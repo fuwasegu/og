@@ -1,0 +1,57 @@
+name: Swift macOS CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build & Test (macOS 15 / Swift 6)
+    runs-on: macos-15
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 16 (Swift 6.0)
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.0.app/Contents/Developer || true
+          swift --version
+
+      - name: Setup Go toolchain & gopls (for integration tests)
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache: false
+
+      - name: Install gopls
+        run: go install golang.org/x/tools/gopls@latest
+
+      - name: Cache Swift Package Manager build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            .build
+          key: ${{ runner.os }}-spm-${{ hashFiles('Package.resolved', 'Package.swift') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      - name: Resolve Swift Package dependencies
+        run: swift package resolve
+
+      - name: Build og (Debug with StrictConcurrency)
+        run: swift build -v
+
+      - name: Run GoEditorCore Unit Tests
+        run: swift test -v --parallel
+
+      - name: Build Release Executable
+        run: swift build -c release
