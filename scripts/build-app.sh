@@ -22,6 +22,19 @@ mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 cp "$BIN_PATH" "$MACOS_DIR/og"
 chmod +x "$MACOS_DIR/og"
 
+ICON_SRC="$ROOT_DIR/docs/assets/icon.png"
+if [ -f "$ICON_SRC" ]; then
+    ICONSET_DIR="$(mktemp -d)/AppIcon.iconset"
+    mkdir -p "$ICONSET_DIR"
+    for s in 16 32 128 256 512; do
+        sips -z "$s" "$s" "$ICON_SRC" --out "$ICONSET_DIR/icon_${s}x${s}.png" > /dev/null
+        d=$((s * 2))
+        sips -z "$d" "$d" "$ICON_SRC" --out "$ICONSET_DIR/icon_${s}x${s}@2x.png" > /dev/null
+    done
+    iconutil -c icns "$ICONSET_DIR" -o "$RESOURCES_DIR/AppIcon.icns"
+    rm -rf "$(dirname "$ICONSET_DIR")"
+fi
+
 cat > "$CONTENTS_DIR/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -33,6 +46,8 @@ cat > "$CONTENTS_DIR/Info.plist" <<EOF
     <string>og</string>
     <key>CFBundleExecutable</key>
     <string>og</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>dev.fuwasegu.og</string>
     <key>CFBundleInfoDictionaryVersion</key>

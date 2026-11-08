@@ -1,71 +1,103 @@
-# og — Native macOS Go Editor (Swift 6)
+<p align="center">
+  <img src="docs/assets/icon.png" width="120" height="120" alt="og icon">
+</p>
 
-Apple Silicon (macOS 14.0+) に最適化した、入力遅延ゼロ（AppKit `NSView` + `CoreText` 120fps描画）を目指す Go 言語特化型ネイティブコードエディタです。
+<h1 align="center">og</h1>
 
-## インストール (Homebrew)
+<p align="center">
+  Go を書くためだけに作られた、120fps ネイティブ macOS エディタ。<br>
+  Electron 不使用。起動した瞬間からキー入力・構文解析・内蔵ターミナルまで遅延ゼロ。
+</p>
 
-```bash
+<p align="center">
+  <a href="https://github.com/fuwasegu/og/releases/latest">ダウンロード</a> ·
+  <a href="README.en.md">English</a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/macOS-14+-blue" alt="macOS 14+">
+  <img src="https://img.shields.io/badge/Swift-6.0-orange" alt="Swift 6.0">
+  <img src="https://img.shields.io/badge/Go-gopls-00ADD8" alt="Go / gopls">
+</p>
+
+## インストール
+
+```sh
 brew install --cask fuwasegu/tap/og
 ```
 
-## ディレクトリ構成（Swift Package Manager 標準レイアウト）
+アップデート時:
 
-```text
-og/
-├── .github/
-│   └── workflows/
-│       ├── ci.yml                       # GitHub Actions 統合ハーネス CI (macOS 15 / Swift 6 / gopls)
-│       └── release.yml                  # GitHub Releases 作成 & fuwasegu/homebrew-tap 自動更新 CD
-├── .gitignore                           # SPM / Xcode / macOS 標準除外設定
-├── AGENTS.md                            # AI エージェント向け不変条件・SLA・ガードレール定義
-├── Makefile                             # ローカル / AI 駆動開発用ワンコマンド実行ターゲット
-├── Package.swift                        # Swift 6.0 マニフェスト (StrictConcurrency 有効)
-├── README.md                            # アーキテクチャ & ビルド手順書
-├── VERSION                              # リリースタグ検証用バージョン定義
-├── scripts/
-│   ├── build-app.sh                     # og.app バンドル生成スクリプト
-│   ├── sign-app.sh                      # 自己署名 / ad-hoc 署名スクリプト
-│   ├── harness.sh                       # 4段階検証ハーネス (静的ガードレール / Debug / Fuzz+SLA / Release)
-│   └── install-hooks.sh                 # Git pre-commit / pre-push フック自動インストーラ
-├── Sources/
-│   ├── GoEditorCore/                    # コアライブラリターゲット (UI / テストから参照)
-│   │   ├── TextBuffer.swift             # Rope ベース O(log N) テキストバッファ & Undo/Redo
-│   │   ├── SyntaxHighlighter.swift      # swift-tree-sitter 0ms ハイライトキャッシュ & AST解析
-│   │   ├── GoplsClient.swift            # gopls 専用 JSON-RPC 2.0 クライアント & オートヒーリング監視
-│   │   ├── GoToolingEngine.swift        # アトミック・シンボルリネーム (Diffプレビュー/ロールバック) & go test
-│   │   ├── InlineCompletion.swift       # ローカルLLM (llama-server FIM) ストリーミング補完
-│   │   ├── NativeTerminal.swift         # Darwin openpty + CoreText 120fps ネイティブ PTY ターミナル
-│   │   └── EditorView.swift             # AppKit NSView + CoreText ビューポート限定 120fps 描画キャンバス
-│   └── GoEditorApp/                     # macOS 実行可能ターゲット (@main)
-│       └── GoEditorApp.swift            # SwiftUI ウィンドウシェル・統合ターミナルドック・リネームシート
-└── Tests/
-    └── GoEditorCoreTests/               # Swift Testing 単体・ファジング・性能SLAテストターゲット
-        ├── TextBufferTests.swift        # Rope編集・UTF-8/UTF-16変換・AST解析・FIM・PTYターミナル検証
-        ├── HarnessGuardrailTests.swift  # 300ステップ決定論的ファジング & パフォーマンス SLA ゲート
-        └── TestHelpers.swift            # テスト用ワークスペース・高精度ベンチマーク計測ヘルパー
+```sh
+brew upgrade --cask fuwasegu/tap/og
 ```
 
-## 主なショートカット
+要件は **macOS 14 (Sonoma) 以降**。または [Releases](https://github.com/fuwasegu/og/releases/latest) から `og.app.zip` を直接ダウンロードできます。
 
-- `⌘J` : ネイティブ PTY ターミナルの表示 / 非表示トグル
-- `⌘S` : ファイル保存 + `gofmt` 自動フォーマット
-- `⌘O` : `.go` ファイルを開く
-- `⌘/` : 行コメント (`//`) トグル
-- `⌘⇧R` : トランザクショナル・シンボルリネーム（Unified Diff プレビュー付き）
-- `Tab` : インライン AI 補完（Ghost Text）確定
+## 特徴
 
-## 検証ハーネス・ビルド・実行方法
+- **WebView ゼロ・120fps の入力体験** — Electron や WKWebView を一切使わず、エディタも内蔵ターミナルも AppKit (`NSView`) + `CoreText` で直接描画。画面に見えている行だけをスライス描画し、構文ハイライトも編集が起きた瞬間だけ差分更新するため、スクロールや高速タイピング中も ProMotion 120Hz に張り付いたまま動きます。
+- **設定不要でつながる `gopls` と自動復旧** — ファイルを開くとバックグラウンドで `gopls` を自動起動し、リアルタイムの型チェック・エラー箇所の波線表示・LSP 応答レイテンシ計測を行います。万が一 `gopls` プロセスがクラッシュしても、指数バックオフで自動再起動し開いているドキュメントの状態をそのまま復元します。
+- **保存と同時に `gofmt` 自動整形** — `⌘S` で保存すると自動的に `gofmt` を走らせ、カーソル位置を維持したままフォーマットを適用します。括弧・クォートの自動ペア補完（`{}` / `()` / `[]` / `""`）や `⌘/` による行コメント切り替えなど、Go の読み書きに必要な操作が最初から揃っています。
+- **Diff プレビュー付きの安全なシンボルリネーム (`⌘⇧R`)** — パッケージをまたぐ関数名・型名・変数名のリネームを、適用前に **Unified Diff で一覧プレビュー**。確定すると一時ファイル経由のアトミック置換を行い、途中で1ファイルでも失敗した場合は全ファイルを元の状態へ自動ロールバックします。
+- **ワンクリックで `go test` を実行** — ウィンドウ上部から `go test -v -json ./...` を非同期実行し、パス / フェイル数と実行時間をその場でフィードバックします。
+- **`⌘J` で即座に開くネイティブ PTY ターミナル** — エディタ下部に Darwin `openpty` 直結のネイティブターミナルを内蔵。24-bit TrueColor・ANSI カラー・高速スクロールに対応し、別ウィンドウに切り替えずその場で `go run` や `git`、CLI エージェントを動かせます。
+- **クラウド不要のローカル AI インライン補完** — ローカルの `llama-server`（Fill-in-the-Middle）と連携し、コードを外部へ一切送信せずにカーソル位置の先読み補完（Ghost Text）をストリーミング表示します。`Tab` で確定、そのままタイピングを続ければ自動でキャンセルされます。
 
-```bash
-# Git フック（pre-commit / pre-push ガードレール）のインストール
+## ショートカット・操作
+
+| キー / 操作 | 動作 |
+|---|---|
+| `⌘O` | `.go` ファイルを開く |
+| `⌘S` | 保存 + `gofmt` 自動フォーマット |
+| `⌘J` | 内蔵ネイティブターミナルの表示 / 非表示トグル |
+| `⌘/` | 選択行のコメント (`//`) トグル |
+| `⌘⇧R` | シンボルリネーム（Unified Diff プレビュー & 自動ロールバック付き） |
+| `Tab` | AI インライン補完（Ghost Text）を確定 |
+| `⌘C` / `⌘X` / `⌘V` | コピー / カット / ペースト |
+| `⌘A` | 全選択 |
+| `⌘Z` / `⌘⇧Z` | Undo / Redo |
+| ダブルクリック | 単語選択（識別子単位） |
+| トリプルクリック | 行全体を選択 |
+
+## 要件
+
+- **macOS 14 (Sonoma)** 以降
+- **[Go](https://go.dev/)** および **[`gopls`](https://pkg.go.dev/golang.org/x/tools/gopls)**（コード診断・リネーム・`gofmt`・`go test` 連携に使用）
+  ```sh
+  brew install go gopls
+  ```
+- **（任意）ローカル AI 補完を使う場合**: `127.0.0.1:8080` で FIM 対応モデルを載せた `llama-server` を起動しておくと、自動的にインライン補完が有効になります（起動していなくてもエディタはそのまま動作します）。
+
+## 開発
+
+Swift 6.0 (Swift Package Manager) で構成されたネイティブ macOS アプリです。
+
+```sh
+# ビルドして起動
+make run
+
+# .app バンドルをビルド (build/og.app)
+make app
+```
+
+<details>
+<summary>品質検証ハーネス & リリース手順</summary>
+
+ローカル開発および CI では、4段階の検証ハーネス（静的ガードレール / StrictConcurrency ビルド / 300ステップ決定論的ファジング + レイテンシ SLA ベンチマーク / Release ビルド）を実行できます。
+
+```sh
+# Git フック（pre-commit / pre-push）の有効化
 make install-hooks
 
-# 4段階フル検証ハーネス実行（静的ガードレール + Debug + Fuzz/性能SLAテスト + Release）
+# 全4ゲートのフル検証
 make check
-
-# 高速イテレーション用チェック（Release ビルド省略）
-make quick
-
-# エディタ起動
-make run
 ```
+
+`VERSION` を更新して `v*` タグを push すると、GitHub Actions (`.github/workflows/release.yml`) がハーネス検証 → `og.app` のビルド・署名 → GitHub Release 公開 → `fuwasegu/homebrew-tap` の Cask 更新まで自動実行します。
+
+```sh
+git tag v0.2.0 && git push origin main --tags
+```
+
+</details>
