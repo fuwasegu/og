@@ -14,7 +14,7 @@ public struct GoPostfixCandidate: Sendable, Equatable {
 public enum GoPostfixCompletionEngine {
     public static let supportedKeys: Set<String> = [
         "err", "iferr", "nn", "nil", "var", "return", "ret",
-        "print", "forr", "for", "if", "not", "len"
+        "print", "forr", "for", "seq", "loop", "if", "not", "len"
     ]
 
     public static func matchCandidate(in buffer: TextBuffer, at cursor: TextPosition) -> GoPostfixCandidate? {
@@ -173,12 +173,38 @@ public enum GoPostfixCompletionEngine {
             )
 
         case "forr":
-            let beforeCursor = "for i, v := range \(expr) {\n\(innerIndent)"
+            let isIntLiteral = !expr.isEmpty && expr.allSatisfy { $0.isNumber || $0 == "_" }
+            let header = isIntLiteral ? "for i := range \(expr)" : "for i, v := range \(expr)"
+            let beforeCursor = "\(header) {\n\(innerIndent)"
             let full = "\(beforeCursor)\n\(indent)}"
             return GoPostfixCandidate(
                 key: key,
                 expression: expr,
-                previewLabel: "for i, v := range \(expr) { … }",
+                previewLabel: "\(header) { … }",
+                replacementText: full,
+                replaceRange: replaceRange,
+                cursorOffsetInsideReplacement: beforeCursor.count
+            )
+
+        case "seq":
+            let beforeCursor = "for v := range \(expr) {\n\(innerIndent)"
+            let full = "\(beforeCursor)\n\(indent)}"
+            return GoPostfixCandidate(
+                key: key,
+                expression: expr,
+                previewLabel: "for v := range \(expr) { … }",
+                replacementText: full,
+                replaceRange: replaceRange,
+                cursorOffsetInsideReplacement: beforeCursor.count
+            )
+
+        case "loop":
+            let beforeCursor = "for \(expr).Loop() {\n\(innerIndent)"
+            let full = "\(beforeCursor)\n\(indent)}"
+            return GoPostfixCandidate(
+                key: key,
+                expression: expr,
+                previewLabel: "for \(expr).Loop() { … }",
                 replacementText: full,
                 replaceRange: replaceRange,
                 cursorOffsetInsideReplacement: beforeCursor.count
@@ -244,12 +270,13 @@ public enum GoPostfixCompletionEngine {
     }
 }
 
-// MARK: - 2. GoLand Struct Tag Generator (`json`, `yaml`, `db` with snake_case / camelCase)
+// MARK: - 2. GoLand Struct Tag Generator (`json`, `yaml`, `db` with snake_case / camelCase / omitzero)
 
 public enum GoStructTagStyle: String, Sendable, CaseIterable {
     case jsonSnake = "json (snake_case)"
     case jsonCamel = "json (camelCase)"
     case jsonOmitempty = "json (omitempty)"
+    case jsonOmitzero = "json (omitzero — Go 1.24+)"
     case jsonYaml = "json + yaml"
     case dbJson = "db + json"
 
@@ -263,6 +290,8 @@ public enum GoStructTagStyle: String, Sendable, CaseIterable {
             return "`json:\"\(camel)\"`"
         case .jsonOmitempty:
             return "`json:\"\(snake),omitempty\"`"
+        case .jsonOmitzero:
+            return "`json:\"\(snake),omitzero\"`"
         case .jsonYaml:
             return "`json:\"\(snake)\" yaml:\"\(snake)\"`"
         case .dbJson:

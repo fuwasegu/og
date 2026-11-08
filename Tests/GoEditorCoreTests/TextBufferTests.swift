@@ -283,5 +283,54 @@ struct TextBufferTests {
         #expect(buffer.string.contains("tests := []struct"))
         #expect(buffer.string.contains("t.Run(tt.name, func(t *testing.T)"))
     }
+
+    @Test("Modern Go 1.22–1.24+ generics, range-over-int, iter.Seq, b.Loop(), and omitzero")
+    func modernGoLanguageFeatures() {
+        let genericSource = """
+        package cache
+
+        type Store[K comparable, V any] interface {
+        \tGet(key K) (V, bool)
+        }
+
+        type MemoryCache[K comparable, V any] struct {
+        \tCreatedAt int64
+        }
+
+        func (m *MemoryCache[K, V]) Get(key K) (V, bool) {
+        \tvar zero V
+        \treturn zero, false
+        }
+
+        func MapSlice[T any, R any](in []T) []R {
+        \treturn nil
+        }
+        """
+        let buf = TextBuffer(genericSource)
+        let analysis = SyntaxHighlighter().analyzeGoAST(in: buf)
+
+        #expect(analysis.types.map(\.name) == ["Store", "MemoryCache"])
+        #expect(analysis.implicitInterfaceImpls[6] == ["Store"])
+        #expect(analysis.interfaceImplementors[2] == ["MemoryCache"])
+        #expect(analysis.functions.map(\.name) == ["Get", "MapSlice"])
+        #expect(analysis.functions.first?.receiverType == "MemoryCache")
+
+        // Go 1.24 omitzero struct tag
+        if let cacheStruct = analysis.types.first(where: { $0.name == "MemoryCache" }) {
+            _ = GoStructTagGenerator.applyStructTags(in: buf, structEntry: cacheStruct, style: .jsonOmitzero)
+            #expect(buf.lineContent(at: 7).contains("`json:\"created_at,omitzero\"`"))
+        }
+
+        // Go 1.22 range-over-int (`10.forr` -> `for i := range 10`)
+        let intRangeBuf = TextBuffer("\t10.forr")
+        _ = GoPostfixCompletionEngine.tryExpand(in: intRangeBuf, at: TextPosition(line: 0, column: 8))
+        #expect(intRangeBuf.lineContent(at: 0) == "\tfor i := range 10 {")
+
+        // Go 1.24 testing.B.Loop (`b.loop` -> `for b.Loop()`)
+        let loopBuf = TextBuffer("\tb.loop")
+        _ = GoPostfixCompletionEngine.tryExpand(in: loopBuf, at: TextPosition(line: 0, column: 7))
+        #expect(loopBuf.lineContent(at: 0) == "\tfor b.Loop() {")
+    }
 }
+
 

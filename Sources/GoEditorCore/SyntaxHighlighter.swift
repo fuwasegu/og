@@ -292,9 +292,10 @@ public final class SyntaxHighlighter: @unchecked Sendable {
 
             if trimmed.hasPrefix("type ") && (trimmed.contains(" struct") || trimmed.contains(" interface")) {
                 let endLine = findMatchingBraceLine(in: lines, startingAt: lineIdx)
-                let parts = trimmed.split(separator: " ")
-                if parts.count >= 3 {
-                    let typeName = String(parts[1])
+                let afterType = String(trimmed.dropFirst("type ".count)).trimmingCharacters(in: .whitespaces)
+                let rawNameToken = afterType.prefix(while: { $0 != " " && $0 != "\t" && $0 != "[" && $0 != "=" })
+                let typeName = String(rawNameToken)
+                if !typeName.isEmpty {
                     let kind = trimmed.contains(" interface") ? "interface" : "struct"
                     var methods: [String] = []
                     if kind == "interface" && endLine > lineIdx {
@@ -302,7 +303,8 @@ public final class SyntaxHighlighter: @unchecked Sendable {
                             let mTrim = lines[mLine].trimmingCharacters(in: .whitespaces)
                             if !mTrim.isEmpty && !mTrim.hasPrefix("//") {
                                 if let parenIdx = mTrim.firstIndex(of: "(") {
-                                    let mName = String(mTrim[..<parenIdx]).trimmingCharacters(in: .whitespaces)
+                                    let rawMethod = String(mTrim[..<parenIdx]).trimmingCharacters(in: .whitespaces)
+                                    let mName = String(rawMethod.prefix(while: { $0 != "[" }))
                                     if !mName.isEmpty {
                                         methods.append(mName)
                                     }
@@ -386,7 +388,8 @@ public final class SyntaxHighlighter: @unchecked Sendable {
         if rest.hasPrefix("(") {
             guard let closeParen = rest.firstIndex(of: ")") else { return nil }
             let recvInside = String(rest[rest.index(after: rest.startIndex)..<closeParen])
-            let recvParts = recvInside.split(separator: " ")
+            let withoutTypeParams = String(recvInside.prefix(while: { $0 != "[" }))
+            let recvParts = withoutTypeParams.split(separator: " ")
             if let lastPart = recvParts.last {
                 receiverType = lastPart.replacingOccurrences(of: "*", with: "").trimmingCharacters(in: .whitespaces)
             }
@@ -394,7 +397,9 @@ public final class SyntaxHighlighter: @unchecked Sendable {
         }
 
         guard let openParen = rest.firstIndex(of: "(") else { return nil }
-        let funcName = String(rest[..<openParen]).trimmingCharacters(in: .whitespaces)
+        let rawFuncToken = String(rest[..<openParen]).trimmingCharacters(in: .whitespaces)
+        let funcName = String(rawFuncToken.prefix(while: { $0 != "[" })).trimmingCharacters(in: .whitespaces)
+        guard !funcName.isEmpty else { return nil }
         let signature = line.replacingOccurrences(of: "{", with: "").trimmingCharacters(in: .whitespaces)
         let isTest = receiverType == nil && funcName.hasPrefix("Test") && line.contains("*testing.T")
         let isBenchmark = receiverType == nil && funcName.hasPrefix("Benchmark") && line.contains("*testing.B")
