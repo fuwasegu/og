@@ -8,10 +8,15 @@ Apple Silicon (macOS 14.0+) に最適化した、入力遅延ゼロ（AppKit `NS
 og/
 ├── .github/
 │   └── workflows/
-│       └── ci.yml                       # GitHub Actions (macOS 15 / Xcode 16 / Swift 6 / gopls)
+│       └── ci.yml                       # GitHub Actions 統合ハーネス CI (macOS 15 / Swift 6 / gopls)
 ├── .gitignore                           # SPM / Xcode / macOS 標準除外設定
+├── AGENTS.md                            # AI エージェント向け不変条件・SLA・ガードレール定義
+├── Makefile                             # ローカル / AI 駆動開発用ワンコマンド実行ターゲット
 ├── Package.swift                        # Swift 6.0 マニフェスト (StrictConcurrency 有効)
 ├── README.md                            # アーキテクチャ & ビルド手順書
+├── scripts/
+│   ├── harness.sh                       # 4段階検証ハーネス (静的ガードレール / Debug / Fuzz+SLA / Release)
+│   └── install-hooks.sh                 # Git pre-commit / pre-push フック自動インストーラ
 ├── Sources/
 │   ├── GoEditorCore/                    # コアライブラリターゲット (UI / テストから参照)
 │   │   ├── TextBuffer.swift             # Rope ベース O(log N) テキストバッファ & Undo/Redo
@@ -24,9 +29,10 @@ og/
 │   └── GoEditorApp/                     # macOS 実行可能ターゲット (@main)
 │       └── GoEditorApp.swift            # SwiftUI ウィンドウシェル・統合ターミナルドック・リネームシート
 └── Tests/
-    └── GoEditorCoreTests/               # Swift Testing 単体テストターゲット
+    └── GoEditorCoreTests/               # Swift Testing 単体・ファジング・性能SLAテストターゲット
         ├── TextBufferTests.swift        # Rope編集・UTF-8/UTF-16変換・AST解析・FIM・PTYターミナル検証
-        └── TestHelpers.swift            # テスト用ワークスペース・一時ファイルヘルパー
+        ├── HarnessGuardrailTests.swift  # 300ステップ決定論的ファジング & パフォーマンス SLA ゲート
+        └── TestHelpers.swift            # テスト用ワークスペース・高精度ベンチマーク計測ヘルパー
 ```
 
 ## 主なショートカット
@@ -38,10 +44,18 @@ og/
 - `⌘⇧R` : トランザクショナル・シンボルリネーム（Unified Diff プレビュー付き）
 - `Tab` : インライン AI 補完（Ghost Text）確定
 
-## ビルド・テスト・実行方法
+## 検証ハーネス・ビルド・実行方法
 
 ```bash
-swift build -c release
-swift test --parallel
-swift run og
+# Git フック（pre-commit / pre-push ガードレール）のインストール
+make install-hooks
+
+# 4段階フル検証ハーネス実行（静的ガードレール + Debug + Fuzz/性能SLAテスト + Release）
+make check
+
+# 高速イテレーション用チェック（Release ビルド省略）
+make quick
+
+# エディタ起動
+make run
 ```

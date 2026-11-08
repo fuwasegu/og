@@ -1,4 +1,4 @@
-name: Swift macOS CI
+name: Swift macOS CI & Guardrail Harness
 
 on:
   push:
@@ -12,8 +12,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-and-test:
-    name: Build & Test (macOS 15 / Swift 6)
+  harness:
+    name: Guardrail Harness (macOS 15 / Swift 6 / gopls)
     runs-on: macos-15
     timeout-minutes: 20
 
@@ -21,12 +21,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Select Xcode 16 (Swift 6.0)
+      - name: Select latest Xcode 16 (Swift 6)
         run: |
-          sudo xcode-select -s /Applications/Xcode_16.0.app/Contents/Developer || true
+          XCODE_APP=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -n 1 || true)
+          if [ -n "$XCODE_APP" ]; then
+            sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          fi
           swift --version
 
-      - name: Setup Go toolchain & gopls (for integration tests)
+      - name: Setup Go toolchain & gopls
         uses: actions/setup-go@v5
         with:
           go-version: '1.23.x'
@@ -47,11 +50,5 @@ jobs:
       - name: Resolve Swift Package dependencies
         run: swift package resolve
 
-      - name: Build og (Debug with StrictConcurrency)
-        run: swift build -v
-
-      - name: Run GoEditorCore Unit Tests
-        run: swift test -v --parallel
-
-      - name: Build Release Executable
-        run: swift build -c release
+      - name: Run Unified Verification Harness (Static Guardrails + Debug + Fuzz/SLA Tests + Release)
+        run: ./scripts/harness.sh

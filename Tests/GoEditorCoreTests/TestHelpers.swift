@@ -25,4 +25,11 @@ enum TestWorkspaceHelper {
         let url = URL(fileURLWithPath: filePath)
         return try await manager.buildPreview(for: edit, inMemoryBuffers: [url: buffer])
     }
+
+    static func measureMilliseconds(_ block: () -> Void) -> Double {
+        let start = ContinuousClock.now
+        block()
+        let elapsed = start.duration(to: .now)
+        return (Double(elapsed.components.seconds) * 1000.0) + (Double(elapsed.components.attoseconds) / 1e15)
+    }
 }

@@ -95,7 +95,10 @@ public final class TextBuffer: @unchecked Sendable {
     }
 
     private var chunks: [Chunk] = []
-    private var cachedLineStarts: [Int]?
+    private var cachedCount: Int = 0
+    private var cachedUTF8Count: Int = 0
+    private var cachedUTF16Count: Int = 0
+    private var cachedNewlineCount: Int = 0
     public private(set) var version: Int = 1
 
     private var undoStack: [TextEdit] = []
@@ -109,83 +112,118 @@ public final class TextBuffer: @unchecked Sendable {
         chunks.map(\.text).joined()
     }
 
-    public var count: Int {
-        chunks.reduce(0) { $0 + $1.charCount }
-    }
+    public var count: Int { cachedCount }
+    public var utf8Count: Int { cachedUTF8Count }
+    public var utf16Count: Int { cachedUTF16Count }
+    public var lineCount: Int { cachedNewlineCount + 1 }
 
-    public var utf8Count: Int {
-        chunks.reduce(0) { $0 + $1.utf8Count }
-    }
+    private func lineStartAndEndOffset(at lineIndex: Int) -> (start: Int, end: Int)? {
+        guard lineIndex >= 0 && lineIndex <= cachedNewlineCount else { return nil }
 
-    public var utf16Count: Int {
-        chunks.reduce(0) { $0 + $1.utf16Count }
-    }
+        var startOffset = 0
+        var startChunkIdx = 0
+        var startNewlineIdxInChunk = -1
 
-    public var lineCount: Int {
-        ensureLineCache().count
-    }
-
-    @discardableResult
-    private func ensureLineCache() -> [Int] {
-        if let cached = cachedLineStarts {
-            return cached
-        }
-        var starts: [Int] = [0]
-        var globalOffset = 0
-        for chunk in chunks {
-            for nl in chunk.newlineOffsets {
-                starts.append(globalOffset + nl + 1)
+        if lineIndex > 0 {
+            var remainingNewlines = lineIndex
+            var globalCharOffset = 0
+            for (cIdx, chunk) in chunks.enumerated() {
+                let nlCount = chunk.newlineOffsets.count
+                if remainingNewlines <= nlCount {
+                    let localNlIdx = remainingNewlines - 1
+                    startOffset = globalCharOffset + chunk.newlineOffsets[localNlIdx] + 1
+                    startChunkIdx = cIdx
+                    startNewlineIdxInChunk = localNlIdx
+                    break
+                }
+                remainingNewlines -= nlCount
+                globalCharOffset += chunk.charCount
             }
-            globalOffset += chunk.charCount
         }
-        cachedLineStarts = starts
-        return starts
+
+        if lineIndex == cachedNewlineCount {
+            return (startOffset, cachedCount)
+        }
+
+        var globalCharOffset = 0
+        for i in 0..<startChunkIdx {
+            globalCharOffset += chunks[i].charCount
+        }
+
+        let firstChunk = chunks[startChunkIdx]
+        if startNewlineIdxInChunk + 1 < firstChunk.newlineOffsets.count {
+            let endOffset = globalCharOffset + firstChunk.newlineOffsets[startNewlineIdxInChunk + 1]
+            return (startOffset, endOffset)
+        }
+
+        globalCharOffset += firstChunk.charCount
+        for cIdx in (startChunkIdx + 1)..<chunks.count {
+            let chunk = chunks[cIdx]
+            if let firstNl = chunk.newlineOffsets.first {
+                return (startOffset, globalCharOffset + firstNl)
+            }
+            globalCharOffset += chunk.charCount
+        }
+
+        return (startOffset, cachedCount)
     }
 
     public func lineContent(at lineIndex: Int) -> String {
-        let starts = ensureLineCache()
-        guard lineIndex >= 0 && lineIndex < starts.count else { return "" }
-        let startOffset = starts[lineIndex]
-        let endOffset = (lineIndex + 1 < starts.count) ? (starts[lineIndex + 1] - 1) : count
-        guard startOffset <= endOffset else { return "" }
+        guard let (startOffset, endOffset) = lineStartAndEndOffset(at: lineIndex),
+              startOffset <= endOffset else { return "" }
         return substring(in: startOffset..<endOffset)
     }
 
     public func lineCharacterRange(at lineIndex: Int) -> Range<Int> {
-        let starts = ensureLineCache()
-        guard lineIndex >= 0 && lineIndex < starts.count else { return 0..<0 }
-        let startOffset = starts[lineIndex]
-        let endOffset = (lineIndex + 1 < starts.count) ? (starts[lineIndex + 1] - 1) : count
+        guard let (startOffset, endOffset) = lineStartAndEndOffset(at: lineIndex) else {
+            return 0..<0
+        }
         return startOffset..<max(startOffset, endOffset)
     }
 
     public func characterOffset(for position: TextPosition) -> Int {
-        let starts = ensureLineCache()
-        guard !starts.isEmpty else { return 0 }
-        let clampedLine = min(max(0, position.line), starts.count - 1)
-        let lineStart = starts[clampedLine]
-        let lineEnd = (clampedLine + 1 < starts.count) ? (starts[clampedLine + 1] - 1) : count
+        let clampedLine = min(max(0, position.line), cachedNewlineCount)
+        guard let (lineStart, lineEnd) = lineStartAndEndOffset(at: clampedLine) else { return 0 }
         let maxCol = max(0, lineEnd - lineStart)
         let clampedCol = min(max(0, position.column), maxCol)
         return lineStart + clampedCol
     }
 
     public func position(forCharacterOffset offset: Int) -> TextPosition {
-        let starts = ensureLineCache()
-        let clamped = min(max(0, offset), count)
-        var low = 0
-        var high = starts.count - 1
-        while low <= high {
-            let mid = (low + high) / 2
-            if starts[mid] <= clamped {
-                low = mid + 1
-            } else {
-                high = mid - 1
+        let clamped = min(max(0, offset), cachedCount)
+        var runningChars = 0
+        var runningLines = 0
+        var lastLineStart = 0
+
+        for chunk in chunks {
+            let nextChars = runningChars + chunk.charCount
+            if clamped <= nextChars {
+                let localTarget = clamped - runningChars
+                var low = 0
+                var high = chunk.newlineOffsets.count - 1
+                while low <= high {
+                    let mid = (low + high) / 2
+                    if chunk.newlineOffsets[mid] < localTarget {
+                        low = mid + 1
+                    } else {
+                        high = mid - 1
+                    }
+                }
+                if high >= 0 {
+                    runningLines += (high + 1)
+                    lastLineStart = runningChars + chunk.newlineOffsets[high] + 1
+                }
+                return TextPosition(line: runningLines, column: clamped - lastLineStart)
             }
+
+            if let lastNl = chunk.newlineOffsets.last {
+                lastLineStart = runningChars + lastNl + 1
+                runningLines += chunk.newlineOffsets.count
+            }
+            runningChars = nextChars
         }
-        let lineIdx = max(0, high)
-        let col = clamped - starts[lineIdx]
-        return TextPosition(line: lineIdx, column: col)
+
+        return TextPosition(line: runningLines, column: max(0, clamped - lastLineStart))
     }
 
     public func utf16Offset(for position: TextPosition) -> Int {
@@ -360,13 +398,15 @@ public final class TextBuffer: @unchecked Sendable {
     }
 
     private func rebuildChunks(from fullText: String) {
-        cachedLineStarts = nil
         let split = Self.splitIntoChunks(fullText)
         chunks = split.isEmpty ? [Chunk("")] : split
+        cachedCount = chunks.reduce(0) { $0 + $1.charCount }
+        cachedUTF8Count = chunks.reduce(0) { $0 + $1.utf8Count }
+        cachedUTF16Count = chunks.reduce(0) { $0 + $1.utf16Count }
+        cachedNewlineCount = chunks.reduce(0) { $0 + $1.newlineOffsets.count }
     }
 
     private func applyRawReplace(range: Range<Int>, with replacement: String) {
-        cachedLineStarts = nil
         if chunks.isEmpty {
             rebuildChunks(from: replacement)
             return
@@ -396,6 +436,14 @@ public final class TextBuffer: @unchecked Sendable {
             }
         }
 
+        for idx in firstChunkIdx...lastChunkIdx {
+            let old = chunks[idx]
+            cachedCount -= old.charCount
+            cachedUTF8Count -= old.utf8Count
+            cachedUTF16Count -= old.utf16Count
+            cachedNewlineCount -= old.newlineOffsets.count
+        }
+
         let firstChunkText = chunks[firstChunkIdx].text
         let prefixCount = max(0, range.lowerBound - firstChunkStart)
         let prefixPart = String(firstChunkText.prefix(prefixCount))
@@ -409,6 +457,14 @@ public final class TextBuffer: @unchecked Sendable {
         if replacementChunks.isEmpty && chunks.count == (lastChunkIdx - firstChunkIdx + 1) {
             replacementChunks = [Chunk("")]
         }
+
+        for item in replacementChunks {
+            cachedCount += item.charCount
+            cachedUTF8Count += item.utf8Count
+            cachedUTF16Count += item.utf16Count
+            cachedNewlineCount += item.newlineOffsets.count
+        }
+
         chunks.replaceSubrange(firstChunkIdx...lastChunkIdx, with: replacementChunks)
     }
 }
