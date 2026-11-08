@@ -32,12 +32,22 @@ final class WorkspaceViewModel: ObservableObject {
     @Published var renameNewSymbol: String = "HTTPServer"
     @Published var renamePreviews: [FileRenameDiffPreview] = []
     @Published var canRollbackRename: Bool = false
-    @Published var statusBannerMessage: String = "Ready — CoreText 120fps · Rope Buffer · Native PTY Terminal"
+    @Published var statusBannerMessage: String = "Ready — CoreText 120fps · Postfix Completion · Native PTY Terminal"
+    @Published var astAnalysis = GoASTAnalysis(
+        packageName: "main",
+        importsBlock: "",
+        functions: [],
+        types: [],
+        errorHandlingBlocks: [],
+        implicitInterfaceImpls: [:]
+    )
+    @Published var requestedJumpLine: Int?
 
     let goplsClient = GoplsClient()
     let renameManager = TransactionalRenameManager()
     let testRunner = GoTestRunner()
     let terminalSession: NativePTYSession
+    private let astAnalyzer = SyntaxHighlighter()
 
     init() {
         let sampleGoSource = """
@@ -105,8 +115,10 @@ final class WorkspaceViewModel: ObservableObject {
 
         let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("server_test.go")
         try? sampleGoSource.write(to: tempURL, atomically: true, encoding: .utf8)
+        let initialBuffer = TextBuffer(sampleGoSource)
         self.currentFileURL = tempURL
-        self.buffer = TextBuffer(sampleGoSource)
+        self.buffer = initialBuffer
+        self.astAnalysis = astAnalyzer.analyzeGoAST(in: initialBuffer)
         self.terminalSession = NativePTYSession(workingDirectory: tempURL.deletingLastPathComponent())
 
         subscribeGoplsStreams()
@@ -143,6 +155,7 @@ final class WorkspaceViewModel: ObservableObject {
     }
 
     func notifyDocumentChanged(_ updatedBuffer: TextBuffer) {
+        self.astAnalysis = astAnalyzer.analyzeGoAST(in: updatedBuffer)
         let uri = currentFileURL.absoluteString
         let text = updatedBuffer.string
         let version = updatedBuffer.version
@@ -158,6 +171,7 @@ final class WorkspaceViewModel: ObservableObject {
             if let formatted = Self.runGofmt(on: currentFileURL.path), formatted != buffer.string {
                 try formatted.write(to: currentFileURL, atomically: true, encoding: .utf8)
                 self.buffer = TextBuffer(formatted)
+                self.astAnalysis = astAnalyzer.analyzeGoAST(in: self.buffer)
                 statusBannerMessage = "Saved & formatted \(currentFileURL.lastPathComponent) with gofmt."
             } else {
                 statusBannerMessage = "Saved \(currentFileURL.lastPathComponent)."
@@ -180,7 +194,9 @@ final class WorkspaceViewModel: ObservableObject {
         if panel.runModal() == .OK, let url = panel.url,
            let content = try? String(contentsOf: url, encoding: .utf8) {
             self.currentFileURL = url
-            self.buffer = TextBuffer(content)
+            let nextBuf = TextBuffer(content)
+            self.buffer = nextBuf
+            self.astAnalysis = astAnalyzer.analyzeGoAST(in: nextBuf)
             self.inlineTestResults.removeAll()
             self.diagnostics.removeAll()
             self.terminalSession.startShell(in: url.deletingLastPathComponent())
@@ -196,6 +212,48 @@ final class WorkspaceViewModel: ObservableObject {
         if isShowingTerminal {
             terminalSession.startIfNeeded()
         }
+    }
+
+    func runMainInTerminal() {
+        if !isShowingTerminal {
+            isShowingTerminal = true
+            terminalSession.startIfNeeded()
+        }
+        try? buffer.string.write(to: currentFileURL, atomically: true, encoding: .utf8)
+        terminalSession.executeCommand("go run .")
+        statusBannerMessage = "Running `go run .` in Native PTY Terminal..."
+    }
+
+    func applyStructTags(style: GoStructTagStyle) {
+        guard let targetStruct = GoStructTagGenerator.enclosingStruct(in: astAnalysis, atLine: cursorPosition.line) else {
+            statusBannerMessage = "No Go struct found in current file."
+            return
+        }
+        let count = GoStructTagGenerator.applyStructTags(in: buffer, structEntry: targetStruct, style: style)
+        notifyDocumentChanged(buffer)
+        objectWillChange.send()
+        statusBannerMessage = "Generated \(style.rawValue) tags for \(count) fields on `type \(targetStruct.name) struct`."
+    }
+
+    func generateTableTestForCurrentFunction() {
+        guard let fn = GoTableTestGenerator.targetFunction(in: astAnalysis, atLine: cursorPosition.line) else {
+            statusBannerMessage = "No Go function found to generate a table-driven test."
+            return
+        }
+        let outcome = GoTableTestGenerator.appendOrLocateTableTest(for: fn, in: buffer, analysis: astAnalysis)
+        notifyDocumentChanged(buffer)
+        requestedJumpLine = outcome.position.line
+        objectWillChange.send()
+        if outcome.created {
+            statusBannerMessage = "Generated GoLand Table-Driven Test `\(outcome.testName)` for `\(fn.name)`."
+        } else {
+            statusBannerMessage = "Jumped to existing test `\(outcome.testName)` (Ln \(outcome.position.line + 1))."
+        }
+    }
+
+    func jumpToLine(_ line: Int, label: String) {
+        requestedJumpLine = line
+        statusBannerMessage = "Jumped to \(label) (Ln \(line + 1))."
     }
 
     func runInlineTest(_ fn: GoASTAnalysis.FuncEntry) {
@@ -250,7 +308,9 @@ final class WorkspaceViewModel: ObservableObject {
                 oldName: oldName,
                 newName: newName
             ), let updatedContent = try? String(contentsOf: currentFileURL, encoding: .utf8) {
-                self.buffer = TextBuffer(updatedContent)
+                let nextBuf = TextBuffer(updatedContent)
+                self.buffer = nextBuf
+                self.astAnalysis = astAnalyzer.analyzeGoAST(in: nextBuf)
                 self.canRollbackRename = await renameManager.canRollback
                 self.isShowingRenameSheet = false
                 self.statusBannerMessage = "Renamed `\(oldName)` → `\(newName)` atomically."
@@ -262,7 +322,9 @@ final class WorkspaceViewModel: ObservableObject {
         Task {
             if let snap = try? await renameManager.rollbackLastRename(),
                let restored = try? String(contentsOf: currentFileURL, encoding: .utf8) {
-                self.buffer = TextBuffer(restored)
+                let nextBuf = TextBuffer(restored)
+                self.buffer = nextBuf
+                self.astAnalysis = astAnalyzer.analyzeGoAST(in: nextBuf)
                 self.canRollbackRename = await renameManager.canRollback
                 self.statusBannerMessage = "Rolled back rename `\(snap.symbolOldName)` ← `\(snap.symbolNewName)`."
             }
@@ -297,7 +359,7 @@ struct GoWorkspaceContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 12) {
+            HStack(spacing: 10) {
                 Label(vm.currentFileURL.lastPathComponent, systemImage: "chevron.left.forwardslash.chevron.right")
                     .font(.system(size: 13, weight: .semibold, design: .monospaced))
 
@@ -317,15 +379,65 @@ struct GoWorkspaceContentView: View {
                 }
                 .help("Save & format with gofmt (⌘S)")
 
+                Menu {
+                    if !vm.astAnalysis.types.isEmpty {
+                        Section("Types (Structs & Interfaces)") {
+                            ForEach(vm.astAnalysis.types, id: \.startLine) { t in
+                                Button("\(t.kind) \(t.name)  (Ln \(t.startLine + 1))") {
+                                    vm.jumpToLine(t.startLine, label: "\(t.kind) \(t.name)")
+                                }
+                            }
+                        }
+                    }
+                    if !vm.astAnalysis.functions.isEmpty {
+                        Section("Functions & Methods") {
+                            ForEach(vm.astAnalysis.functions, id: \.startLine) { fn in
+                                let prefix = fn.receiverType.map { "(\($0))." } ?? ""
+                                Button("func \(prefix)\(fn.name)  (Ln \(fn.startLine + 1))") {
+                                    vm.jumpToLine(fn.startLine, label: "func \(prefix)\(fn.name)")
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    Label("Structure", systemImage: "list.bullet.indent")
+                        .font(.system(size: 11.5, weight: .medium))
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("GoLand Structure Outline — Jump to Type or Function")
+
+                Menu {
+                    ForEach(GoStructTagStyle.allCases, id: \.rawValue) { style in
+                        Button("Generate \(style.rawValue)") {
+                            vm.applyStructTags(style: style)
+                        }
+                    }
+                } label: {
+                    Label("Struct Tags", systemImage: "tag")
+                        .font(.system(size: 11.5, weight: .medium))
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("Generate Go struct tags (⌘⇧T)")
+
+                Button {
+                    vm.generateTableTestForCurrentFunction()
+                } label: {
+                    Label("+Table Test", systemImage: "flask")
+                        .font(.system(size: 11.5, weight: .medium))
+                }
+                .help("Generate GoLand Table-Driven Test (⌘⇧G)")
+
                 Divider().frame(height: 16)
 
-                Toggle("Dim `if err != nil`", isOn: $vm.dimErrorBlocks)
+                Toggle("Dim `err`", isOn: $vm.dimErrorBlocks)
                     .toggleStyle(.checkbox)
-                    .font(.system(size: 12))
+                    .font(.system(size: 11.5))
 
-                Toggle("Fold `if err != nil`", isOn: $vm.foldErrorBlocks)
+                Toggle("Fold `err`", isOn: $vm.foldErrorBlocks)
                     .toggleStyle(.checkbox)
-                    .font(.system(size: 12))
+                    .font(.system(size: 11.5))
 
                 Spacer()
 
@@ -365,14 +477,21 @@ struct GoWorkspaceContentView: View {
                 inlineTestResults: vm.inlineTestResults,
                 foldErrorBlocks: vm.foldErrorBlocks,
                 dimErrorBlocks: vm.dimErrorBlocks,
+                requestedJumpLine: vm.requestedJumpLine,
                 onBufferModified: { updated in
                     vm.notifyDocumentChanged(updated)
                 },
                 onCursorChanged: { pos in
                     vm.cursorPosition = pos
+                    if vm.requestedJumpLine != nil {
+                        vm.requestedJumpLine = nil
+                    }
                 },
                 onRunGoTestRequested: { fn in
                     vm.runInlineTest(fn)
+                },
+                onRunMainRequested: {
+                    vm.runMainInTerminal()
                 },
                 onRenameRequested: { _ in
                     vm.prepareTransactionalRename()
@@ -385,6 +504,9 @@ struct GoWorkspaceContentView: View {
                 },
                 onOpenFileRequested: {
                     vm.openDocumentWithPanel()
+                },
+                onStatusMessage: { msg in
+                    vm.statusBannerMessage = msg
                 }
             )
 

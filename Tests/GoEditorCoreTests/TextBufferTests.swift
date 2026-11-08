@@ -192,4 +192,96 @@ struct TextBufferTests {
         #expect(screen.cursorCol == 0)
         #expect(screen.grid[0][0].scalar == " ")
     }
+
+    @Test("GoLand Postfix Completion (.err, .var, .forr, .return, .nn)")
+    func golandPostfixCompletion() {
+        let buf1 = TextBuffer("package main\n\nfunc run() error {\n\terr.err\n}\n")
+        let cursor1 = TextPosition(line: 3, column: 8)
+        let candidate1 = GoPostfixCompletionEngine.matchCandidate(in: buf1, at: cursor1)
+        #expect(candidate1?.key == "err")
+        let expandedPos1 = GoPostfixCompletionEngine.tryExpand(in: buf1, at: cursor1)
+        #expect(expandedPos1 != nil)
+        #expect(buf1.lineContent(at: 3) == "\tif err != nil {")
+        #expect(buf1.lineContent(at: 4) == "\t\treturn err")
+        #expect(buf1.lineContent(at: 5) == "\t}")
+
+        let buf2 = TextBuffer("\tNewHTTPServer(8080).var")
+        let cursor2 = TextPosition(line: 0, column: buf2.lineContent(at: 0).count)
+        _ = GoPostfixCompletionEngine.tryExpand(in: buf2, at: cursor2)
+        #expect(buf2.lineContent(at: 0) == "\thttpServer := NewHTTPServer(8080)")
+
+        let buf3 = TextBuffer("\titems.forr")
+        let cursor3 = TextPosition(line: 0, column: buf3.lineContent(at: 0).count)
+        _ = GoPostfixCompletionEngine.tryExpand(in: buf3, at: cursor3)
+        #expect(buf3.lineContent(at: 0) == "\tfor i, v := range items {")
+    }
+
+    @Test("GoLand Struct Tag Generator (json snake_case, camelCase, db + json)")
+    func golandStructTagGenerator() {
+        #expect(GoStructTagGenerator.toSnakeCase("ReadTimeout") == "read_timeout")
+        #expect(GoStructTagGenerator.toSnakeCase("HTTPServerID") == "http_server_id")
+        #expect(GoStructTagGenerator.toCamelCase("ReadTimeout") == "readTimeout")
+
+        let source = """
+        package main
+
+        type ServerConfig struct {
+        \tHostName    string
+        \tReadTimeout int
+        }
+        """
+        let buffer = TextBuffer(source)
+        let analysis = SyntaxHighlighter().analyzeGoAST(in: buffer)
+        guard let structEntry = GoStructTagGenerator.enclosingStruct(in: analysis, atLine: 3) else {
+            Issue.record("Expected ServerConfig struct")
+            return
+        }
+
+        let count = GoStructTagGenerator.applyStructTags(in: buffer, structEntry: structEntry, style: .jsonSnake)
+        #expect(count == 2)
+        #expect(buffer.lineContent(at: 3).contains("`json:\"host_name\"`"))
+        #expect(buffer.lineContent(at: 4).contains("`json:\"read_timeout\"`"))
+
+        let countYaml = GoStructTagGenerator.applyStructTags(in: buffer, structEntry: structEntry, style: .jsonYaml)
+        #expect(countYaml == 2)
+        #expect(buffer.lineContent(at: 3).contains("`json:\"host_name\" yaml:\"host_name\"`"))
+    }
+
+    @Test("GoLand Table-Driven Test Generator and Bidirectional Interface Navigation")
+    func golandTableTestAndInterfaceNavigation() {
+        let source = """
+        package main
+
+        type Handler interface {
+        \tServe() error
+        }
+
+        type Worker struct{}
+
+        func (w *Worker) Serve() error {
+        \treturn nil
+        }
+        """
+        let buffer = TextBuffer(source)
+        let highlighter = SyntaxHighlighter()
+        let analysis = highlighter.analyzeGoAST(in: buffer)
+
+        // Bidirectional interface <-> struct mapping
+        #expect(analysis.interfaceImplementors[2] == ["Worker"])
+        #expect(analysis.implicitInterfaceImpls[6] == ["Handler"])
+        #expect(GoSymbolNavigator.findDeclarationLine(forSymbol: "Handler", in: analysis) == 2)
+        #expect(GoSymbolNavigator.findDeclarationLine(forSymbol: "Worker", in: analysis) == 6)
+
+        guard let targetFn = GoTableTestGenerator.targetFunction(in: analysis, atLine: 8) else {
+            Issue.record("Expected Serve method")
+            return
+        }
+        let outcome = GoTableTestGenerator.appendOrLocateTableTest(for: targetFn, in: buffer, analysis: analysis)
+        #expect(outcome.created)
+        #expect(outcome.testName == "TestWorker_Serve")
+        #expect(buffer.string.contains("func TestWorker_Serve(t *testing.T)"))
+        #expect(buffer.string.contains("tests := []struct"))
+        #expect(buffer.string.contains("t.Run(tt.name, func(t *testing.T)"))
+    }
 }
+

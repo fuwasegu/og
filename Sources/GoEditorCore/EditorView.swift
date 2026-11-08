@@ -47,11 +47,13 @@ public final class EditorView: NSView {
     public var onBufferModified: ((TextBuffer) -> Void)?
     public var onCursorChanged: ((TextPosition) -> Void)?
     public var onRunGoTestRequested: ((GoASTAnalysis.FuncEntry) -> Void)?
+    public var onRunMainRequested: (() -> Void)?
     public var onDefinitionRequested: ((TextPosition) -> Void)?
     public var onRenameRequested: ((TextPosition) -> Void)?
     public var onToggleTerminalRequested: (() -> Void)?
     public var onSaveRequested: (() -> Void)?
     public var onOpenFileRequested: (() -> Void)?
+    public var onStatusMessage: ((String) -> Void)?
 
     public var editorFont: NSFont = NSFont.monospacedSystemFont(ofSize: 13.5, weight: .regular) {
         didSet { computeFontMetrics() }
@@ -62,7 +64,7 @@ public final class EditorView: NSView {
     private let gutterWidth: CGFloat = 68.0
     private let textLeftPadding: CGFloat = 12.0
 
-    private(set) var astAnalysis = GoASTAnalysis(
+    public private(set) var astAnalysis = GoASTAnalysis(
         packageName: "main",
         importsBlock: "",
         functions: [],
@@ -71,7 +73,15 @@ public final class EditorView: NSView {
         implicitInterfaceImpls: [:]
     )
 
-    private var testButtonHitRects: [(rect: CGRect, funcEntry: GoASTAnalysis.FuncEntry)] = []
+    private enum BadgeAction {
+        case runTest(GoASTAnalysis.FuncEntry)
+        case runMain
+        case jumpToSymbol(String)
+        case generateStructTags(GoASTAnalysis.TypeEntry)
+        case generateTableTest(GoASTAnalysis.FuncEntry)
+    }
+
+    private var badgeHitRects: [(rect: CGRect, action: BadgeAction)] = []
 
     public init(buffer: TextBuffer = TextBuffer(""), frame frameRect: NSRect = .zero) {
         self.buffer = buffer
@@ -127,7 +137,7 @@ public final class EditorView: NSView {
 
         let attrText = highlighter.attributedString(for: buffer, font: editorFont)
         let visibleLines = computeVisibleLines()
-        testButtonHitRects.removeAll()
+        badgeHitRects.removeAll()
         guard !visibleLines.isEmpty else { return }
 
         let firstVisualRow = max(0, Int(floor(dirtyRect.minY / lineHeight)))
@@ -175,51 +185,95 @@ public final class EditorView: NSView {
                 badgeX = r.maxX + 8
             }
 
-            if let impls = astAnalysis.implicitInterfaceImpls[docLine] {
+            if let impls = astAnalysis.implicitInterfaceImpls[docLine], let firstIface = impls.first {
                 let label = "⇄ implements " + impls.joined(separator: ", ")
                 let r = drawBadge(
                     text: label,
                     at: CGPoint(x: badgeX, y: rowY + 3),
-                    backgroundColor: NSColor(calibratedRed: 0.05, green: 0.30, blue: 0.38, alpha: 0.85),
+                    backgroundColor: NSColor(calibratedRed: 0.05, green: 0.30, blue: 0.38, alpha: 0.88),
                     textColor: NSColor(calibratedRed: 0.45, green: 0.92, blue: 1.0, alpha: 1.0)
                 )
+                badgeHitRects.append((rect: r, action: .jumpToSymbol(firstIface)))
                 badgeX = r.maxX + 8
             }
 
-            if let fn = astAnalysis.functions.first(where: { $0.startLine == docLine && ($0.isTest || $0.isBenchmark) }) {
-                let btnTitle = fn.isBenchmark ? "▶ Bench" : "▶ Run Test"
-                let btnRect = drawBadge(
-                    text: btnTitle,
+            if let implementors = astAnalysis.interfaceImplementors[docLine], let firstStruct = implementors.first {
+                let label = "⇣ implemented by " + implementors.joined(separator: ", ")
+                let r = drawBadge(
+                    text: label,
                     at: CGPoint(x: badgeX, y: rowY + 3),
-                    backgroundColor: NSColor(calibratedRed: 0.14, green: 0.38, blue: 0.24, alpha: 0.95),
-                    textColor: NSColor(calibratedRed: 0.65, green: 0.98, blue: 0.75, alpha: 1.0)
+                    backgroundColor: NSColor(calibratedRed: 0.22, green: 0.16, blue: 0.40, alpha: 0.88),
+                    textColor: NSColor(calibratedRed: 0.80, green: 0.70, blue: 1.0, alpha: 1.0)
                 )
-                testButtonHitRects.append((rect: btnRect, funcEntry: fn))
-                badgeX = btnRect.maxX + 8
+                badgeHitRects.append((rect: r, action: .jumpToSymbol(firstStruct)))
+                badgeX = r.maxX + 8
+            }
 
-                if let res = inlineTestResults[docLine] {
-                    let statusIcon = res.passed ? "✓ PASS" : "✗ FAIL"
-                    let metricText = [
-                        statusIcon,
-                        String(format: "%.3fs", res.durationSeconds),
-                        res.nsPerOp,
-                        res.allocsPerOp
-                    ].compactMap { $0 }.joined(separator: " · ")
+            if let structType = astAnalysis.types.first(where: { $0.startLine == docLine && $0.kind == "struct" }) {
+                let tagRect = drawBadge(
+                    text: "🏷 +json tags",
+                    at: CGPoint(x: badgeX, y: rowY + 3),
+                    backgroundColor: NSColor(calibratedRed: 0.32, green: 0.24, blue: 0.10, alpha: 0.88),
+                    textColor: NSColor(calibratedRed: 0.98, green: 0.82, blue: 0.48, alpha: 1.0)
+                )
+                badgeHitRects.append((rect: tagRect, action: .generateStructTags(structType)))
+                badgeX = tagRect.maxX + 8
+            }
 
-                    let bg = res.passed
-                        ? NSColor(calibratedRed: 0.10, green: 0.32, blue: 0.18, alpha: 0.85)
-                        : NSColor(calibratedRed: 0.42, green: 0.12, blue: 0.14, alpha: 0.90)
-                    let fg = res.passed
-                        ? NSColor(calibratedRed: 0.55, green: 0.95, blue: 0.68, alpha: 1.0)
-                        : NSColor(calibratedRed: 1.0, green: 0.62, blue: 0.65, alpha: 1.0)
-
-                    let r = drawBadge(
-                        text: metricText,
+            if let fn = astAnalysis.functions.first(where: { $0.startLine == docLine }) {
+                if fn.isTest || fn.isBenchmark {
+                    let btnTitle = fn.isBenchmark ? "▶ Bench" : "▶ Run Test"
+                    let btnRect = drawBadge(
+                        text: btnTitle,
                         at: CGPoint(x: badgeX, y: rowY + 3),
-                        backgroundColor: bg,
-                        textColor: fg
+                        backgroundColor: NSColor(calibratedRed: 0.14, green: 0.38, blue: 0.24, alpha: 0.95),
+                        textColor: NSColor(calibratedRed: 0.65, green: 0.98, blue: 0.75, alpha: 1.0)
                     )
-                    badgeX = r.maxX + 8
+                    badgeHitRects.append((rect: btnRect, action: .runTest(fn)))
+                    badgeX = btnRect.maxX + 8
+
+                    if let res = inlineTestResults[docLine] {
+                        let statusIcon = res.passed ? "✓ PASS" : "✗ FAIL"
+                        let metricText = [
+                            statusIcon,
+                            String(format: "%.3fs", res.durationSeconds),
+                            res.nsPerOp,
+                            res.allocsPerOp
+                        ].compactMap { $0 }.joined(separator: " · ")
+
+                        let bg = res.passed
+                            ? NSColor(calibratedRed: 0.10, green: 0.32, blue: 0.18, alpha: 0.85)
+                            : NSColor(calibratedRed: 0.42, green: 0.12, blue: 0.14, alpha: 0.90)
+                        let fg = res.passed
+                            ? NSColor(calibratedRed: 0.55, green: 0.95, blue: 0.68, alpha: 1.0)
+                            : NSColor(calibratedRed: 1.0, green: 0.62, blue: 0.65, alpha: 1.0)
+
+                        let r = drawBadge(
+                            text: metricText,
+                            at: CGPoint(x: badgeX, y: rowY + 3),
+                            backgroundColor: bg,
+                            textColor: fg
+                        )
+                        badgeX = r.maxX + 8
+                    }
+                } else if fn.isMain {
+                    let runMainRect = drawBadge(
+                        text: "▶ Run main",
+                        at: CGPoint(x: badgeX, y: rowY + 3),
+                        backgroundColor: NSColor(calibratedRed: 0.12, green: 0.40, blue: 0.28, alpha: 0.95),
+                        textColor: NSColor(calibratedRed: 0.60, green: 0.98, blue: 0.80, alpha: 1.0)
+                    )
+                    badgeHitRects.append((rect: runMainRect, action: .runMain))
+                    badgeX = runMainRect.maxX + 8
+                } else {
+                    let genTestRect = drawBadge(
+                        text: "🧪 +Table Test",
+                        at: CGPoint(x: badgeX, y: rowY + 3),
+                        backgroundColor: NSColor(calibratedRed: 0.14, green: 0.24, blue: 0.38, alpha: 0.85),
+                        textColor: NSColor(calibratedRed: 0.68, green: 0.86, blue: 1.0, alpha: 1.0)
+                    )
+                    badgeHitRects.append((rect: genTestRect, action: .generateTableTest(fn)))
+                    badgeX = genTestRect.maxX + 8
                 }
             }
 
@@ -245,7 +299,14 @@ public final class EditorView: NSView {
                 ctx.setFillColor(theme.caretColor.cgColor)
                 ctx.fill(CGRect(x: caretX, y: rowY + 2, width: 2.0, height: lineHeight - 4))
 
-                if !ghostText.isEmpty {
+                if let postfixCandidate = GoPostfixCompletionEngine.matchCandidate(in: buffer, at: cursorPosition) {
+                    _ = drawBadge(
+                        text: "⚡ Postfix [Tab]: \(postfixCandidate.previewLabel)",
+                        at: CGPoint(x: max(badgeX, caretX + 10), y: rowY + 3),
+                        backgroundColor: NSColor(calibratedRed: 0.08, green: 0.34, blue: 0.36, alpha: 0.95),
+                        textColor: NSColor(calibratedRed: 0.35, green: 0.96, blue: 0.88, alpha: 1.0)
+                    )
+                } else if !ghostText.isEmpty {
                     let firstGhostLine = ghostText.components(separatedBy: "\n").first ?? ghostText
                     let ghostAttr = NSAttributedString(
                         string: firstGhostLine + "  [Tab]",
@@ -368,14 +429,26 @@ public final class EditorView: NSView {
         window?.makeFirstResponder(self)
         let pt = convert(event.locationInWindow, from: nil)
 
-        for hit in testButtonHitRects where hit.rect.contains(pt) {
-            onRunGoTestRequested?(hit.funcEntry)
+        for hit in badgeHitRects where hit.rect.contains(pt) {
+            switch hit.action {
+            case .runTest(let fn):
+                onRunGoTestRequested?(fn)
+            case .runMain:
+                onRunMainRequested?()
+            case .jumpToSymbol(let symbol):
+                jumpToSymbol(named: symbol)
+            case .generateStructTags(let structEntry):
+                applyStructTags(for: structEntry, style: .jsonSnake)
+            case .generateTableTest(let fn):
+                generateTableTest(for: fn)
+            }
             return
         }
 
         let pos = textPosition(for: pt)
         if event.modifierFlags.contains(.command) {
             cursorPosition = pos
+            jumpToSymbolAtCursor()
             onDefinitionRequested?(pos)
             return
         }
@@ -432,6 +505,16 @@ public final class EditorView: NSView {
     override public func keyDown(with event: NSEvent) {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
 
+        if flags.contains(.option) && flags.contains(.shift) {
+            if event.keyCode == 126 {
+                moveCurrentLine(delta: -1)
+                return
+            } else if event.keyCode == 125 {
+                moveCurrentLine(delta: 1)
+                return
+            }
+        }
+
         if flags.contains(.command), let key = event.charactersIgnoringModifiers?.lowercased() {
             switch key {
             case "z":
@@ -451,6 +534,19 @@ public final class EditorView: NSView {
                 return
             case "r" where flags.contains(.shift):
                 onRenameRequested?(cursorPosition)
+                return
+            case "t" where flags.contains(.shift):
+                generateStructTagsAtCursor(style: .jsonSnake)
+                return
+            case "g" where flags.contains(.shift):
+                generateTableTestAtCursor()
+                return
+            case "b":
+                jumpToSymbolAtCursor()
+                onDefinitionRequested?(cursorPosition)
+                return
+            case "d":
+                duplicateSelectionOrLine()
                 return
             case "c":
                 copySelectionOrLine()
@@ -483,7 +579,14 @@ public final class EditorView: NSView {
 
         switch event.keyCode {
         case 48:
-            if !ghostText.isEmpty {
+            if let candidate = GoPostfixCompletionEngine.matchCandidate(in: buffer, at: cursorPosition),
+               let expandedPos = GoPostfixCompletionEngine.tryExpand(in: buffer, at: cursorPosition) {
+                ghostText = ""
+                selectionAnchor = nil
+                cursorPosition = expandedPos
+                notifyBufferDidMutate()
+                onStatusMessage?("⚡ Postfix expanded `.\(candidate.key)` → `\(candidate.previewLabel)`")
+            } else if !ghostText.isEmpty {
                 let accepted = ghostText
                 ghostText = ""
                 insertUserText(accepted)
@@ -512,6 +615,107 @@ public final class EditorView: NSView {
                 handleTypedCharacters(chars)
             }
         }
+    }
+
+    public func jumpToSymbolAtCursor() {
+        let range = wordRange(at: cursorPosition)
+        let startOff = buffer.characterOffset(for: range.start)
+        let endOff = buffer.characterOffset(for: range.end)
+        let word = buffer.substring(in: startOff..<endOff).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !word.isEmpty else { return }
+        jumpToSymbol(named: word)
+    }
+
+    public func jumpToSymbol(named symbol: String) {
+        guard let targetLine = GoSymbolNavigator.findDeclarationLine(forSymbol: symbol, in: astAnalysis) else {
+            onStatusMessage?("Symbol `\(symbol)` not found in current file.")
+            return
+        }
+        jumpToLine(targetLine)
+        onStatusMessage?("Jumped to `\(symbol)` (Ln \(targetLine + 1)).")
+    }
+
+    public func jumpToLine(_ line: Int) {
+        let clamped = max(0, min(buffer.lineCount - 1, line))
+        selectionAnchor = nil
+        cursorPosition = TextPosition(line: clamped, column: 0)
+        let targetY = max(0, CGFloat(clamped - 3) * lineHeight)
+        scroll(CGPoint(x: 0, y: targetY))
+        needsDisplay = true
+    }
+
+    public func generateStructTagsAtCursor(style: GoStructTagStyle = .jsonSnake) {
+        guard let structEntry = GoStructTagGenerator.enclosingStruct(in: astAnalysis, atLine: cursorPosition.line) else {
+            onStatusMessage?("No Go struct found in current file.")
+            return
+        }
+        applyStructTags(for: structEntry, style: style)
+    }
+
+    public func applyStructTags(for structEntry: GoASTAnalysis.TypeEntry, style: GoStructTagStyle) {
+        let count = GoStructTagGenerator.applyStructTags(in: buffer, structEntry: structEntry, style: style)
+        notifyBufferDidMutate()
+        onStatusMessage?("Generated \(style.rawValue) tags for \(count) fields on `type \(structEntry.name) struct`.")
+    }
+
+    public func generateTableTestAtCursor() {
+        guard let fn = GoTableTestGenerator.targetFunction(in: astAnalysis, atLine: cursorPosition.line) else {
+            onStatusMessage?("No target Go function found to generate a table test.")
+            return
+        }
+        generateTableTest(for: fn)
+    }
+
+    public func generateTableTest(for fn: GoASTAnalysis.FuncEntry) {
+        let outcome = GoTableTestGenerator.appendOrLocateTableTest(for: fn, in: buffer, analysis: astAnalysis)
+        notifyBufferDidMutate()
+        jumpToLine(outcome.position.line)
+        if outcome.created {
+            onStatusMessage?("Generated GoLand Table-Driven Test `\(outcome.testName)` for `\(fn.name)`.")
+        } else {
+            onStatusMessage?("Jumped to existing test `\(outcome.testName)` (Ln \(outcome.position.line + 1)).")
+        }
+    }
+
+    public func duplicateSelectionOrLine() {
+        if let sel = currentSelectionRange() {
+            let startOff = buffer.characterOffset(for: sel.start)
+            let endOff = buffer.characterOffset(for: sel.end)
+            let slice = buffer.substring(in: startOff..<endOff)
+            cursorPosition = buffer.insert(slice, at: endOff)
+            selectionAnchor = nil
+        } else {
+            let lineText = buffer.lineContent(at: cursorPosition.line)
+            let lineRange = buffer.lineCharacterRange(at: cursorPosition.line)
+            _ = buffer.insert("\n" + lineText, at: lineRange.upperBound)
+            cursorPosition = TextPosition(line: cursorPosition.line + 1, column: cursorPosition.column)
+        }
+        notifyBufferDidMutate()
+        onStatusMessage?("Duplicated line (⌘D).")
+    }
+
+    public func moveCurrentLine(delta: Int) {
+        let line = cursorPosition.line
+        let targetLine = line + delta
+        guard targetLine >= 0 && targetLine < buffer.lineCount else { return }
+
+        let currentText = buffer.lineContent(at: line)
+        let neighborText = buffer.lineContent(at: targetLine)
+        let col = cursorPosition.column
+
+        let firstLine = min(line, targetLine)
+        let secondLine = max(line, targetLine)
+        let startOff = buffer.lineCharacterRange(at: firstLine).lowerBound
+        let endOff = buffer.lineCharacterRange(at: secondLine).upperBound
+
+        let replacement = (delta < 0)
+            ? "\(currentText)\n\(neighborText)"
+            : "\(neighborText)\n\(currentText)"
+
+        _ = buffer.replace(range: startOff..<endOff, with: replacement)
+        cursorPosition = TextPosition(line: targetLine, column: min(col, currentText.count))
+        selectionAnchor = nil
+        notifyBufferDidMutate()
     }
 
     private func handleTypedCharacters(_ chars: String) {
@@ -685,14 +889,17 @@ public struct GoEditorCanvasRepresentable: NSViewRepresentable {
     public let inlineTestResults: [Int: GoTestRunResult]
     public let foldErrorBlocks: Bool
     public let dimErrorBlocks: Bool
+    public let requestedJumpLine: Int?
     public var onBufferModified: ((TextBuffer) -> Void)?
     public var onCursorChanged: ((TextPosition) -> Void)?
     public var onRunGoTestRequested: ((GoASTAnalysis.FuncEntry) -> Void)?
+    public var onRunMainRequested: (() -> Void)?
     public var onDefinitionRequested: ((TextPosition) -> Void)?
     public var onRenameRequested: ((TextPosition) -> Void)?
     public var onToggleTerminalRequested: (() -> Void)?
     public var onSaveRequested: (() -> Void)?
     public var onOpenFileRequested: (() -> Void)?
+    public var onStatusMessage: ((String) -> Void)?
 
     public init(
         buffer: TextBuffer,
@@ -701,14 +908,17 @@ public struct GoEditorCanvasRepresentable: NSViewRepresentable {
         inlineTestResults: [Int: GoTestRunResult] = [:],
         foldErrorBlocks: Bool = false,
         dimErrorBlocks: Bool = true,
+        requestedJumpLine: Int? = nil,
         onBufferModified: ((TextBuffer) -> Void)? = nil,
         onCursorChanged: ((TextPosition) -> Void)? = nil,
         onRunGoTestRequested: ((GoASTAnalysis.FuncEntry) -> Void)? = nil,
+        onRunMainRequested: (() -> Void)? = nil,
         onDefinitionRequested: ((TextPosition) -> Void)? = nil,
         onRenameRequested: ((TextPosition) -> Void)? = nil,
         onToggleTerminalRequested: (() -> Void)? = nil,
         onSaveRequested: (() -> Void)? = nil,
-        onOpenFileRequested: (() -> Void)? = nil
+        onOpenFileRequested: (() -> Void)? = nil,
+        onStatusMessage: ((String) -> Void)? = nil
     ) {
         self.buffer = buffer
         self.filePath = filePath
@@ -716,14 +926,17 @@ public struct GoEditorCanvasRepresentable: NSViewRepresentable {
         self.inlineTestResults = inlineTestResults
         self.foldErrorBlocks = foldErrorBlocks
         self.dimErrorBlocks = dimErrorBlocks
+        self.requestedJumpLine = requestedJumpLine
         self.onBufferModified = onBufferModified
         self.onCursorChanged = onCursorChanged
         self.onRunGoTestRequested = onRunGoTestRequested
+        self.onRunMainRequested = onRunMainRequested
         self.onDefinitionRequested = onDefinitionRequested
         self.onRenameRequested = onRenameRequested
         self.onToggleTerminalRequested = onToggleTerminalRequested
         self.onSaveRequested = onSaveRequested
         self.onOpenFileRequested = onOpenFileRequested
+        self.onStatusMessage = onStatusMessage
     }
 
     public func makeNSView(context: Context) -> NSScrollView {
@@ -753,10 +966,16 @@ public struct GoEditorCanvasRepresentable: NSViewRepresentable {
         editor.onBufferModified = onBufferModified
         editor.onCursorChanged = onCursorChanged
         editor.onRunGoTestRequested = onRunGoTestRequested
+        editor.onRunMainRequested = onRunMainRequested
         editor.onDefinitionRequested = onDefinitionRequested
         editor.onRenameRequested = onRenameRequested
         editor.onToggleTerminalRequested = onToggleTerminalRequested
         editor.onSaveRequested = onSaveRequested
         editor.onOpenFileRequested = onOpenFileRequested
+        editor.onStatusMessage = onStatusMessage
+
+        if let jumpLine = requestedJumpLine, editor.cursorPosition.line != jumpLine {
+            editor.jumpToLine(jumpLine)
+        }
     }
 }

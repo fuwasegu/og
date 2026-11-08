@@ -37,6 +37,27 @@ public struct GoASTAnalysis: Sendable {
         public let endLine: Int
         public let isTest: Bool
         public let isBenchmark: Bool
+        public let isMain: Bool
+
+        public init(
+            name: String,
+            receiverType: String?,
+            signature: String,
+            startLine: Int,
+            endLine: Int,
+            isTest: Bool,
+            isBenchmark: Bool,
+            isMain: Bool = false
+        ) {
+            self.name = name
+            self.receiverType = receiverType
+            self.signature = signature
+            self.startLine = startLine
+            self.endLine = endLine
+            self.isTest = isTest
+            self.isBenchmark = isBenchmark
+            self.isMain = isMain
+        }
     }
 
     public struct TypeEntry: Sendable, Equatable {
@@ -53,6 +74,7 @@ public struct GoASTAnalysis: Sendable {
     public let types: [TypeEntry]
     public let errorHandlingBlocks: [ClosedRange<Int>]
     public let implicitInterfaceImpls: [Int: [String]]
+    public let interfaceImplementors: [Int: [String]]
 
     public init(
         packageName: String,
@@ -60,7 +82,8 @@ public struct GoASTAnalysis: Sendable {
         functions: [FuncEntry],
         types: [TypeEntry],
         errorHandlingBlocks: [ClosedRange<Int>],
-        implicitInterfaceImpls: [Int: [String]]
+        implicitInterfaceImpls: [Int: [String]],
+        interfaceImplementors: [Int: [String]] = [:]
     ) {
         self.packageName = packageName
         self.importsBlock = importsBlock
@@ -68,6 +91,7 @@ public struct GoASTAnalysis: Sendable {
         self.types = types
         self.errorHandlingBlocks = errorHandlingBlocks
         self.implicitInterfaceImpls = implicitInterfaceImpls
+        self.interfaceImplementors = interfaceImplementors
     }
 }
 
@@ -303,16 +327,25 @@ public final class SyntaxHighlighter: @unchecked Sendable {
         }
 
         var implicitImpls: [Int: [String]] = [:]
+        var ifaceImplsByName: [String: [String]] = [:]
         for typeEntry in types where typeEntry.kind == "struct" {
             let implemented = structMethods[typeEntry.name] ?? []
             var satisfied: [String] = []
             for (ifaceName, reqMethods) in interfaceRequirements where !reqMethods.isEmpty {
                 if reqMethods.isSubset(of: implemented) {
                     satisfied.append(ifaceName)
+                    ifaceImplsByName[ifaceName, default: []].append(typeEntry.name)
                 }
             }
             if !satisfied.isEmpty {
                 implicitImpls[typeEntry.startLine] = satisfied.sorted()
+            }
+        }
+
+        var interfaceImplementors: [Int: [String]] = [:]
+        for typeEntry in types where typeEntry.kind == "interface" {
+            if let structs = ifaceImplsByName[typeEntry.name], !structs.isEmpty {
+                interfaceImplementors[typeEntry.startLine] = structs.sorted()
             }
         }
 
@@ -322,7 +355,8 @@ public final class SyntaxHighlighter: @unchecked Sendable {
             functions: functions,
             types: types,
             errorHandlingBlocks: errorBlocks,
-            implicitInterfaceImpls: implicitImpls
+            implicitInterfaceImpls: implicitImpls,
+            interfaceImplementors: interfaceImplementors
         )
     }
 
@@ -364,6 +398,7 @@ public final class SyntaxHighlighter: @unchecked Sendable {
         let signature = line.replacingOccurrences(of: "{", with: "").trimmingCharacters(in: .whitespaces)
         let isTest = receiverType == nil && funcName.hasPrefix("Test") && line.contains("*testing.T")
         let isBenchmark = receiverType == nil && funcName.hasPrefix("Benchmark") && line.contains("*testing.B")
+        let isMain = receiverType == nil && funcName == "main"
 
         return GoASTAnalysis.FuncEntry(
             name: funcName,
@@ -372,7 +407,8 @@ public final class SyntaxHighlighter: @unchecked Sendable {
             startLine: startLine,
             endLine: endLine,
             isTest: isTest,
-            isBenchmark: isBenchmark
+            isBenchmark: isBenchmark,
+            isMain: isMain
         )
     }
 
