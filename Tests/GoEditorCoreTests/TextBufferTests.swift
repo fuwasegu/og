@@ -173,4 +173,23 @@ struct TextBufferTests {
             #expect(diskAfterRollback == initial)
         }
     }
+
+    @Test("Native PTY TerminalScreenBuffer ANSI CSI parsing and SGR colors")
+    func nativeTerminalScreenBufferANSIParsing() {
+        var screen = TerminalScreenBuffer(cols: 40, rows: 6)
+        screen.feed("\u{1B}[32mPASS\u{1B}[0m go test\r\nLine2")
+
+        #expect(screen.grid[0][0].scalar == "P")
+        #expect(screen.grid[0][0].foreground == .ansi(2))
+        #expect(screen.grid[0][5].scalar == "g")
+        #expect(screen.grid[0][5].foreground == .defaultForeground)
+        #expect(screen.grid[1][0].scalar == "L")
+        #expect(screen.cursorRow == 1)
+        #expect(screen.cursorCol == 5)
+
+        screen.feed("\u{1B}[2J")
+        #expect(screen.cursorRow == 0)
+        #expect(screen.cursorCol == 0)
+        #expect(screen.grid[0][0].scalar == " ")
+    }
 }

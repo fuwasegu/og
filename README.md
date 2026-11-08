@@ -15,23 +15,33 @@ og/
 ├── Sources/
 │   ├── GoEditorCore/                    # コアライブラリターゲット (UI / テストから参照)
 │   │   ├── TextBuffer.swift             # Rope ベース O(log N) テキストバッファ & Undo/Redo
-│   │   ├── SyntaxHighlighter.swift      # swift-tree-sitter (tree-sitter-go) 0ms ハイライト & AST解析
+│   │   ├── SyntaxHighlighter.swift      # swift-tree-sitter 0ms ハイライトキャッシュ & AST解析
 │   │   ├── GoplsClient.swift            # gopls 専用 JSON-RPC 2.0 クライアント & オートヒーリング監視
 │   │   ├── GoToolingEngine.swift        # アトミック・シンボルリネーム (Diffプレビュー/ロールバック) & go test
 │   │   ├── InlineCompletion.swift       # ローカルLLM (llama-server FIM) ストリーミング補完
-│   │   └── EditorView.swift             # AppKit NSView + CoreText 等幅ダイレクト描画キャンバス
+│   │   ├── NativeTerminal.swift         # Darwin openpty + CoreText 120fps ネイティブ PTY ターミナル
+│   │   └── EditorView.swift             # AppKit NSView + CoreText ビューポート限定 120fps 描画キャンバス
 │   └── GoEditorApp/                     # macOS 実行可能ターゲット (@main)
-│       └── GoEditorApp.swift            # SwiftUI ウィンドウシェル・ツールバー・リネームプレビューシート
+│       └── GoEditorApp.swift            # SwiftUI ウィンドウシェル・統合ターミナルドック・リネームシート
 └── Tests/
     └── GoEditorCoreTests/               # Swift Testing 単体テストターゲット
-        ├── TextBufferTests.swift        # Rope編集・UTF-8/UTF-16変換・AST解析・FIMプロンプト・リネーム検証
+        ├── TextBufferTests.swift        # Rope編集・UTF-8/UTF-16変換・AST解析・FIM・PTYターミナル検証
         └── TestHelpers.swift            # テスト用ワークスペース・一時ファイルヘルパー
 ```
+
+## 主なショートカット
+
+- `⌘J` : ネイティブ PTY ターミナルの表示 / 非表示トグル
+- `⌘S` : ファイル保存 + `gofmt` 自動フォーマット
+- `⌘O` : `.go` ファイルを開く
+- `⌘/` : 行コメント (`//`) トグル
+- `⌘⇧R` : トランザクショナル・シンボルリネーム（Unified Diff プレビュー付き）
+- `Tab` : インライン AI 補完（Ghost Text）確定
 
 ## ビルド・テスト・実行方法
 
 ```bash
-swift build
+swift build -c release
 swift test --parallel
 swift run og
 ```

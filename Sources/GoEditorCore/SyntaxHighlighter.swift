@@ -144,6 +144,12 @@ public final class SyntaxHighlighter: @unchecked Sendable {
         #endif
     }
 
+    private var cachedBufferID: ObjectIdentifier?
+    private var cachedBufferVersion: Int = -1
+    private var cachedDimSetting: Bool = true
+    private var cachedFontSize: CGFloat = 0
+    private var cachedAttributedText: NSAttributedString?
+
     public func computeHighlights(
         in buffer: TextBuffer,
         semanticOverlays: [HighlightSpan] = []
@@ -167,6 +173,16 @@ public final class SyntaxHighlighter: @unchecked Sendable {
         font: NSFont,
         semanticOverlays: [HighlightSpan] = []
     ) -> NSAttributedString {
+        let bufID = ObjectIdentifier(buffer)
+        if semanticOverlays.isEmpty,
+           let cached = cachedAttributedText,
+           cachedBufferID == bufID,
+           cachedBufferVersion == buffer.version,
+           cachedDimSetting == dimErrorBoilerplate,
+           cachedFontSize == font.pointSize {
+            return cached
+        }
+
         let text = buffer.string
         let attr = NSMutableAttributedString(
             string: text,
@@ -188,6 +204,14 @@ public final class SyntaxHighlighter: @unchecked Sendable {
             let nsRange = NSRange(location: utf16Start, length: max(0, utf16End - utf16Start))
             let color = theme.color(for: span.category, dimErrorBoilerplate: dimErrorBoilerplate)
             attr.addAttribute(.foregroundColor, value: color, range: nsRange)
+        }
+
+        if semanticOverlays.isEmpty {
+            cachedBufferID = bufID
+            cachedBufferVersion = buffer.version
+            cachedDimSetting = dimErrorBoilerplate
+            cachedFontSize = font.pointSize
+            cachedAttributedText = attr
         }
 
         return attr

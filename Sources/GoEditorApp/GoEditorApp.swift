@@ -25,16 +25,19 @@ final class WorkspaceViewModel: ObservableObject {
     @Published var dimErrorBlocks: Bool = true
     @Published var goplsHealth: GoplsHealthStatus = .healthy(latencyMs: 0.8)
 
+    @Published var isShowingTerminal: Bool = true
+    @Published var terminalHeight: CGFloat = 210
     @Published var isShowingRenameSheet: Bool = false
     @Published var renameOldSymbol: String = "Server"
     @Published var renameNewSymbol: String = "HTTPServer"
     @Published var renamePreviews: [FileRenameDiffPreview] = []
     @Published var canRollbackRename: Bool = false
-    @Published var statusBannerMessage: String = "Ready — CoreText 120fps · Rope Buffer · Tree-sitter Go"
+    @Published var statusBannerMessage: String = "Ready — CoreText 120fps · Rope Buffer · Native PTY Terminal"
 
     let goplsClient = GoplsClient()
     let renameManager = TransactionalRenameManager()
     let testRunner = GoTestRunner()
+    let terminalSession: NativePTYSession
 
     init() {
         let sampleGoSource = """
@@ -104,6 +107,39 @@ final class WorkspaceViewModel: ObservableObject {
         try? sampleGoSource.write(to: tempURL, atomically: true, encoding: .utf8)
         self.currentFileURL = tempURL
         self.buffer = TextBuffer(sampleGoSource)
+        self.terminalSession = NativePTYSession(workingDirectory: tempURL.deletingLastPathComponent())
+
+        subscribeGoplsStreams()
+    }
+
+    private func subscribeGoplsStreams() {
+        let client = goplsClient
+        let rootDir = currentFileURL.deletingLastPathComponent()
+        let initialURI = currentFileURL.absoluteString
+        let initialText = buffer.string
+
+        Task {
+            do {
+                try await client.start(workspaceRoot: rootDir)
+                try await client.sendDidOpen(uri: initialURI, text: initialText)
+            } catch {
+                // Fallback to local Tree-sitter AST mode if gopls is not installed
+            }
+        }
+
+        Task {
+            for await (uri, diags) in client.diagnosticsStream {
+                if uri == self.currentFileURL.absoluteString {
+                    self.diagnostics = diags
+                }
+            }
+        }
+
+        Task {
+            for await health in client.healthStream {
+                self.goplsHealth = health
+            }
+        }
     }
 
     func notifyDocumentChanged(_ updatedBuffer: TextBuffer) {
@@ -113,6 +149,52 @@ final class WorkspaceViewModel: ObservableObject {
         try? updatedBuffer.string.write(to: currentFileURL, atomically: true, encoding: .utf8)
         Task {
             try? await goplsClient.sendDidChange(uri: uri, text: text, version: version)
+        }
+    }
+
+    func saveAndFormatDocument() {
+        do {
+            try buffer.string.write(to: currentFileURL, atomically: true, encoding: .utf8)
+            if let formatted = Self.runGofmt(on: currentFileURL.path), formatted != buffer.string {
+                try formatted.write(to: currentFileURL, atomically: true, encoding: .utf8)
+                self.buffer = TextBuffer(formatted)
+                statusBannerMessage = "Saved & formatted \(currentFileURL.lastPathComponent) with gofmt."
+            } else {
+                statusBannerMessage = "Saved \(currentFileURL.lastPathComponent)."
+            }
+            let uri = currentFileURL.absoluteString
+            let text = buffer.string
+            Task {
+                try? await goplsClient.sendDidSave(uri: uri, text: text)
+            }
+        } catch {
+            statusBannerMessage = "Save failed: \(error.localizedDescription)"
+        }
+    }
+
+    func openDocumentWithPanel() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url,
+           let content = try? String(contentsOf: url, encoding: .utf8) {
+            self.currentFileURL = url
+            self.buffer = TextBuffer(content)
+            self.inlineTestResults.removeAll()
+            self.diagnostics.removeAll()
+            self.terminalSession.startShell(in: url.deletingLastPathComponent())
+            self.statusBannerMessage = "Opened \(url.lastPathComponent)"
+            Task {
+                try? await goplsClient.sendDidOpen(uri: url.absoluteString, text: content)
+            }
+        }
+    }
+
+    func toggleTerminal() {
+        isShowingTerminal.toggle()
+        if isShowingTerminal {
+            terminalSession.startIfNeeded()
         }
     }
 
@@ -186,6 +268,28 @@ final class WorkspaceViewModel: ObservableObject {
             }
         }
     }
+
+    private static func runGofmt(on filePath: String) -> String? {
+        let candidates = ["/usr/local/go/bin/gofmt", "/opt/homebrew/bin/gofmt", "/usr/local/bin/gofmt", "/usr/bin/gofmt"]
+        guard let bin = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            return nil
+        }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: bin)
+        proc.arguments = [filePath]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+            guard proc.terminationStatus == 0 else { return nil }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            return String(data: data, encoding: .utf8)
+        } catch {
+            return nil
+        }
+    }
 }
 
 struct GoWorkspaceContentView: View {
@@ -193,9 +297,25 @@ struct GoWorkspaceContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 14) {
+            HStack(spacing: 12) {
                 Label(vm.currentFileURL.lastPathComponent, systemImage: "chevron.left.forwardslash.chevron.right")
                     .font(.system(size: 13, weight: .semibold, design: .monospaced))
+
+                Button {
+                    vm.openDocumentWithPanel()
+                } label: {
+                    Label("Open", systemImage: "folder")
+                        .font(.system(size: 11.5, weight: .medium))
+                }
+                .help("Open Go file (⌘O)")
+
+                Button {
+                    vm.saveAndFormatDocument()
+                } label: {
+                    Label("Save & gofmt", systemImage: "square.and.arrow.down")
+                        .font(.system(size: 11.5, weight: .medium))
+                }
+                .help("Save & format with gofmt (⌘S)")
 
                 Divider().frame(height: 16)
 
@@ -208,6 +328,13 @@ struct GoWorkspaceContentView: View {
                     .font(.system(size: 12))
 
                 Spacer()
+
+                Button {
+                    vm.toggleTerminal()
+                } label: {
+                    Label(vm.isShowingTerminal ? "Hide Terminal" : "Terminal (⌘J)", systemImage: "terminal")
+                        .font(.system(size: 12, weight: .medium))
+                }
 
                 Button {
                     vm.prepareTransactionalRename()
@@ -249,8 +376,24 @@ struct GoWorkspaceContentView: View {
                 },
                 onRenameRequested: { _ in
                     vm.prepareTransactionalRename()
+                },
+                onToggleTerminalRequested: {
+                    vm.toggleTerminal()
+                },
+                onSaveRequested: {
+                    vm.saveAndFormatDocument()
+                },
+                onOpenFileRequested: {
+                    vm.openDocumentWithPanel()
                 }
             )
+
+            if vm.isShowingTerminal {
+                Divider()
+                NativeTerminalDockView(session: vm.terminalSession, height: $vm.terminalHeight) {
+                    vm.isShowingTerminal = false
+                }
+            }
 
             Divider()
 
@@ -283,6 +426,76 @@ struct GoWorkspaceContentView: View {
         }
         .sheet(isPresented: $vm.isShowingRenameSheet) {
             TransactionalRenamePreviewSheet(vm: vm)
+        }
+    }
+}
+
+struct NativeTerminalDockView: View {
+    @ObservedObject var session: NativePTYSession
+    @Binding var height: CGFloat
+    var onClose: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                HStack(spacing: 6) {
+                    Image(systemName: "terminal.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.cyan)
+                    Text("TERMINAL — Native PTY (120fps CoreText)")
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                }
+
+                Divider().frame(height: 12)
+
+                Button {
+                    session.executeCommand("go test -v ./...")
+                } label: {
+                    Label("go test", systemImage: "play.fill")
+                        .font(.system(size: 11, design: .monospaced))
+                }
+                .buttonStyle(.borderless)
+
+                Button {
+                    session.executeCommand("go version")
+                } label: {
+                    Label("go version", systemImage: "bolt.fill")
+                        .font(.system(size: 11, design: .monospaced))
+                }
+                .buttonStyle(.borderless)
+
+                Button {
+                    session.clear()
+                } label: {
+                    Label("Clear (⌘K)", systemImage: "trash")
+                        .font(.system(size: 11, design: .monospaced))
+                }
+                .buttonStyle(.borderless)
+
+                Spacer()
+
+                Text(session.workingDirectory.path)
+                    .font(.system(size: 10.5, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+
+                Button {
+                    onClose()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .semibold))
+                }
+                .buttonStyle(.borderless)
+                .help("Hide Terminal (⌘J)")
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 5)
+            .background(Color(nsColor: NSColor(calibratedRed: 0.09, green: 0.10, blue: 0.13, alpha: 1.0)))
+
+            Divider()
+
+            NativeTerminalRepresentable(session: session)
+                .frame(height: height)
         }
     }
 }

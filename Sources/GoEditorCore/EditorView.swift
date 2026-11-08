@@ -49,6 +49,9 @@ public final class EditorView: NSView {
     public var onRunGoTestRequested: ((GoASTAnalysis.FuncEntry) -> Void)?
     public var onDefinitionRequested: ((TextPosition) -> Void)?
     public var onRenameRequested: ((TextPosition) -> Void)?
+    public var onToggleTerminalRequested: (() -> Void)?
+    public var onSaveRequested: (() -> Void)?
+    public var onOpenFileRequested: (() -> Void)?
 
     public var editorFont: NSFont = NSFont.monospacedSystemFont(ofSize: 13.5, weight: .regular) {
         didSet { computeFontMetrics() }
@@ -125,12 +128,15 @@ public final class EditorView: NSView {
         let attrText = highlighter.attributedString(for: buffer, font: editorFont)
         let visibleLines = computeVisibleLines()
         testButtonHitRects.removeAll()
+        guard !visibleLines.isEmpty else { return }
 
-        for (visualRow, docLine) in visibleLines.enumerated() {
+        let firstVisualRow = max(0, Int(floor(dirtyRect.minY / lineHeight)))
+        let lastVisualRow = min(visibleLines.count - 1, Int(ceil(dirtyRect.maxY / lineHeight)))
+        guard firstVisualRow <= lastVisualRow else { return }
+
+        for visualRow in firstVisualRow...lastVisualRow {
+            let docLine = visibleLines[visualRow]
             let rowY = CGFloat(visualRow) * lineHeight
-            if rowY + lineHeight < dirtyRect.minY || rowY > dirtyRect.maxY {
-                continue
-            }
 
             if docLine == cursorPosition.line {
                 ctx.setFillColor(theme.currentLineHighlight.cgColor)
@@ -375,6 +381,18 @@ public final class EditorView: NSView {
         }
 
         ghostText = ""
+        if event.clickCount >= 3 {
+            let lineLen = buffer.lineCharacterRange(at: pos.line).count
+            selectionAnchor = TextPosition(line: pos.line, column: 0)
+            cursorPosition = TextPosition(line: pos.line, column: lineLen)
+            return
+        } else if event.clickCount == 2 {
+            let wordRange = wordRange(at: pos)
+            selectionAnchor = wordRange.start
+            cursorPosition = wordRange.end
+            return
+        }
+
         if event.modifierFlags.contains(.shift) {
             if selectionAnchor == nil { selectionAnchor = cursorPosition }
             cursorPosition = pos
@@ -382,6 +400,28 @@ public final class EditorView: NSView {
             selectionAnchor = pos
             cursorPosition = pos
         }
+    }
+
+    private func wordRange(at pos: TextPosition) -> TextRange {
+        let lineChars = Array(buffer.lineContent(at: pos.line))
+        guard !lineChars.isEmpty else { return TextRange(start: pos, end: pos) }
+        let idx = min(max(0, pos.column), lineChars.count - 1)
+        let isWordChar: (Character) -> Bool = { $0.isLetter || $0.isNumber || $0 == "_" }
+        guard isWordChar(lineChars[idx]) else {
+            return TextRange(start: pos, end: TextPosition(line: pos.line, column: min(lineChars.count, idx + 1)))
+        }
+        var startCol = idx
+        while startCol > 0 && isWordChar(lineChars[startCol - 1]) {
+            startCol -= 1
+        }
+        var endCol = idx + 1
+        while endCol < lineChars.count && isWordChar(lineChars[endCol]) {
+            endCol += 1
+        }
+        return TextRange(
+            start: TextPosition(line: pos.line, column: startCol),
+            end: TextPosition(line: pos.line, column: endCol)
+        )
     }
 
     override public func mouseDragged(with event: NSEvent) {
@@ -392,8 +432,9 @@ public final class EditorView: NSView {
     override public func keyDown(with event: NSEvent) {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
 
-        if flags.contains(.command) {
-            if event.charactersIgnoringModifiers?.lowercased() == "z" {
+        if flags.contains(.command), let key = event.charactersIgnoringModifiers?.lowercased() {
+            switch key {
+            case "z":
                 if flags.contains(.shift) {
                     if let pos = buffer.redo() {
                         cursorPosition = pos
@@ -408,10 +449,35 @@ public final class EditorView: NSView {
                     }
                 }
                 return
-            }
-            if event.charactersIgnoringModifiers?.lowercased() == "r" && flags.contains(.shift) {
+            case "r" where flags.contains(.shift):
                 onRenameRequested?(cursorPosition)
                 return
+            case "c":
+                copySelectionOrLine()
+                return
+            case "x":
+                cutSelectionOrLine()
+                return
+            case "v":
+                pasteFromClipboard()
+                return
+            case "a":
+                selectAllDocument()
+                return
+            case "/":
+                toggleLineComment()
+                return
+            case "j":
+                onToggleTerminalRequested?()
+                return
+            case "s":
+                onSaveRequested?()
+                return
+            case "o":
+                onOpenFileRequested?()
+                return
+            default:
+                break
             }
         }
 
@@ -443,9 +509,79 @@ public final class EditorView: NSView {
             needsDisplay = true
         default:
             if let chars = event.characters, !chars.isEmpty, !flags.contains(.command), !flags.contains(.control) {
-                insertUserText(chars)
+                handleTypedCharacters(chars)
             }
         }
+    }
+
+    private func handleTypedCharacters(_ chars: String) {
+        if currentSelectionRange() == nil {
+            let pairs: [String: String] = ["{": "}", "(": ")", "[": "]", "\"": "\""]
+            if let closing = pairs[chars] {
+                let offset = buffer.characterOffset(for: cursorPosition)
+                _ = buffer.insert(chars + closing, at: offset)
+                cursorPosition = buffer.position(forCharacterOffset: offset + 1)
+                notifyBufferDidMutate()
+                return
+            }
+        }
+        insertUserText(chars)
+    }
+
+    public func copySelectionOrLine() {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        if let sel = currentSelectionRange() {
+            let startOff = buffer.characterOffset(for: sel.start)
+            let endOff = buffer.characterOffset(for: sel.end)
+            pb.setString(buffer.substring(in: startOff..<endOff), forType: .string)
+        } else {
+            let lineText = buffer.lineContent(at: cursorPosition.line) + "\n"
+            pb.setString(lineText, forType: .string)
+        }
+    }
+
+    public func cutSelectionOrLine() {
+        copySelectionOrLine()
+        if let sel = currentSelectionRange() {
+            cursorPosition = buffer.replace(textRange: sel, with: "")
+            selectionAnchor = nil
+            notifyBufferDidMutate()
+        } else {
+            let lineRange = buffer.lineCharacterRange(at: cursorPosition.line)
+            let endBound = min(buffer.count, lineRange.upperBound + 1)
+            cursorPosition = buffer.delete(in: lineRange.lowerBound..<endBound)
+            notifyBufferDidMutate()
+        }
+    }
+
+    public func pasteFromClipboard() {
+        guard let text = NSPasteboard.general.string(forType: .string), !text.isEmpty else { return }
+        insertUserText(text)
+    }
+
+    public func selectAllDocument() {
+        selectionAnchor = .zero
+        cursorPosition = buffer.position(forCharacterOffset: buffer.count)
+    }
+
+    public func toggleLineComment() {
+        let range = currentSelectionRange() ?? TextRange(start: cursorPosition, end: cursorPosition)
+        for line in range.start.line...range.end.line {
+            let content = buffer.lineContent(at: line)
+            let trimmed = content.trimmingCharacters(in: .whitespaces)
+            let lineCharRange = buffer.lineCharacterRange(at: line)
+            if trimmed.hasPrefix("// ") {
+                let updated = content.replacingOccurrences(of: "// ", with: "", options: [], range: content.range(of: "// "))
+                _ = buffer.replace(range: lineCharRange, with: updated)
+            } else if trimmed.hasPrefix("//") {
+                let updated = content.replacingOccurrences(of: "//", with: "", options: [], range: content.range(of: "//"))
+                _ = buffer.replace(range: lineCharRange, with: updated)
+            } else {
+                _ = buffer.insert("// ", at: lineCharRange.lowerBound)
+            }
+        }
+        notifyBufferDidMutate()
     }
 
     public func insertUserText(_ text: String) {
@@ -490,7 +626,20 @@ public final class EditorView: NSView {
 
     private func handleReturnKey() {
         let currentLineStr = buffer.lineContent(at: cursorPosition.line)
-        let leadingTabs = currentLineStr.prefix(while: { $0 == "\t" || $0 == " " })
+        let leadingTabs = String(currentLineStr.prefix(while: { $0 == "\t" || $0 == " " }))
+        let offset = buffer.characterOffset(for: cursorPosition)
+        let prevChar = offset > 0 ? buffer.substring(in: (offset - 1)..<offset) : ""
+        let nextChar = offset < buffer.count ? buffer.substring(in: offset..<(offset + 1)) : ""
+
+        if prevChar == "{" && nextChar == "}" {
+            let innerIndent = leadingTabs + "\t"
+            let expansion = "\n" + innerIndent + "\n" + leadingTabs
+            _ = buffer.insert(expansion, at: offset)
+            cursorPosition = buffer.position(forCharacterOffset: offset + 1 + innerIndent.count)
+            notifyBufferDidMutate()
+            return
+        }
+
         let trimmed = currentLineStr.trimmingCharacters(in: .whitespaces)
         let extraTab = trimmed.hasSuffix("{") ? "\t" : ""
         insertUserText("\n" + leadingTabs + extraTab)
@@ -541,6 +690,9 @@ public struct GoEditorCanvasRepresentable: NSViewRepresentable {
     public var onRunGoTestRequested: ((GoASTAnalysis.FuncEntry) -> Void)?
     public var onDefinitionRequested: ((TextPosition) -> Void)?
     public var onRenameRequested: ((TextPosition) -> Void)?
+    public var onToggleTerminalRequested: (() -> Void)?
+    public var onSaveRequested: (() -> Void)?
+    public var onOpenFileRequested: (() -> Void)?
 
     public init(
         buffer: TextBuffer,
@@ -553,7 +705,10 @@ public struct GoEditorCanvasRepresentable: NSViewRepresentable {
         onCursorChanged: ((TextPosition) -> Void)? = nil,
         onRunGoTestRequested: ((GoASTAnalysis.FuncEntry) -> Void)? = nil,
         onDefinitionRequested: ((TextPosition) -> Void)? = nil,
-        onRenameRequested: ((TextPosition) -> Void)? = nil
+        onRenameRequested: ((TextPosition) -> Void)? = nil,
+        onToggleTerminalRequested: (() -> Void)? = nil,
+        onSaveRequested: (() -> Void)? = nil,
+        onOpenFileRequested: (() -> Void)? = nil
     ) {
         self.buffer = buffer
         self.filePath = filePath
@@ -566,6 +721,9 @@ public struct GoEditorCanvasRepresentable: NSViewRepresentable {
         self.onRunGoTestRequested = onRunGoTestRequested
         self.onDefinitionRequested = onDefinitionRequested
         self.onRenameRequested = onRenameRequested
+        self.onToggleTerminalRequested = onToggleTerminalRequested
+        self.onSaveRequested = onSaveRequested
+        self.onOpenFileRequested = onOpenFileRequested
     }
 
     public func makeNSView(context: Context) -> NSScrollView {
@@ -597,5 +755,8 @@ public struct GoEditorCanvasRepresentable: NSViewRepresentable {
         editor.onRunGoTestRequested = onRunGoTestRequested
         editor.onDefinitionRequested = onDefinitionRequested
         editor.onRenameRequested = onRenameRequested
+        editor.onToggleTerminalRequested = onToggleTerminalRequested
+        editor.onSaveRequested = onSaveRequested
+        editor.onOpenFileRequested = onOpenFileRequested
     }
 }
