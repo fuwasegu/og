@@ -18,6 +18,11 @@ build:
 release:
 	CLANG_MODULE_CACHE_PATH=/tmp/og-clang-module-cache swift build --disable-sandbox -c release
 
+## Package native macOS og.app bundle (build/og.app)
+app:
+	bash scripts/build-app.sh
+	bash scripts/sign-app.sh build/og.app
+
 ## Run unit, fuzz, and performance SLA test suite
 test:
 	./scripts/harness.sh --quick

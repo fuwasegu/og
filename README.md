@@ -2,19 +2,29 @@
 
 Apple Silicon (macOS 14.0+) に最適化した、入力遅延ゼロ（AppKit `NSView` + `CoreText` 120fps描画）を目指す Go 言語特化型ネイティブコードエディタです。
 
+## インストール (Homebrew)
+
+```bash
+brew install --cask fuwasegu/tap/og
+```
+
 ## ディレクトリ構成（Swift Package Manager 標準レイアウト）
 
 ```text
 og/
 ├── .github/
 │   └── workflows/
-│       └── ci.yml                       # GitHub Actions 統合ハーネス CI (macOS 15 / Swift 6 / gopls)
+│       ├── ci.yml                       # GitHub Actions 統合ハーネス CI (macOS 15 / Swift 6 / gopls)
+│       └── release.yml                  # GitHub Releases 作成 & fuwasegu/homebrew-tap 自動更新 CD
 ├── .gitignore                           # SPM / Xcode / macOS 標準除外設定
 ├── AGENTS.md                            # AI エージェント向け不変条件・SLA・ガードレール定義
 ├── Makefile                             # ローカル / AI 駆動開発用ワンコマンド実行ターゲット
 ├── Package.swift                        # Swift 6.0 マニフェスト (StrictConcurrency 有効)
 ├── README.md                            # アーキテクチャ & ビルド手順書
+├── VERSION                              # リリースタグ検証用バージョン定義
 ├── scripts/
+│   ├── build-app.sh                     # og.app バンドル生成スクリプト
+│   ├── sign-app.sh                      # 自己署名 / ad-hoc 署名スクリプト
 │   ├── harness.sh                       # 4段階検証ハーネス (静的ガードレール / Debug / Fuzz+SLA / Release)
 │   └── install-hooks.sh                 # Git pre-commit / pre-push フック自動インストーラ
 ├── Sources/

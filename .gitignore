@@ -26,3 +26,8 @@ DerivedData/
 *.test
 *.out
 coverage.txt
+
+# App bundle / release artifacts
+build/
+*.zip
+notes.md
