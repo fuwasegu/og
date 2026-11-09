@@ -326,11 +326,20 @@ extension EditorController {
         return rect
     }
 
+    /// Identifier at (or just before) the caret.
     func wordAtCaret() -> String? {
-        let r = textView.selectionRange(forProposedRange: NSRange(location: caretOffset, length: 0), granularity: .selectByWord)
-        guard r.length > 0 else { return nil }
-        let w = (document.storage.string as NSString).substring(with: r).trimmingCharacters(in: .whitespacesAndNewlines)
-        return w.isEmpty ? nil : w
+        let ns = document.storage.string as NSString
+        func isIdent(_ i: Int) -> Bool {
+            guard i >= 0, i < ns.length, let u = UnicodeScalar(ns.character(at: i)) else { return false }
+            return CharacterSet.alphanumerics.contains(u) || u == "_"
+        }
+        var start = caretOffset
+        if !isIdent(start) && isIdent(start - 1) { start -= 1 }
+        guard isIdent(start) else { return nil }
+        var end = start
+        while isIdent(start - 1) { start -= 1 }
+        while isIdent(end) { end += 1 }
+        return ns.substring(with: NSRange(location: start, length: end - start))
     }
 
     func gotoNextError(forward: Bool) {

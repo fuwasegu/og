@@ -132,6 +132,8 @@ final class ProjectContext {
         let worktree = paths.filter { !$0.contains("/.git/") }
         if !worktree.isEmpty {
             documents.filesChanged(worktree)
+            let index = self.index
+            Task { await index.refresh() }
             NotificationCenter.default.post(name: .ogFilesChanged, object: self, userInfo: ["paths": worktree])
         }
         if gitTouched || !worktree.isEmpty { refreshGit() }
