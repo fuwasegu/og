@@ -62,6 +62,10 @@ GoLand の macOS 用キーマップに合わせています。
 | `⌘[` / `⌘]` | 戻る / 進む |
 | `⇧⌘T` / `⇧⌥⌘G` | Struct タグを追加 / Table Test を生成 |
 
+## アイコン
+
+アイコンは、下からのぞく Gopher の目が `og` になっています。Go gopher のデザインは Renée French によるもので、[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) で公開されています。アイコンは `scripts/generate-icon.swift` で生成します。
+
 ## 開発
 
 仕様は `spec/` に FSL で書いてあり、`fslc` で検証します。詳しくは `spec/README.md` と `AGENTS.md` を見てください。

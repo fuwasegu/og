@@ -1,182 +1,154 @@
 #!/usr/bin/env swift
+// Generates docs/assets/icon.png (1024 x 1024).
+//
+// A hand-drawn gopher peeking up from the bottom; its eyes spell "og".
+// The Go gopher was designed by Renée French and is licensed under CC BY 4.0.
+//
+// usage: swift scripts/generate-icon.swift [out.png]
 import AppKit
-import CoreGraphics
 
 let size = 1024
-let width = CGFloat(size)
-let height = CGFloat(size)
+let cs = CGColorSpaceCreateDeviceRGB()
+guard let ctx = CGContext(data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: size * 4,
+                          space: cs, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { fatalError("context") }
 
-let colorSpace = CGColorSpaceCreateDeviceRGB()
-guard let ctx = CGContext(
-    data: nil,
-    width: size,
-    height: size,
-    bitsPerComponent: 8,
-    bytesPerRow: size * 4,
-    space: colorSpace,
-    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-) else {
-    fatalError("Failed to create CGContext")
+func hex(_ v: UInt32, _ a: CGFloat = 1) -> CGColor {
+    CGColor(colorSpace: cs, components: [CGFloat((v >> 16) & 255) / 255, CGFloat((v >> 8) & 255) / 255, CGFloat(v & 255) / 255, a])
+        ?? CGColor(gray: 0, alpha: 1)
 }
 
-ctx.setAllowsAntialiasing(true)
-ctx.setShouldAntialias(true)
+let ink = hex(0x101114)
+let lime = hex(0xC8FF2E)
 
-func rgba(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat, _ a: CGFloat = 1.0) -> CGColor {
-    CGColor(colorSpace: colorSpace, components: [r / 255.0, g / 255.0, b / 255.0, a])!
+// macOS icon grid: 824 px tile centered in 1024, continuous-corner radius ~185.
+let tile = CGRect(x: 100, y: 100, width: 824, height: 824)
+let tilePath = CGPath(roundedRect: tile, cornerWidth: 185, cornerHeight: 185, transform: nil)
+
+// MARK: - Hand-drawn lines
+
+/// Low-frequency wobble with integer harmonics, so a closed loop meets itself exactly (no lump at the seam).
+func wobble(_ th: CGFloat, _ amp: CGFloat, _ phase: CGFloat) -> CGFloat {
+    amp * (0.6 * sin(2 * th + phase) + 0.3 * sin(3 * th + phase * 1.7) + 0.1 * sin(5 * th + phase * 2.3))
 }
 
-// 1. macOS Squircle Background (matching Fleet's exact dark slate material)
-let squircleRect = CGRect(x: 0, y: 0, width: width, height: height).insetBy(dx: 8, dy: 8)
-let cornerRadius: CGFloat = 224
-let squirclePath = CGPath(roundedRect: squircleRect, cornerWidth: cornerRadius, cornerHeight: cornerRadius, transform: nil)
+/// A slightly uneven loop, drawn as a smooth curve through many samples.
+func loop(_ c: CGPoint, _ r: CGFloat, squash: CGFloat = 1, amp: CGFloat = 0.018, phase: CGFloat) -> CGPath {
+    let n = 96
+    var pts: [CGPoint] = []
+    for i in 0..<n {
+        let th = 2 * .pi * CGFloat(i) / CGFloat(n)
+        let k = 1 + wobble(th, amp, phase)
+        pts.append(CGPoint(x: c.x + r * k * cos(th), y: c.y + r * squash * k * sin(th)))
+    }
+    return smoothClosed(pts)
+}
+
+/// Catmull-Rom through closed points -> cubic Béziers.
+func smoothClosed(_ p: [CGPoint]) -> CGPath {
+    let path = CGMutablePath()
+    let n = p.count
+    path.move(to: p[0])
+    for i in 0..<n {
+        let p0 = p[(i - 1 + n) % n], p1 = p[i], p2 = p[(i + 1) % n], p3 = p[(i + 2) % n]
+        let c1 = CGPoint(x: p1.x + (p2.x - p0.x) / 6, y: p1.y + (p2.y - p0.y) / 6)
+        let c2 = CGPoint(x: p2.x - (p3.x - p1.x) / 6, y: p2.y - (p3.y - p1.y) / 6)
+        path.addCurve(to: p2, control1: c1, control2: c2)
+    }
+    path.closeSubpath()
+    return path
+}
+
+func stroke(_ path: CGPath, _ width: CGFloat, _ color: CGColor = lime) {
+    ctx.addPath(path)
+    ctx.setStrokeColor(color)
+    ctx.setLineWidth(width)
+    ctx.setLineCap(.round)
+    ctx.setLineJoin(.round)
+    ctx.strokePath()
+}
+
+func fill(_ path: CGPath, _ color: CGColor) {
+    ctx.addPath(path)
+    ctx.setFillColor(color)
+    ctx.fillPath()
+}
+
+// MARK: - Tile
 
 ctx.saveGState()
-ctx.addPath(squirclePath)
+ctx.setShadow(offset: CGSize(width: 0, height: -12), blur: 30, color: hex(0x000000, 0.35))
+fill(tilePath, ink)
+ctx.restoreGState()
+
+ctx.saveGState()
+ctx.addPath(tilePath)
 ctx.clip()
-
-let bgColors = [
-    rgba(25, 29, 36),
-    rgba(17, 20, 26)
-] as CFArray
-if let bgGradient = CGGradient(colorsSpace: colorSpace, colors: bgColors, locations: [0.0, 1.0]) {
-    ctx.drawLinearGradient(
-        bgGradient,
-        start: CGPoint(x: 120, y: height),
-        end: CGPoint(x: width, y: 0),
-        options: []
-    )
+// A faint top light so the black tile is not flat.
+if let g = CGGradient(colorsSpace: cs, colors: [hex(0x1A1C21), hex(0x0E0F12)] as CFArray, locations: [0, 1]) {
+    ctx.drawLinearGradient(g, start: CGPoint(x: 512, y: 924), end: CGPoint(x: 512, y: 100), options: [])
 }
 
-// Ambient Go-Cyan / Mint glow around the live cursor beacon
-let activeNode = CGPoint(x: 648, y: 364)
-let glowColors = [
-    rgba(0, 216, 245, 0.12),
-    rgba(45, 224, 182, 0.04),
-    rgba(17, 20, 26, 0.0)
-] as CFArray
-if let glowGrad = CGGradient(colorsSpace: colorSpace, colors: glowColors, locations: [0.0, 0.45, 1.0]) {
-    ctx.drawRadialGradient(
-        glowGrad,
-        startCenter: activeNode,
-        startRadius: 0,
-        endCenter: activeNode,
-        endRadius: 340,
-        options: []
-    )
-}
-ctx.restoreGState()
+let line: CGFloat = 24    // head and ears
+let letter: CGFloat = 42  // the "og" eyes
 
-// Squircle border
-ctx.saveGState()
-ctx.addPath(squirclePath)
-ctx.setStrokeColor(rgba(42, 47, 57))
-ctx.setLineWidth(14)
-ctx.strokePath()
-ctx.restoreGState()
+// MARK: - Ears (behind the head)
 
-// 2. Editor + Terminal Frame (same #2D333F dark structural stroke as Fleet's rings)
-let frameRect = CGRect(x: 204, y: 214, width: 616, height: 596)
-let framePath = CGPath(roundedRect: frameRect, cornerWidth: 110, cornerHeight: 110, transform: nil)
-
-ctx.saveGState()
-ctx.addPath(framePath)
-ctx.setStrokeColor(rgba(45, 51, 63))
-ctx.setLineWidth(20)
-ctx.strokePath()
-
-// Subtle inner header divider
-ctx.setStrokeColor(rgba(40, 46, 58))
-ctx.setLineWidth(16)
-ctx.move(to: CGPoint(x: 204, y: 656))
-ctx.addLine(to: CGPoint(x: 820, y: 656))
-ctx.strokePath()
-ctx.restoreGState()
-
-// Window header dots (muted slate)
-ctx.saveGState()
-ctx.setFillColor(rgba(72, 81, 98))
-for i in 0..<3 {
-    let dotX = CGFloat(292 + i * 48)
-    ctx.fillEllipse(in: CGRect(x: dotX - 13, y: 724 - 13, width: 26, height: 26))
-}
-ctx.restoreGState()
-
-// 3. Inside Editor: Prompt Chevron `>` + Indented Code / AST Lines
-ctx.saveGState()
-ctx.setLineCap(.round)
-ctx.setLineJoin(.round)
-
-// Bold chevron `>` on the left (Go / Terminal prompt)
-ctx.setStrokeColor(rgba(110, 120, 139))
-ctx.setLineWidth(28)
-ctx.move(to: CGPoint(x: 294, y: 558))
-ctx.addLine(to: CGPoint(x: 382, y: 478))
-ctx.addLine(to: CGPoint(x: 294, y: 398))
-ctx.strokePath()
-
-// Top code bar (muted slate)
-ctx.setStrokeColor(rgba(110, 120, 139))
-ctx.setLineWidth(28)
-ctx.move(to: CGPoint(x: 452, y: 558))
-ctx.addLine(to: CGPoint(x: 704, y: 558))
-ctx.strokePath()
-
-// Middle code bar (structural slate)
-ctx.setStrokeColor(rgba(78, 88, 106))
-ctx.setLineWidth(28)
-ctx.move(to: CGPoint(x: 452, y: 468))
-ctx.addLine(to: CGPoint(x: 564, y: 468))
-ctx.strokePath()
-
-// Bottom code bar (subtle slate)
-ctx.setStrokeColor(rgba(68, 77, 94))
-ctx.setLineWidth(26)
-ctx.move(to: CGPoint(x: 304, y: 314))
-ctx.addLine(to: CGPoint(x: 484, y: 314))
-ctx.strokePath()
-ctx.restoreGState()
-
-// 4. Fleet-style Glowing Active Beacon (Go Cyan -> Mint with translucent halo ring)
-let haloRadius: CGFloat = 86
-let coreRadius: CGFloat = 50
-
-ctx.saveGState()
-// Translucent outer halo ring (exactly like Fleet: no opaque cutout, blends over structure)
-ctx.setStrokeColor(rgba(45, 224, 182, 0.36))
-ctx.setLineWidth(18)
-ctx.strokeEllipse(in: CGRect(x: activeNode.x - haloRadius, y: activeNode.y - haloRadius, width: haloRadius * 2, height: haloRadius * 2))
-
-// Bright core dot (Go Cyan-Mint)
-let coreRect = CGRect(x: activeNode.x - coreRadius, y: activeNode.y - coreRadius, width: coreRadius * 2, height: coreRadius * 2)
-ctx.saveGState()
-ctx.addEllipse(in: coreRect)
-ctx.clip()
-let coreColors = [
-    rgba(0, 214, 246),
-    rgba(45, 228, 182)
-] as CFArray
-if let coreGrad = CGGradient(colorsSpace: colorSpace, colors: coreColors, locations: [0.0, 1.0]) {
-    ctx.drawLinearGradient(
-        coreGrad,
-        start: CGPoint(x: activeNode.x - coreRadius, y: activeNode.y + coreRadius),
-        end: CGPoint(x: activeNode.x + coreRadius, y: activeNode.y - coreRadius),
-        options: []
-    )
-}
-ctx.restoreGState()
-ctx.restoreGState()
-
-guard let cgImage = ctx.makeImage() else {
-    fatalError("Failed to make CGImage")
-}
-let bitmapRep = NSBitmapImageRep(cgImage: cgImage)
-guard let pngData = bitmapRep.representation(using: .png, properties: [:]) else {
-    fatalError("Failed to encode PNG")
+let leftEar = loop(CGPoint(x: 214, y: 640), 70, squash: 1.04, amp: 0.03, phase: 0.8)
+let rightEar = loop(CGPoint(x: 812, y: 652), 68, squash: 1.04, amp: 0.03, phase: 2.4)
+for ear in [leftEar, rightEar] {
+    fill(ear, ink)
+    stroke(ear, line)
 }
 
-let outputPath = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "docs/assets/icon.png"
-let outputURL = URL(fileURLWithPath: outputPath)
-try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-try pngData.write(to: outputURL)
-print("Generated icon at \(outputPath)")
+// MARK: - Head: one dome rising from below the tile
+
+let head = CGMutablePath()
+head.move(to: CGPoint(x: 152, y: 60))
+head.addCurve(to: CGPoint(x: 512, y: 776), control1: CGPoint(x: 150, y: 560), control2: CGPoint(x: 262, y: 780))
+head.addCurve(to: CGPoint(x: 872, y: 60), control1: CGPoint(x: 768, y: 772), control2: CGPoint(x: 880, y: 556))
+fill(head, ink)
+stroke(head, line)
+
+// MARK: - Eyes: "o" and "g"
+
+let oCenter = CGPoint(x: 374, y: 566), oR: CGFloat = 106
+let gCenter = CGPoint(x: 650, y: 566), gR: CGFloat = 100
+
+// g's stem and hook, drawn first so the bowl overlaps it cleanly.
+let stemX = gCenter.x + gR
+let hookR: CGFloat = 74
+let hookY: CGFloat = 430
+let tail = CGMutablePath()
+// Geometric g: the stem rises to the top of the bowl, tangent to it.
+tail.move(to: CGPoint(x: stemX, y: gCenter.y + gR))
+tail.addLine(to: CGPoint(x: stemX, y: hookY))
+tail.addArc(center: CGPoint(x: stemX - hookR, y: hookY), radius: hookR, startAngle: 0, endAngle: -.pi * 0.86, clockwise: true)
+stroke(tail, letter)
+
+for (c, r, ph) in [(oCenter, oR, CGFloat(0.4)), (gCenter, gR, CGFloat(2.1))] {
+    let ring = loop(c, r, squash: 1.02, phase: ph)
+    fill(ring, ink)
+    stroke(ring, letter)
+}
+
+// Pupils look up and to the right, like the original gopher.
+for (c, r) in [(oCenter, oR), (gCenter, gR)] {
+    let p = CGPoint(x: c.x + r * 0.30, y: c.y + r * 0.26)
+    let pr: CGFloat = 30
+    ctx.setFillColor(lime)
+    ctx.fillEllipse(in: CGRect(x: p.x - pr, y: p.y - pr, width: pr * 2, height: pr * 2))
+    ctx.setFillColor(ink)
+    ctx.fillEllipse(in: CGRect(x: p.x + 6, y: p.y + 8, width: 15, height: 15))
+}
+
+ctx.restoreGState()
+
+// MARK: - Write
+
+guard let image = ctx.makeImage(),
+      let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else { fatalError("encode") }
+let out = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "docs/assets/icon.png"
+let url = URL(fileURLWithPath: out)
+try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+try png.write(to: url)
+print("Generated icon at \(out)")
