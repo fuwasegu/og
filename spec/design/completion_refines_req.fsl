@@ -1,0 +1,16 @@
+// CompletionDesign ⊑ Completion
+// Ghost text "arrives" (requirements: stream) with the first chunk; later chunks,
+// debounce and settings validation are invisible.
+refinement CompletionRefinesReq {
+  impl CompletionDesign
+  abs  Completion
+  maps auto
+
+  action set_endpoint(h)  -> stutter
+  action debounce()       -> stutter
+  action request()        -> request(Local)
+  action first_chunk()    -> stream()
+  action more_chunks()    -> stutter
+  action stream_end()     -> stutter
+  action late_chunk()     -> drop_stale()
+}

@@ -1,4 +1,4 @@
-.PHONY: all check quick build release test run install-hooks clean
+.PHONY: all check quick build release test run install-hooks clean spec
 
 all: check
 
@@ -9,6 +9,10 @@ check:
 ## Fast verification harness for pre-commit / rapid AI agent iteration
 quick:
 	./scripts/harness.sh --quick
+
+## Verify FSL specs (requirements, design, refinement); requires fslc
+spec:
+	./scripts/spec-check.sh
 
 ## Build debug executable
 build:

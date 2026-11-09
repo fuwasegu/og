@@ -1,0 +1,25 @@
+// RefactorDesign ⊑ Refactor
+// Computing looks idle; staging and committing both look like "applying".
+// A file counts as "written" in the requirements once its replace commits.
+refinement RefactorRefinesReq {
+  impl RefactorDesign
+  abs  Refactor
+  maps auto
+
+  map phase = if phase == RPreview then Previewing
+              else if phase == RStaging or phase == RCommitting then Applying
+              else Idle
+  map form[f: File]    = if form[f] == RRenamed then Renamed else Original
+  map written[f: File] = phase == RCommitting and form[f] == RRenamed
+
+  action request()                -> stutter
+  action abandon()                -> stutter
+  action edit_while_computing(f)  -> stutter
+  action recompute()              -> stutter
+  action computed()               -> preview()
+  action stage_ok(f)              -> stutter
+  action stage_fail(f)            -> write_fail(f)
+  action begin_commit()           -> stutter
+  action commit_ok(f)             -> write_ok(f)
+  action commit_fail(f)           -> write_fail(f)
+}

@@ -1,0 +1,174 @@
+// og — Run / test / debug design (RunManager actor + DAP client for `dlv dap`)
+//
+// Refines: spec/req/run_debug.fsl (mapping: spec/design/run_debug_refines_req.fsl)
+//
+// DES-1: A run is launched only after DocumentStore.flushAll() completes (the
+//        flush itself is modeled in the workspace design).
+// DES-2: Every launched process carries the run generation. Rerun or stop kills
+//        the process and bumps / closes the generation immediately; output and
+//        exit events from an older generation are dropped.
+// DES-3: Breakpoints are mirrored to delve with DAP setBreakpoints
+//        asynchronously. If delve stops at a breakpoint the user has already
+//        removed, the session continues automatically without showing a pause.
+// DES-4: A step request leaves the session "stepping" until delve reports the
+//        next stop; variables and stack are requested only in a confirmed stop.
+//        If the program exits during a step, the run ends as if stopped.
+//
+// ASSUME-1 (representation only): 2 configurations, 3 generations.
+spec RunDebugDesign {
+  entity Cfg
+  number Gen
+  const MAXG = 2
+
+  enum RSt { RIdle, RRunning, RPaused, RStepping, RDone }
+
+  state {
+    saved:     Bool,
+    st:        Map<Cfg, RSt>,
+    debug:     Map<Cfg, Bool>,
+    gen:       Map<Cfg, Gen>,
+    results:   Map<Cfg, Option<Gen>>,
+    zombie:    Map<Cfg, Bool>,      // DES-2: a killed older process has not exited yet
+    bp_user:   Bool,                // breakpoint as the user sees it
+    bp_dlv:    Bool                 // breakpoint as delve currently has it
+  }
+
+  init {
+    saved = true
+    bp_user = false
+    bp_dlv = false
+    forall c: Cfg {
+      st[c] = RIdle
+      debug[c] = false
+      gen[c] = 0
+      results[c] = none
+      zombie[c] = false
+    }
+  }
+
+  def active(c: Cfg) = st[c] == RRunning or st[c] == RPaused or st[c] == RStepping
+
+  action edit() "MODEL-1: the user edits a file" {
+    saved = false
+  }
+
+  action toggle_breakpoint(on: Bool) "DES-3: the user sets or clears a breakpoint in the gutter" {
+    requires bp_user != on
+    bp_user = on
+  }
+
+  fair action sync_breakpoints() "DES-3: setBreakpoints brings delve in line with the gutter" {
+    requires bp_dlv != bp_user
+    bp_dlv = bp_user
+  }
+
+  action start(c: Cfg, dbg: Bool) "DES-1: flush all files, then launch `go run` / `go test` / `dlv dap`" {
+    requires not active(c)
+    requires gen[c] < MAXG
+    saved = true
+    st[c] = RRunning
+    debug[c] = dbg
+    gen[c] = gen[c] + 1
+    results[c] = none
+  }
+
+  action rerun(c: Cfg) "DES-2: kill the live process and launch a new generation" {
+    requires active(c)
+    requires gen[c] < MAXG
+    saved = true
+    st[c] = RRunning
+    gen[c] = gen[c] + 1
+    results[c] = none
+    zombie[c] = true
+  }
+
+  action exit(c: Cfg) "DES-2: the current generation exits; results are shown" {
+    requires st[c] == RRunning
+    st[c] = RDone
+    results[c] = some(gen[c])
+  }
+
+  fair action zombie_exit(c: Cfg) "DES-2: a killed older process finally exits; its events are dropped" {
+    requires zombie[c]
+    zombie[c] = false
+  }
+
+  action stop(c: Cfg) "DES-2: the user stops the run; the process is killed" {
+    requires active(c)
+    st[c] = RDone
+    results[c] = some(gen[c])
+    zombie[c] = true
+  }
+
+  action stopped_at_breakpoint(c: Cfg) "DES-3: delve reports a stop at a breakpoint the user still has; the session pauses" {
+    requires st[c] == RRunning
+    requires debug[c]
+    requires bp_dlv
+    requires bp_user
+    st[c] = RPaused
+  }
+
+  action stopped_at_removed(c: Cfg) "DES-3: delve stops at a breakpoint the user already removed; continue silently" {
+    requires st[c] == RRunning
+    requires debug[c]
+    requires bp_dlv
+    requires not bp_user
+    st[c] = RRunning
+  }
+
+  action step(c: Cfg) "DES-4: send next / stepIn / stepOut" {
+    requires st[c] == RPaused
+    st[c] = RStepping
+  }
+
+  fair action step_stopped(c: Cfg) "DES-4: delve reports the next stop after a step" {
+    requires st[c] == RStepping
+    st[c] = RPaused
+  }
+
+  action step_exited(c: Cfg) "DES-4: the program exits during a step; the run ends as if stopped" {
+    requires st[c] == RStepping
+    st[c] = RDone
+    results[c] = some(gen[c])
+  }
+
+  action resume(c: Cfg) "DES-RUN-1: send continue" {
+    requires st[c] == RPaused
+    st[c] = RRunning
+  }
+
+  action inspect(c: Cfg) "DES-4: request threads / stackTrace / variables in a confirmed stop" {
+    requires st[c] == RPaused
+    st[c] = RPaused
+  }
+
+  action dismiss(c: Cfg) "DES-RUN-2: close a finished run's tab" {
+    requires st[c] == RDone
+    st[c] = RIdle
+  }
+
+  invariant PauseOnlyInDebug "DES-3: only a debug session pauses or steps" {
+    forall c: Cfg { (st[c] == RPaused or st[c] == RStepping) => debug[c] }
+  }
+
+  invariant ResultsAreLatest "DES-2: results never come from an older generation" {
+    forall c: Cfg { results[c] is some(g) => g == gen[c] }
+  }
+
+  invariant ResultsOnlyWhenFinished "MODEL-2: induction aid" {
+    forall c: Cfg { active(c) => results[c] == none }
+  }
+
+  leadsTo ZombiesDie "DES-2: every killed process eventually exits" {
+    forall c: Cfg { zombie[c] ~> not zombie[c] }
+  }
+
+  leadsTo BreakpointsSync "DES-3: delve eventually has the breakpoints the user set" {
+    bp_dlv != bp_user ~> bp_dlv == bp_user
+  }
+}
+
+verify {
+  instances Cfg = 2
+  values Gen = 0..2
+}

@@ -56,13 +56,24 @@ FSL で表せるのは、操作の順序や組み合わせで壊れうる部分�
 |---|---|---|---|
 | ワークスペース | `design/workspace.fsl` | `design/workspace_refines_req.fsl` | refines |
 | gopls | `design/lsp.fsl` | `design/lsp_refines_req.fsl` | refines |
-| リファクタ・実行・Git・補完 | 未着手 | 未着手 | なし |
+| リファクタ | `design/refactor.fsl` | `design/refactor_refines_req.fsl` | refines |
+| 実行・デバッグ | `design/run_debug.fsl` | `design/run_debug_refines_req.fsl` | refines |
+| Git | `design/vcs.fsl` | `design/vcs_refines_req.fsl` | refines |
+| 補完 | `design/completion.fsl` | `design/completion_refines_req.fsl` | refines |
 
 ```sh
 fslc refine spec/design/workspace.fsl spec/req/workspace.fsl spec/design/workspace_refines_req.fsl
 ```
 
 ## 検証コマンド
+
+すべての仕様をまとめて検証する。
+
+```sh
+make spec
+```
+
+個別に動かすときは次のとおり。
 
 ```sh
 fslc check spec/req/workspace.fsl --strict-tags
