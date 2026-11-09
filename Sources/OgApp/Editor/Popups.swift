@@ -151,6 +151,14 @@ final class CompletionPopup: NSObject, NSTableViewDataSource, NSTableViewDelegat
 
     @objc private func doubleClicked() { acceptSelected() }
 
+    /// Headless driver: the items currently listed, and accepting one of them.
+    var debugShown: [LSPCompletionItem] { isVisible ? shown : [] }
+    func debugAccept(index: Int) {
+        guard index >= 0, index < shown.count else { return }
+        table.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+        acceptSelected()
+    }
+
     func close() {
         if panel.isVisible {
             panel.parent?.removeChildWindow(panel)

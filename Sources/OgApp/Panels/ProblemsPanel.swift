@@ -55,7 +55,7 @@ final class ProblemsPanel: NSViewController, NSOutlineViewDataSource, NSOutlineV
     }
 
     private func reload() {
-        let sorted = context.diagnostics.sorted { $0.key < $1.key }
+        let sorted = context.allDiagnostics.sorted { $0.key < $1.key }
         fileRows = sorted.map { Row(uri: $0.key, diag: nil) }
         childRows = Dictionary(uniqueKeysWithValues: sorted.map { k, v in
             (k, v.sorted { ($0.severity?.rawValue ?? 4, $0.range.start.line) < ($1.severity?.rawValue ?? 4, $1.range.start.line) }.map { Row(uri: k, diag: $0) })

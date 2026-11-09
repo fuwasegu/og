@@ -47,6 +47,11 @@ public enum GoStyleCompletions {
         return t == "//" || t == "// " || before == "func ("
     }
 
+    /// The caret is in a comment or string: only og's templates make sense there, not gopls items.
+    public static func isInCommentOrString(_ ns: NSString, caret: Int) -> Bool {
+        GoScanner.isInsideStringOrComment(ns, offset: caret)
+    }
+
     /// Receivers and constructors look at the rest of the package.
     public static func wantsPackageSources(in ns: NSString, caret: Int) -> Bool {
         guard caret <= ns.length else { return false }

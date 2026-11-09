@@ -83,6 +83,9 @@ public struct LSPCompletionItem: Sendable, Hashable {
     public var isSnippet: Bool
     public var textEdit: LSPTextEdit?
     public var additionalTextEdits: [LSPTextEdit]
+    /// og's own item: its `textEdit` is computed on the current buffer, so it holds even when the
+    /// gopls answer it was merged into is stale.
+    public var isLocal = false
 
     /// A locally generated item (og's own suggestions).
     public init(label: String, detail: String?, snippet: String, filterText: String, sortText: String) {
@@ -96,6 +99,7 @@ public struct LSPCompletionItem: Sendable, Hashable {
         isSnippet = true
         textEdit = nil
         additionalTextEdits = []
+        isLocal = true
     }
 
     public init(json: JSONValue) {
