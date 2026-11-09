@@ -165,7 +165,11 @@ extension EditorController {
     func styleCompletionAccepted(_ item: LSPCompletionItem) {
         guard item.isLocal else { return }
         let text = item.plainInsertion.text
-        if text.contains("fmt.") || text.contains("errors.") || text.contains("cmp.") { organizeImports(quiet: true) }
+        guard text.contains("fmt.") || text.contains("errors.") || text.contains("cmp.") else { return }
+        // After the edit's own (async) version bump, or organizeImports drops its answer as stale.
+        DispatchQueue.main.async { [weak self] in
+            MainActor.assumeIsolated { self?.organizeImports(quiet: true) }
+        }
     }
 
     // MARK: - Headless driver
