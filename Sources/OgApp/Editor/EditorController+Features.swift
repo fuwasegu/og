@@ -107,6 +107,7 @@ extension EditorController {
             dismissGhost()
             textView.insertReplacing(exp.replaceRange, with: exp.text, caret: exp.replaceRange.location + exp.caretOffset)
             document.undoManager.setActionName("Postfix .\(exp.templateName)")
+            if exp.text.contains("fmt.") { organizeImports(quiet: true) }
             return true
         }
         if let ghost = textView.ghostText, textView.ghostLocation == caret {
@@ -432,7 +433,7 @@ extension EditorController {
         }
     }
 
-    func organizeImports() {
+    func organizeImports(quiet: Bool = false) {
         let flushDoc = document
         let uri = document.uri
         let v = document.version
@@ -441,7 +442,7 @@ extension EditorController {
             await self.context.documents.flush(flushDoc)
             let edits = await self.context.gopls.organizeImports(uri: uri)
             guard self.document.version == v else { return }
-            if edits.isEmpty { self.context.setStatus("Imports are already optimized"); return }
+            if edits.isEmpty { if !quiet { self.context.setStatus("Imports are already optimized") }; return }
             self.applyTextEdits(edits, undoName: "Optimize Imports")
         }
     }
@@ -468,6 +469,7 @@ extension EditorController {
             let end = doc.storage.length
             editor.textView.insertReplacing(NSRange(location: end, length: 0), with: gen.appendContent, caret: end)
             revealFunction(gen.functionName, in: editor)
+            editor.organizeImports(quiet: true)
             return
         }
         if FileManager.default.fileExists(atPath: testURL.path) {
@@ -475,6 +477,7 @@ extension EditorController {
             let end = editor.document.storage.length
             editor.textView.insertReplacing(NSRange(location: end, length: 0), with: gen.appendContent, caret: end)
             revealFunction(gen.functionName, in: editor)
+            editor.organizeImports(quiet: true)
         } else {
             do {
                 try Data(gen.newFileContent.utf8).write(to: testURL, options: .atomic)

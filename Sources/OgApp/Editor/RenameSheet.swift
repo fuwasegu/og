@@ -106,6 +106,11 @@ final class RenameSheet: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         }
     }
 
+    /// Headless self-test hooks (DebugDriver).
+    static func debugPreview(_ name: String) { current?.field.stringValue = name; current?.previewClicked() }
+    static func debugApply() { current?.applyClicked() }
+    static var debugStatus: String { current?.status.stringValue ?? "(no sheet)" }
+
     @objc private func previewClicked() {
         let newName = field.stringValue.trimmingCharacters(in: .whitespaces)
         guard let editor, !newName.isEmpty, newName != oldName else { return }

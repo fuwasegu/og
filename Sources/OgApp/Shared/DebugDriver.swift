@@ -66,7 +66,15 @@ enum DebugDriver {
         case "action":
             guard let p = project else { return }
             let sel = NSSelectorFromString(arg)
-            if !NSApp.sendAction(sel, to: nil, from: nil) { _ = p.tryToPerform(sel, with: nil) }
+            // The headless window is never key, so walk its own responder chain.
+            if let tv = p.editorArea.current?.textView { p.window?.makeFirstResponder(tv) }
+            var responder: NSResponder? = p.window?.firstResponder
+            var done = false
+            while let r = responder, !done {
+                if r.responds(to: sel) { r.perform(sel, with: nil); done = true }
+                responder = r.nextResponder
+            }
+            if !done { _ = p.tryToPerform(sel, with: nil) }
         case "caret":
             let a = arg.split(separator: " ").compactMap { Int($0) }
             guard a.count == 2, let ed = project?.editorArea.current else { return }
@@ -96,6 +104,13 @@ enum DebugDriver {
         case "geom":
             guard let ed = project?.editorArea.current else { return }
             print("clip=\(ed.scrollView.contentView.bounds) tv=\(ed.textView.frame) doc=\(ed.scrollView.documentVisibleRect) caret=\(ed.caretScreenRect())")
+        case "rename":
+            RenameSheet.debugPreview(arg)
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            print("rename preview: \(RenameSheet.debugStatus)")
+            RenameSheet.debugApply()
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            print("rename: \(RenameSheet.debugStatus)")
         case "log":
             print(arg)
         case "dump":
