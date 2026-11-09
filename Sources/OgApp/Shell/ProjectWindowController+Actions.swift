@@ -222,7 +222,10 @@ extension ProjectWindowController: NSMenuItemValidation {
                     }
                     self.context.refreshGit()
                 } catch {
-                    self.context.setStatus(error.localizedDescription)
+                    let a = NSAlert()
+                    a.messageText = "Rollback failed"
+                    a.informativeText = error.localizedDescription
+                    if let w = self.window { a.beginSheetModal(for: w, completionHandler: nil) } else { a.runModal() }
                 }
             }
         }
