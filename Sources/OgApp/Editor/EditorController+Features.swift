@@ -688,7 +688,11 @@ enum Markdown {
                let close = chars[(mid + 2)...].firstIndex(of: ")") {
                 flush()
                 let label = String(chars[(i + 1)..<mid]).replacingOccurrences(of: "`", with: "")
-                emit(label, [.foregroundColor: Theme.function])
+                var extra: [NSAttributedString.Key: Any] = [.foregroundColor: Theme.function]
+                if let url = URL(string: String(chars[(mid + 2)..<close])), url.scheme == "https" || url.scheme == "http" {
+                    extra[.link] = url
+                }
+                emit(label, extra)
                 i = close + 1; continue
             }
             buf.append(c); i += 1

@@ -233,9 +233,10 @@ final class InfoPopup {
     enum Kind { case hover, signature }
     private weak var editor: EditorController?
     private let panel: PopupPanel
-    private let text = NSTextView()
+    private let text = CardTextView()
     private(set) var kind: Kind = .hover
     private var monitor: Any?
+    private let linkOpener = LinkOpener()
     var isVisible: Bool { panel.isVisible }
 
     init(editor: EditorController) {
@@ -254,6 +255,8 @@ final class InfoPopup {
         text.isSelectable = true
         text.drawsBackground = false
         text.textContainerInset = NSSize(width: 8, height: 6)
+        text.linkTextAttributes = [.foregroundColor: Theme.function, .cursor: NSCursor.pointingHand]
+        text.delegate = linkOpener
         let scroll = NSScrollView()
         scroll.documentView = text
         scroll.drawsBackground = false
@@ -312,7 +315,8 @@ final class InfoPopup {
         if monitor == nil {
             monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .scrollWheel]) { [weak self] event in
                 MainActor.assumeIsolated {
-                    if let self, self.kind == .hover || event.type != .keyDown { self.close() }
+                    // Clicks and scrolls inside the card (links, text selection) keep it open.
+                    if let self, event.window !== self.panel, self.kind == .hover || event.type != .keyDown { self.close() }
                 }
                 return event
             }
@@ -328,4 +332,20 @@ final class InfoPopup {
             panel.orderOut(nil)
         }
     }
+}
+
+/// Opens hover-card links (pkg.go.dev) in the default browser, then closes nothing else.
+@MainActor
+final class LinkOpener: NSObject, NSTextViewDelegate {
+    func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+        let url = (link as? URL) ?? (link as? String).flatMap(URL.init(string:))
+        guard let url, url.scheme == "https" || url.scheme == "http" else { return false }
+        NSWorkspace.shared.open(url)
+        return true
+    }
+}
+
+/// The card never becomes key, so it must take the first click itself (links).
+final class CardTextView: NSTextView {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
