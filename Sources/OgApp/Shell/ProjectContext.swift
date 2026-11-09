@@ -119,7 +119,10 @@ final class ProjectContext {
     // MARK: - Events
 
     private func setDiagnostics(uri: String, _ items: [LSPDiagnostic]) {
-        diagnostics[uri] = items.isEmpty ? nil : items
+        // gopls can report the same finding twice (type checker + analyzer); keep one.
+        var seen = Set<String>()
+        let unique = items.filter { seen.insert("\($0.range.start.line):\($0.range.start.character)-\($0.range.end.line):\($0.range.end.character) \($0.message)").inserted }
+        diagnostics[uri] = unique.isEmpty ? nil : unique
         NotificationCenter.default.post(name: .ogDiagnosticsChanged, object: self, userInfo: ["uri": uri])
     }
 

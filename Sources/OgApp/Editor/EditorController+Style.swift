@@ -123,12 +123,17 @@ extension EditorController {
             // Open buffers win over their files on disk.
             sources = onDisk.map { context.documents.document(for: $0.url)?.text ?? $0.text }
         }
-        let ns = document.storage.string as NSString
+        // Scanning is whole-file work: do it off the main thread on the cached snapshot.
+        let lines = document.lines
         let candidates = gopls.prefix(60).map { GoCompletionCandidate(label: $0.label, detail: $0.detail) }
-        let found = GoStyleCompletions.items(in: ns, caret: caret, fileName: document.url.lastPathComponent,
-                                             packageSources: sources, candidates: candidates)
-        let lines = TextLines(nsString: ns)
-        return (found.map { Self.completionItem($0, lines: lines) }, GoStyleCompletions.isInCommentOrString(ns, caret: caret))
+        let fileName = document.url.lastPathComponent
+        let pkg = sources
+        let (found, inComment) = await Task.detached(priority: .userInitiated) {
+            (GoStyleCompletions.items(in: lines.text, caret: caret, fileName: fileName, packageSources: pkg, candidates: candidates),
+             GoStyleCompletions.isInCommentOrString(lines.text, caret: caret))
+        }.value
+        guard document.version == version, caretOffset == caret else { return ([], false) }
+        return (found.map { Self.completionItem($0, lines: lines) }, inComment)
     }
 
     nonisolated static func packageFiles(in dir: URL, excluding name: String) -> [(url: URL, text: String)] {
