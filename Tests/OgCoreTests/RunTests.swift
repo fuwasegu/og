@@ -130,7 +130,7 @@ import Testing
         var q = ANSIParser()
         let s = q.parse("\u{1B}[1;38;5;196mA\u{1B}[38;2;1;2;3mB\u{1B}[91mC")
         #expect(s.map(\.style.foreground) == [.indexed(196), .rgb(1, 2, 3), .indexed(9)])
-        #expect(s.allSatisfy(\.style.bold))
+        #expect(s.allSatisfy { $0.style.bold })
         #expect(ANSIParser.strip("\u{1B}[31mred\u{1B}[0m") == "red")
     }
 

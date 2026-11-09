@@ -22,7 +22,8 @@ import Testing
     }
 
     @Test func requestIsLlamaInfill() throws {
-        let client = try #require(LocalCompletionClient(endpoint: try #require(url("http://127.0.0.1:8080"))))
+        let endpoint = try #require(url("http://127.0.0.1:8080"))
+        let client = try #require(LocalCompletionClient(endpoint: endpoint))
         let body = requestJSON(client, prefix: "func f() {\n\t", suffix: "\n}", maxTokens: 48)
         #expect(body["_path"] == "/infill")
         #expect(body["_method"] == "POST")
@@ -94,7 +95,8 @@ import Testing
 
     @Test func serverDownThrows() async throws {
         // Port 1 on loopback is never a llama-server: the stream must throw, not hang or yield.
-        let client = try #require(LocalCompletionClient(endpoint: try #require(url("http://127.0.0.1:1"))))
+        let endpoint = try #require(url("http://127.0.0.1:1"))
+        let client = try #require(LocalCompletionClient(endpoint: endpoint))
         var chunks = 0
         await #expect(throws: (any Error).self) {
             for try await _ in client.complete(prefix: "a", suffix: "b") { chunks += 1 }
