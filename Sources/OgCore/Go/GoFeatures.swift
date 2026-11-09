@@ -14,9 +14,11 @@ public struct PostfixExpansion: Sendable, Hashable {
 
 public enum GoPostfix {
     /// Template names, for completion UI.
-    public static let templates: [String] = []
+    public static let templates: [String] = GoPostfixEngine.templateNames
     /// Tries to expand a postfix template ending at `caret` (UTF-16 offset in `text`).
-    public static func expansion(in text: String, caret: Int) -> PostfixExpansion? { nil }
+    public static func expansion(in text: String, caret: Int) -> PostfixExpansion? {
+        GoPostfixEngine.expansion(in: text, caret: caret)
+    }
 }
 
 public enum GoStructTagStyle: String, Sendable, CaseIterable { case snake, camel }
@@ -24,7 +26,9 @@ public enum GoStructTagStyle: String, Sendable, CaseIterable { case snake, camel
 public enum GoStructTags {
     /// Adds/updates `json`, `yaml`... tags on the struct that contains `line` (0-based).
     /// Returns the full new source, or nil if no struct is found.
-    public static func apply(to source: String, line: Int, keys: [String] = ["json"], style: GoStructTagStyle = .snake) -> String? { nil }
+    public static func apply(to source: String, line: Int, keys: [String] = ["json"], style: GoStructTagStyle = .snake) -> String? {
+        GoStructTagsEngine.apply(to: source, line: line, keys: keys, style: style)
+    }
 }
 
 public struct GeneratedTest: Sendable, Hashable {
@@ -38,5 +42,7 @@ public struct GeneratedTest: Sendable, Hashable {
 
 public enum GoTableTest {
     /// Generates a table-driven test for the func/method declared at `line` (0-based).
-    public static func generate(source: String, fileName: String, line: Int) -> GeneratedTest? { nil }
+    public static func generate(source: String, fileName: String, line: Int) -> GeneratedTest? {
+        GoTableTestEngine.generate(source: source, fileName: fileName, line: line)
+    }
 }
