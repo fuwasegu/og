@@ -39,7 +39,7 @@ brew install go gopls delve
 - Git：ツリーと差分ガターに状態を表示、commit、ブランチの切り替えと作成、stash
 - 検索：ファイルへ移動、シンボルへ移動、最近のファイル、全文検索と一括置換
 - ターミナル：複数タブの内蔵ターミナル（xterm 互換）
-- Go 向けの機能：Postfix 補完（`.err` `.var` `.for` `.nn` など）、Struct タグの生成、Table-Driven Test の生成
+- Go 向けの機能：Postfix 補完（`.err` `.var` `.for` `.nn` など。Enum 風の型に `.switch` を使うと全 case を埋める）、Struct タグの生成、Table-Driven Test の生成
 - ローカル AI 補完：設定でオンにすると、og が llama.cpp（`llama-server`）または MLX（`mlx_lm.server`）を自分で起動・停止し、インライン補完を出します。モデルは設定で選べます。サーバーは `127.0.0.1` だけで待ち受け、コードは Mac の外へ出ません
 
 注意：デバッガを初めて使うと、macOS が「Developer Tools Access」の許可を求めます。毎回の入力を省くには、`sudo DevToolsSecurity -enable` を一度実行します。

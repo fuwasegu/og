@@ -105,6 +105,7 @@ extension EditorController {
         let caret = caretOffset
         if textView.selectedRange().length == 0, document.isGo, let exp = GoPostfix.expansion(in: text, caret: caret) {
             dismissGhost()
+            if exp.templateName == "switch", expandSwitchWithCases(exp) { return true }
             textView.insertReplacing(exp.replaceRange, with: exp.text, caret: exp.replaceRange.location + exp.caretOffset)
             document.undoManager.setActionName("Postfix .\(exp.templateName)")
             if exp.text.contains("fmt.") { organizeImports(quiet: true) }
@@ -116,6 +117,49 @@ extension EditorController {
             return true
         }
         return false
+    }
+
+    /// `.switch` on an enum-like value (named type + consts): insert an empty switch and let
+    /// gopls fill every case (type-checked, so only real enums qualify). Otherwise the
+    /// plain `case :` template is put back.
+    private func expandSwitchWithCases(_ exp: PostfixExpansion) -> Bool {
+        let ns = exp.text as NSString
+        let brace = ns.range(of: "{")
+        let lastNL = ns.range(of: "\n", options: .backwards)
+        guard brace.location != NSNotFound, lastNL.location != NSNotFound else { return false }
+        let indent = ns.substring(with: NSRange(location: lastNL.location + 1, length: ns.length - lastNL.location - 2))
+        let empty = ns.substring(to: NSMaxRange(brace)) + "\n" + indent + "}"
+        let start = exp.replaceRange.location
+        let bodyAt = start + NSMaxRange(brace)
+        textView.insertReplacing(exp.replaceRange, with: empty, caret: bodyAt)
+        document.undoManager.setActionName("Postfix .switch")
+        let doc = document, uri = document.uri
+        let lines = TextLines(nsString: doc.storage.string as NSString)
+        let at = lines.position(forOffset: start)
+        let range = LSPRange(start: at, end: at)
+        Task { [weak self] in
+            guard let self else { return }
+            await self.context.documents.flush(doc)
+            let version = doc.version
+            var fill = await self.context.gopls.codeActions(uri: uri, range: range, diagnostics: [], only: ["refactor.rewrite.fillSwitch"])
+                .first { $0.kind == "refactor.rewrite.fillSwitch" }
+            if var a = fill, a.edit == nil { a = await self.context.gopls.resolve(codeAction: a); fill = a }
+            guard doc.version == version, self.caretOffset == bodyAt else { return }  // the user moved on
+            if let edit = fill?.edit {
+                _ = self.context.applyWorkspaceEdit(edit)
+                // Caret at the end of the first case line.
+                let text = doc.storage.string as NSString
+                let c = text.range(of: "case ", range: NSRange(location: start, length: text.length - start))
+                if c.location != NSNotFound {
+                    let colon = text.range(of: ":", range: NSRange(location: c.location, length: text.length - c.location))
+                    if colon.location != NSNotFound { self.textView.setSelectedRange(NSRange(location: colon.location + 1, length: 0)) }
+                }
+            } else {
+                let filler = "\n" + indent + "case :"
+                self.textView.insertReplacing(NSRange(location: bodyAt, length: 0), with: filler, caret: bodyAt + (filler as NSString).length - 1)
+            }
+        }
+        return true
     }
 
     // MARK: - Ghost text (local AI)
@@ -194,6 +238,31 @@ extension EditorController {
         hoverWord = nil
     }
 
+    /// Module paths that live in this workspace: the file's own module plus go.work `use` entries.
+    /// Their packages are usually not published, so pkg.go.dev links to them are hidden.
+    func localModulePaths() -> [String] {
+        var out: [String] = []
+        if let m = GoTestLocator.findModule(from: document.url.deletingLastPathComponent()) { out.append(m.path) }
+        if let work = try? String(contentsOf: context.root.appendingPathComponent("go.work"), encoding: .utf8) {
+            var inUse = false
+            for raw in work.split(separator: "\n") {
+                var line = raw.trimmingCharacters(in: .whitespaces)
+                if let c = line.range(of: "//") { line = String(line[..<c.lowerBound]).trimmingCharacters(in: .whitespaces) }
+                var dir: String?
+                if inUse {
+                    if line.hasPrefix(")") { inUse = false } else if !line.isEmpty { dir = line }
+                } else if line.hasPrefix("use") {
+                    let rest = line.dropFirst(3).trimmingCharacters(in: .whitespaces)
+                    if rest.hasPrefix("(") { inUse = true } else if !rest.isEmpty { dir = rest }
+                }
+                if let dir, let m = GoTestLocator.findModule(from: context.root.appendingPathComponent(dir.trimmingCharacters(in: CharacterSet(charactersIn: "\"`")))) {
+                    out.append(m.path)
+                }
+            }
+        }
+        return out
+    }
+
     private func identifierRange(at offset: Int) -> NSRange? {
         let ns = document.storage.string as NSString
         func isIdent(_ c: unichar) -> Bool {
@@ -241,7 +310,7 @@ extension EditorController {
             }
             guard let self else { return }
             if let word, self.hoverWord != word { return }  // the mouse moved on
-            let card = Markdown.hoverCard(diagnostics: diags.map(\.message), markdown: hover ?? "")
+            let card = Markdown.hoverCard(diagnostics: diags.map(\.message), markdown: hover ?? "", localModules: self.localModulePaths())
             guard card.length > 0 else { return }
             if self.info == nil { self.info = InfoPopup(editor: self) }
             self.info?.show(attributed: card, at: rect, in: self.textView, kind: .hover)
@@ -420,7 +489,7 @@ extension EditorController {
             guard let self else { return }
             await self.context.documents.flush(flushDoc)
             var actions = await self.context.gopls.codeActions(uri: uri, range: range, diagnostics: diags)
-            actions.sort { ($0.isPreferred ? 0 : 1, $0.kind == "quickfix" ? 0 : 1) < ($1.isPreferred ? 0 : 1, $1.kind == "quickfix" ? 0 : 1) }
+            actions.sort { Self.actionRank($0) < Self.actionRank($1) }
             let menu = NSMenu(title: "Actions")
             let header = NSMenuItem(title: "Context Actions", action: nil, keyEquivalent: "")
             header.isEnabled = false
@@ -442,6 +511,36 @@ extension EditorController {
             self.pendingActions = (version, actions)
             let rect = self.caretScreenRect()
             menu.popUp(positioning: nil, at: NSPoint(x: rect.minX, y: rect.maxY + 2), in: self.textView)
+        }
+    }
+
+    /// Quick fixes, then fill switch/struct, then other refactors, then source/doc browsing.
+    static func actionRank(_ a: LSPCodeAction) -> Int {
+        let k = a.kind ?? ""
+        if a.isPreferred { return 0 }
+        if k.hasPrefix("quickfix") { return 1 }
+        if k == "refactor.rewrite.fillSwitch" || k == "refactor.rewrite.fillStruct" { return 2 }
+        if k.hasPrefix("refactor") { return 3 }
+        if k.hasPrefix("gopls.doc") { return 6 }
+        if k.hasPrefix("source") { return 5 }
+        return 4
+    }
+
+    /// Headless driver: print the actions at the caret, optionally apply one by title.
+    func debugCodeActions(apply match: String?) {
+        let lines = TextLines(nsString: document.storage.string as NSString)
+        let range = lines.lspRange(for: textView.selectedRange())
+        let uri = document.uri, doc = document, version = document.version
+        Task { [weak self] in
+            guard let self else { return }
+            await self.context.documents.flush(doc)
+            let actions = await self.context.gopls.codeActions(uri: uri, range: range, diagnostics: self.diagnostics(atLine: range.start.line))
+            print("actions: " + actions.map { "\($0.title) [\($0.kind ?? "")]" }.joined(separator: " | "))
+            guard let match, let i = actions.firstIndex(where: { $0.title.contains(match) }) else { return }
+            self.pendingActions = (version, actions)
+            let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+            item.tag = i
+            self.runCodeAction(item)
         }
     }
 
@@ -573,7 +672,15 @@ extension EditorController {
 /// Renders gopls hover markdown: Go code blocks are syntax highlighted, prose uses the UI font.
 @MainActor
 enum Markdown {
-    static func hoverCard(diagnostics: [String], markdown: String) -> NSAttributedString {
+    /// True for a pkg.go.dev URL that points into one of `modules`.
+    static func isLocalDocLink(_ url: URL, modules: [String]) -> Bool {
+        guard url.host == "pkg.go.dev" else { return false }
+        let path = String(url.path.drop { $0 == "/" })
+        return modules.contains { path == $0 || path.hasPrefix($0 + "/") }
+    }
+
+    static func hoverCard(diagnostics: [String], markdown: String, localModules: [String] = []) -> NSAttributedString {
+        let isLocal: (URL) -> Bool = { isLocalDocLink($0, modules: localModules) }
         let out = NSMutableAttributedString()
         let size = max(11, Theme.fontSize - 1)
         let mono = NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
@@ -591,7 +698,7 @@ enum Markdown {
             text.removeAll()
             guard !body.isEmpty else { return }
             gap()
-            out.append(inline(body, prose: prose, mono: mono))
+            out.append(inline(body, prose: prose, mono: mono, isLocal: isLocal))
         }
         var indented: [String] = []
         func flushIndented() {
@@ -630,6 +737,11 @@ enum Markdown {
                 continue
             }
             if line.trimmingCharacters(in: .whitespaces) == "---" { flushText(); continue }
+            // "[`pkg.Name` on pkg.go.dev](…)" for a workspace package: there is no such page.
+            if line.contains(" on pkg.go.dev]("), let open = line.range(of: "]("), let close = line.range(of: ")", options: .backwards),
+               open.upperBound <= close.lowerBound, let url = URL(string: String(line[open.upperBound..<close.lowerBound])), isLocal(url) {
+                continue
+            }
             text.append(line)
         }
         flushIndented()
@@ -657,7 +769,7 @@ enum Markdown {
     }
 
     /// Prose with `code`, **bold**, [links](…) and backslash escapes.
-    static func inline(_ md: String, prose: NSFont, mono: NSFont) -> NSAttributedString {
+    static func inline(_ md: String, prose: NSFont, mono: NSFont, isLocal: (URL) -> Bool = { _ in false }) -> NSAttributedString {
         let out = NSMutableAttributedString()
         let base: [NSAttributedString.Key: Any] = [.font: prose, .foregroundColor: Theme.text]
         var buf = ""
@@ -690,7 +802,7 @@ enum Markdown {
                 let label = String(chars[(i + 1)..<mid]).replacingOccurrences(of: "`", with: "").replacingOccurrences(of: "\\", with: "")
                 var extra: [NSAttributedString.Key: Any] = [.foregroundColor: Theme.function]
                 if let url = URL(string: String(chars[(mid + 2)..<close])), url.scheme == "https" || url.scheme == "http" {
-                    extra[.link] = url
+                    if isLocal(url) { extra[.foregroundColor] = Theme.type } else { extra[.link] = url }
                 }
                 emit(label, extra)
                 i = close + 1; continue

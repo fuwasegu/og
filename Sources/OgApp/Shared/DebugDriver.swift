@@ -79,6 +79,10 @@ enum DebugDriver {
             let a = arg.split(separator: " ").compactMap { Int($0) }
             guard a.count == 2, let ed = project?.editorArea.current else { return }
             ed.reveal(line: a[0] - 1, column: a[1] - 1, length: 0)
+        case "codeaction":
+            // codeaction [title substring]: list gopls actions at the caret; apply the first match.
+            guard let ed = project?.editorArea.current else { return }
+            ed.debugCodeActions(apply: arg.isEmpty ? nil : arg)
         case "hover":
             // hover L C: simulate the mouse resting on line L, column C; prints when the card shows.
             let a = arg.split(separator: " ").compactMap { Int($0) }
