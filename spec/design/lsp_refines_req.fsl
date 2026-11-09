@@ -1,0 +1,28 @@
+// LanguageDesign ⊑ Language
+// DES-1: "version gopls knows" = last version written to the ordered stream.
+// DES-4: spawning / initializing look like "starting"; backoff looks like "crashed".
+refinement LanguageRefinesReq {
+  impl LanguageDesign
+  abs  Language
+  maps auto
+
+  map server = if phase == PStopped then Stopped
+               else if phase == PReady then Ready
+               else if phase == PCrashed or phase == PBackoff then Crashed
+               else Starting
+  map synced[f: File]  = sent[f]
+  map pending[f: File] = req[f]
+
+  action spawned()       -> stutter
+  action initialized()   -> server_ready()
+  action exited()        -> server_crash()
+  action wait_backoff()  -> stutter
+  action respawn()       -> restart()
+  action send_change(f)  -> sync(f)
+  action process(f)      -> stutter
+  action publish(f, v)   -> publish_diagnostics(f, v)
+  action request(f)      -> request_edits(f)
+  action respond(f)      -> stutter
+  action apply(f)        -> apply_edits(f)
+  action drop(f)         -> discard_edits(f)
+}

@@ -1,0 +1,17 @@
+// WorkspaceDesign ⊑ Workspace
+// `disk` in the requirements is the disk as the editor observes it (DES-2): the
+// design's `known`. Foreign writes are invisible until FSEvents reports them.
+refinement WorkspaceRefinesReq {
+  impl WorkspaceDesign
+  abs  Workspace
+  maps auto
+
+  map disk[f: File] = known[f]
+
+  action foreign_write(f, c) -> stutter
+  action settle()            -> stutter
+  action write_request(f)    -> stutter
+  action write_abort(f)      -> stutter
+  action write_done(f)       -> autosave(f)
+  action notify(f)           -> external_change(f, real[f])
+}

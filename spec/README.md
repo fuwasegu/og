@@ -11,6 +11,9 @@
 | D-3 | 外部変更は、未編集のタブなら自動で読み直す。未保存の変更があれば衝突として選ばせる |
 | D-4 | デバッガ（delve）と Git（commit・ブランチ）を含める |
 | D-5 | ローカル AI 補完（llama-server）を残す |
+| D-6 | 保存に失敗したら、タブは未保存のままエラーを出す。保存できるか変更を破棄するまで、そのタブとプロジェクトを閉じられない |
+| D-7 | 自動保存は 1 ファイルずつ書き込む |
+| D-8 | UI は AppKit 中心で組み、周辺の画面だけ SwiftUI を使う |
 
 仮定（`ASSUME-n`）は各 `.fsl` の冒頭にあり、2026-11-09 にすべてオーナーが承認した（`confirmed`）。
 
@@ -44,6 +47,20 @@ FSL で表せるのは、操作の順序や組み合わせで壊れうる部分�
 - VCS-1 ツリー上の状態表示、VCS-2 差分ガター、VCS-3 commit・ブランチ・stash
 - GO-1 Postfix 補完、GO-2 Struct タグ生成、GO-3 Table Test 生成、GO-4 implements 表示、GO-5 ローカル AI 補完
 - NFR-1 WebView なし、NFR-2 120 fps と表示行だけの描画、NFR-3 Swift 6 の厳格な並行性チェック
+
+## 設計層
+
+設計層は `spec/design/` にあり、`fslc refine` で要件層を満たすことを確かめる。
+
+| 領域 | 設計 | マッピング | 状態 |
+|---|---|---|---|
+| ワークスペース | `design/workspace.fsl` | `design/workspace_refines_req.fsl` | refines |
+| gopls | `design/lsp.fsl` | `design/lsp_refines_req.fsl` | refines |
+| リファクタ・実行・Git・補完 | 未着手 | 未着手 | なし |
+
+```sh
+fslc refine spec/design/workspace.fsl spec/req/workspace.fsl spec/design/workspace_refines_req.fsl
+```
 
 ## 検証コマンド
 

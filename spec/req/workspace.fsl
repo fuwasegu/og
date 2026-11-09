@@ -6,6 +6,11 @@
 //        plus explicit Cmd-S). No "save changes?" prompt on close or quit.
 //   D-3: External change to an open file: reload silently if the buffer has no
 //        unsaved edits; otherwise show a conflict and let the user choose.
+//   D-6: If writing a file fails (disk full, no permission), the tab stays dirty
+//        and shows an error; closing that tab or the project is blocked until a
+//        save succeeds or the user discards the edits.
+//   D-7: Autosave writes one file at a time; a moment where only some files are
+//        saved is acceptable.
 //
 // ASSUME-1 (representation only): file content is abstracted to a small finite
 //   value; "edit" means the buffer now holds a value the user typed.
@@ -28,6 +33,8 @@ requirements Workspace {
     dirty:    Map<File, Bool>,      // tab has edits not yet written to disk
     conflict: Map<File, Bool>,      // disk changed externally while tab was dirty
     focused:  Option<File>,         // active tab
+    writable: Map<File, Bool>,      // environment: a write to this file would succeed
+    save_error: Map<File, Bool>,    // last save of this tab failed; error is shown
     // MODEL: ghost — last content the user typed that is neither saved nor
     // explicitly discarded by the user. Used only to state "no silent loss".
     typed:    Map<File, Option<Content>>
@@ -44,7 +51,16 @@ requirements Workspace {
       dirty[f] = false
       conflict[f] = false
       typed[f] = none
+      writable[f] = true
+      save_error[f] = false
     }
+  }
+
+  // ---- environment ----
+
+  action disk_trouble(f: File, ok: Bool) "MODEL-3: the environment makes writes to a file fail or succeed again" {
+    requires writable[f] != ok
+    writable[f] = ok
   }
 
   // ---- WS: project ----
@@ -57,6 +73,7 @@ requirements Workspace {
   action close_project() "WS-1: closing the project autosaves every dirty tab and closes all tabs (ED-2)" {
     requires project_open
     requires forall f: File { not conflict[f] }   // ASSUME-3
+    requires forall f: File { dirty[f] => writable[f] }   // D-6
     project_open = false
     focused = none
     forall f: File {
@@ -64,6 +81,7 @@ requirements Workspace {
       open[f] = false
       dirty[f] = false
       typed[f] = none
+      save_error[f] = false
     }
   }
 
@@ -78,6 +96,7 @@ requirements Workspace {
     buf[f] = 0
     dirty[f] = false
     conflict[f] = false
+    save_error[f] = false
     focused = some(f)
   }
 
@@ -89,6 +108,7 @@ requirements Workspace {
     dirty[f] = false
     conflict[f] = false
     typed[f] = none                // explicit user decision to discard
+    save_error[f] = false
     if focused == some(f) { focused = none }
   }
 
@@ -102,21 +122,15 @@ requirements Workspace {
     buf[f] = disk[f]
     dirty[f] = false
     conflict[f] = false
+    save_error[f] = false
     focused = some(f)
   }
 
-  action switch_tab(f: File) "ED-1: switching tabs autosaves the tab being left (ED-2)" {
+  action switch_tab(f: File) "ED-1: switching tabs moves focus; leaving a tab makes it eligible for autosave (ED-2, D-7)" {
     requires project_open
     requires open[f]
     requires focused != some(f)
     focused = some(f)
-    forall g: File {
-      if focused == some(g) and dirty[g] and not conflict[g] {
-        disk[g] = buf[g]
-        dirty[g] = false
-        typed[g] = none
-      }
-    }
   }
 
   action edit(f: File, c: Content) "ED-3: the user edits the focused tab; it becomes dirty" {
@@ -128,36 +142,54 @@ requirements Workspace {
     typed[f] = some(c)
   }
 
-  action save(f: File) "ED-2: Cmd-S writes the focused tab to disk" {
+  action save(f: File) "ED-2: Cmd-S writes the focused tab to disk; a failed write leaves it dirty with an error (D-6)" {
     requires project_open
     requires focused == some(f)
     requires dirty[f]
     requires not conflict[f]
-    disk[f] = buf[f]
-    dirty[f] = false
-    typed[f] = none
-  }
-
-  action autosave() "ED-2: on focus loss or idle, every dirty tab without a conflict is written to disk" {
-    requires project_open
-    requires exists f: File { dirty[f] and not conflict[f] }
-    forall f: File {
-      if dirty[f] and not conflict[f] {
-        disk[f] = buf[f]
-        dirty[f] = false
-        typed[f] = none
-      }
+    if writable[f] {
+      disk[f] = buf[f]
+      dirty[f] = false
+      typed[f] = none
+      save_error[f] = false
+    } else {
+      save_error[f] = true
     }
   }
 
-  action close_tab(f: File) "ED-1: closing a tab autosaves it first; no prompt (ED-2)" {
+  action autosave(f: File) "ED-2: on focus loss or idle, a dirty tab without a conflict is written to disk, one file at a time (D-7, D-6)" {
+    requires project_open
+    requires dirty[f]
+    requires not conflict[f]
+    if writable[f] {
+      disk[f] = buf[f]
+      dirty[f] = false
+      typed[f] = none
+      save_error[f] = false
+    } else {
+      save_error[f] = true
+    }
+  }
+
+  action discard(f: File) "D-6: after a failed save, the user may discard the edits and reload the disk content" {
+    requires save_error[f]
+    requires not conflict[f]
+    buf[f] = disk[f]
+    dirty[f] = false
+    typed[f] = none                // explicit user decision to discard
+    save_error[f] = false
+  }
+
+  action close_tab(f: File) "ED-1: closing a tab autosaves it first, no prompt; blocked if the write would fail (ED-2, D-6)" {
     requires project_open
     requires open[f]
     requires not conflict[f]
+    requires dirty[f] => writable[f]
     if dirty[f] { disk[f] = buf[f] }
     open[f] = false
     dirty[f] = false
     typed[f] = none
+    save_error[f] = false
     if focused == some(f) { focused = none }
   }
 
@@ -174,6 +206,8 @@ requirements Workspace {
 
   action keep_mine(f: File) "ED-6: in a conflict, the user keeps the buffer and overwrites disk" {
     requires conflict[f]
+    requires writable[f]          // D-6: a failing write keeps the conflict open
+    save_error[f] = false
     disk[f] = buf[f]
     dirty[f] = false
     conflict[f] = false
@@ -186,6 +220,7 @@ requirements Workspace {
     dirty[f] = false
     conflict[f] = false
     typed[f] = none                // explicit user decision to discard
+    save_error[f] = false
   }
 
   // ---- Properties ----
@@ -216,6 +251,10 @@ requirements Workspace {
     focused is some(f) => open[f]
   }
 
+  invariant ErrorOnlyWhenDirty "D-6: a save error is shown only on a tab that still has unsaved edits" {
+    forall f: File { save_error[f] => dirty[f] }
+  }
+
   invariant TypedOnlyWhenDirty "MODEL-1: induction aid; pending typed content exists exactly while the tab is dirty" {
     forall f: File { typed[f] != none => dirty[f] }
   }
@@ -223,7 +262,7 @@ requirements Workspace {
   // ---- Acceptance / forbidden ----
 
   acceptance AC-WS-1 "ED-2: edit then switch tab autosaves the first file" {
-    open_project() open_tab(0) open_tab(1) switch_tab(0) edit(0, 1) switch_tab(1)
+    open_project() open_tab(0) open_tab(1) switch_tab(0) edit(0, 1) switch_tab(1) autosave(0)
     expect disk[0] == 1 and not dirty[0]
   }
 
@@ -249,6 +288,21 @@ requirements Workspace {
 
   forbidden FB-WS-2 "ED-6: a conflicting tab cannot be closed without resolving it (ASSUME-3)" {
     open_project() open_tab(0) edit(0, 1) external_change(0, 2) close_tab(0)
+    expect rejected
+  }
+
+  acceptance AC-WS-5 "D-6: a failed autosave keeps the edit; it is saved once the disk recovers" {
+    open_project() open_tab(0) edit(0, 1) disk_trouble(0, false) autosave(0) disk_trouble(0, true) autosave(0)
+    expect disk[0] == 1 and not dirty[0] and not save_error[0]
+  }
+
+  forbidden FB-WS-4 "D-6: a tab whose save fails cannot be closed" {
+    open_project() open_tab(0) edit(0, 1) disk_trouble(0, false) autosave(0) close_tab(0)
+    expect rejected
+  }
+
+  forbidden FB-WS-5 "D-6: the project cannot be closed while a dirty file cannot be written" {
+    open_project() open_tab(0) edit(0, 1) disk_trouble(0, false) close_project()
     expect rejected
   }
 
