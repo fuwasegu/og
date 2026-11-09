@@ -95,4 +95,10 @@ struct HarnessGuardrailTests {
         #expect(elapsedMs < 80.0)
         #expect(screen.scrollback.count > 100)
     }
+
+    @Test("Concurrency Isolation: NativePTYSession background DispatchSourceRead does not trap")
+    func nativePTYSessionConcurrencyIsolation() async {
+        let ok = await TestWorkspaceHelper.verifyNativePTYSessionLifecycle()
+        #expect(ok)
+    }
 }

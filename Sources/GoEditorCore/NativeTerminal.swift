@@ -428,21 +428,31 @@ public final class NativePTYSession: ObservableObject {
         self.shellProcess = proc
         self.isRunning = true
 
-        let source = DispatchSource.makeReadSource(fileDescriptor: master, queue: .global(qos: .userInteractive))
-        source.setEventHandler { [weak self] in
-            var buf = [UInt8](repeating: 0, count: 16384)
-            let n = read(master, &buf, buf.count)
-            guard n > 0 else { return }
-            let text = String(decoding: buf[0..<n], as: UTF8.self)
+        let source = Self.makePTYReadSource(master: master) { [weak self] text in
             Task { @MainActor [weak self] in
                 self?.screenBuffer.feed(text)
             }
         }
+        self.readSource = source
+        source.resume()
+    }
+
+    nonisolated private static func makePTYReadSource(
+        master: Int32,
+        onText: @escaping @Sendable (String) -> Void
+    ) -> DispatchSourceRead {
+        let source = DispatchSource.makeReadSource(fileDescriptor: master, queue: .global(qos: .userInteractive))
+        source.setEventHandler {
+            var buf = [UInt8](repeating: 0, count: 16384)
+            let n = read(master, &buf, buf.count)
+            guard n > 0 else { return }
+            let text = String(decoding: buf[0..<n], as: UTF8.self)
+            onText(text)
+        }
         source.setCancelHandler {
             close(master)
         }
-        self.readSource = source
-        source.resume()
+        return source
     }
 
     public func sendInput(_ text: String) {

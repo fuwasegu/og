@@ -32,4 +32,15 @@ enum TestWorkspaceHelper {
         let elapsed = start.duration(to: .now)
         return (Double(elapsed.components.seconds) * 1000.0) + (Double(elapsed.components.attoseconds) / 1e15)
     }
+
+    @MainActor
+    static func verifyNativePTYSessionLifecycle() async -> Bool {
+        let session = NativePTYSession(workingDirectory: FileManager.default.temporaryDirectory)
+        session.startIfNeeded()
+        guard session.isRunning else { return false }
+        session.sendInput("echo og_pty_ok\r")
+        try? await Task.sleep(for: .milliseconds(150))
+        session.stop()
+        return !session.isRunning
+    }
 }

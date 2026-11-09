@@ -145,19 +145,20 @@ public actor GoplsClient {
         self.stdinHandle = stdinPipe.fileHandleForWriting
         self.stdoutHandle = stdoutPipe.fileHandleForReading
 
-        stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let chunk = handle.availableData
-            guard !chunk.isEmpty else { return }
-            Task {
-                await self?.handleIncomingData(chunk)
+        Self.attachProcessHandlers(
+            stdoutHandle: stdoutPipe.fileHandleForReading,
+            process: proc,
+            onData: { [weak self] chunk in
+                Task {
+                    await self?.handleIncomingData(chunk)
+                }
+            },
+            onTerminate: { [weak self] in
+                Task {
+                    await self?.handleUnexpectedTermination()
+                }
             }
-        }
-
-        proc.terminationHandler = { [weak self] _ in
-            Task {
-                await self?.handleUnexpectedTermination()
-            }
-        }
+        )
 
         try proc.run()
         lastPongTimestamp = .now
@@ -165,6 +166,22 @@ public actor GoplsClient {
         try await sendInitializeHandshake(workspaceRoot: workspaceRoot)
         updateHealth(.healthy(latencyMs: 1.0))
         startWatchdogLoop()
+    }
+
+    nonisolated private static func attachProcessHandlers(
+        stdoutHandle: FileHandle,
+        process: Process,
+        onData: @escaping @Sendable (Data) -> Void,
+        onTerminate: @escaping @Sendable () -> Void
+    ) {
+        stdoutHandle.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            guard !chunk.isEmpty else { return }
+            onData(chunk)
+        }
+        process.terminationHandler = { _ in
+            onTerminate()
+        }
     }
 
     public func shutdown() async {
