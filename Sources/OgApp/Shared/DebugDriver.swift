@@ -14,6 +14,9 @@ import OgCore
 ///     snap <path.png>              write a PNG of the project window
 ///     log <text>                   print to stdout
 ///     dump                         print editor text + diagnostics count
+///     diags                        print every diagnostic (gopls + og style) of the editor
+///     completions                  request completion at the caret and print the listed labels
+///     accept [label]               accept the listed completion whose label contains `label`
 ///     quit
 @MainActor
 enum DebugDriver {
@@ -230,6 +233,23 @@ enum DebugDriver {
             ed.requestGhost()
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             print("ghost: \(ed.textView.ghostText ?? "(none)")")
+        case "diags":
+            // diags: every diagnostic of the current editor (gopls + og style), one per line.
+            guard let ed = project?.editorArea.current else { return }
+            for d in ed.diagnostics.sorted(by: { $0.range.start < $1.range.start }) {
+                print("diag \(d.range.start.line + 1):\(d.range.start.character + 1) [\(d.source ?? "")\(d.code.flatMap { $0.stringValue }.map { " " + $0 } ?? "")] \(d.message)")
+            }
+        case "completions":
+            // completions: request completion at the caret and print the items (og's first).
+            guard let ed = project?.editorArea.current else { return }
+            ed.requestCompletion(explicit: true)
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            print("completions: " + ed.debugCompletionLabels().prefix(12).joined(separator: " | "))
+        case "accept":
+            // accept [label substring]: accept the first visible completion matching the label.
+            guard let ed = project?.editorArea.current else { return }
+            ed.debugAcceptCompletion(matching: arg)
+            try? await Task.sleep(nanoseconds: 300_000_000)
         case "log":
             print(arg)
         case "dump":

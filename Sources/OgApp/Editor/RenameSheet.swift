@@ -22,8 +22,10 @@ final class RenameSheet: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     private let oldName: String
     private var observer: NSObjectProtocol?
 
-    static func present(on window: NSWindow, editor: EditorController, oldName: String, uri: String, position: LSPPosition) {
+    static func present(on window: NSWindow, editor: EditorController, oldName: String, uri: String, position: LSPPosition,
+                        suggested: String? = nil) {
         let s = RenameSheet(window: window, editor: editor, oldName: oldName, uri: uri, position: position)
+        if let suggested { s.field.stringValue = suggested }
         current = s
         window.beginSheet(s.sheet) { _ in current = nil }
         s.sheet.makeFirstResponder(s.field)

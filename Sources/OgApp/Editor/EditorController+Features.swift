@@ -26,6 +26,7 @@ extension EditorController {
         }
         if s == "(" || s == "," { showSignatureHelp() }
         if s == ")" { info?.closeIf(kind: .signature) }
+        styleTyped(s)
         scheduleGhost()
     }
 
@@ -48,12 +49,18 @@ extension EditorController {
         completionTask = Task { [weak self] in
             guard let self else { return }
             await self.context.documents.flush(flushDoc)
-            guard var items = await self.context.gopls.completion(uri: uri, position: pos), !Task.isCancelled else { return }
+            // No gopls answer (e.g. in a comment) still leaves og's own templates.
+            var items = await self.context.gopls.completion(uri: uri, position: pos) ?? []
+            guard !Task.isCancelled else { return }
             // Spec LSP-2: a response for an older version only refilters; it never applies stale ranges.
             let stale = self.document.version != version
+            let local = await self.styleCompletionItems(gopls: items)
+            guard !Task.isCancelled else { return }
             if let err = GoErrCheck.suggestion(in: self.document.storage.string as NSString, caret: self.caretOffset) {
                 items.insert(Self.errCheckItem(err), at: 0)
             }
+            if local.inComment { items = [] }
+            items.insert(contentsOf: local.items, at: 0)
             if items.isEmpty { self.completion?.close(); return }
             if self.completion == nil { self.completion = CompletionPopup(editor: self) }
             self.completion?.show(items: items, text: self.document.storage.string as NSString, caret: self.caretOffset, staleRanges: stale, explicit: explicit)
@@ -78,7 +85,7 @@ extension EditorController {
         var start = caret
         while start > 0, let u = UnicodeScalar(ns.character(at: start - 1)), CharacterSet.alphanumerics.contains(u) || u == "_" { start -= 1 }
         var range = NSRange(location: start, length: caret - start)
-        if !staleRanges, let te = item.textEdit {
+        if !staleRanges || item.isLocal, let te = item.textEdit {
             let lines = TextLines(nsString: ns)
             let r = lines.nsRange(for: te.range)
             if r.location <= caret { range = NSRange(location: r.location, length: max(r.length, caret - r.location)) }
@@ -93,6 +100,7 @@ extension EditorController {
         document.undoManager.endUndoGrouping()
         document.undoManager.setActionName("Completion")
         if text.hasSuffix("()") == false && text.contains("(") { showSignatureHelp() }
+        styleCompletionAccepted(item)
     }
 
     /// Keys while the completion popup is open. Returns true if consumed.
@@ -337,7 +345,8 @@ extension EditorController {
             guard let self else { return }
             if let word, self.hoverWord != word { return }  // the mouse moved on
             let card = Markdown.hoverCard(diagnostics: diags.map(\.message), markdown: hover.markdown ?? "",
-                                          constants: hover.constants, localModules: self.localModulePaths())
+                                          constants: hover.constants, localModules: self.localModulePaths(),
+                                          diagnosticLinks: diags.map(Self.styleGuideLink))
             guard card.length > 0 else { return }
             if self.info == nil { self.info = InfoPopup(editor: self) }
             self.info?.show(attributed: card, at: rect, in: self.textView, kind: .hover)
@@ -510,8 +519,9 @@ extension EditorController {
         let lines = TextLines(nsString: document.storage.string as NSString)
         let sel = textView.selectedRange()
         let range = lines.lspRange(for: sel)
-        let diags = diagnostics(atLine: range.start.line)
+        let diags = diagnostics(atLine: range.start.line).filter { $0.source != GoStyle.source }
         let version = document.version
+        let styleFixes = styleFixes(atLine: range.start.line)
         Task { [weak self] in
             guard let self else { return }
             await self.context.documents.flush(flushDoc)
@@ -529,6 +539,7 @@ extension EditorController {
             }
             // og's own Go intentions.
             menu.addItem(.separator())
+            self.addStyleFixItems(styleFixes, to: menu)
             let tags = NSMenuItem(title: "Add json struct tags", action: #selector(self.menuStructTags), keyEquivalent: "")
             tags.target = self
             menu.addItem(tags)
@@ -561,8 +572,12 @@ extension EditorController {
         Task { [weak self] in
             guard let self else { return }
             await self.context.documents.flush(doc)
-            let actions = await self.context.gopls.codeActions(uri: uri, range: range, diagnostics: self.diagnostics(atLine: range.start.line))
+            let gd = self.diagnostics(atLine: range.start.line).filter { $0.source != GoStyle.source }
+            let actions = await self.context.gopls.codeActions(uri: uri, range: range, diagnostics: gd)
             print("actions: " + actions.map { "\($0.title) [\($0.kind ?? "")]" }.joined(separator: " | "))
+            let fixes = self.styleFixes(atLine: range.start.line)
+            print("og fixes: " + fixes.map(\.fix.title).joined(separator: " | "))
+            if let match, let f = fixes.first(where: { $0.fix.title.contains(match) }) { self.applyStyleFix(f); return }
             guard let match, let i = actions.firstIndex(where: { $0.title.contains(match) }) else { return }
             self.pendingActions = (version, actions)
             let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
@@ -676,7 +691,7 @@ extension EditorController {
 
     // MARK: - Rename (refactor.fsl)
 
-    func startRename() {
+    func startRename(suggested: String? = nil) {
         guard document.isGo else { return }
         guard context.saveAll() else { context.setStatus("Save all files before renaming"); return }
         let flushDoc = document
@@ -691,7 +706,7 @@ extension EditorController {
             let ns = self.document.storage.string as NSString
             let oldName = prep.placeholder ?? ns.substring(with: TextLines(nsString: ns).nsRange(for: prep.range))
             guard let window = self.view.window else { return }
-            RenameSheet.present(on: window, editor: self, oldName: oldName, uri: uri, position: pos)
+            RenameSheet.present(on: window, editor: self, oldName: oldName, uri: uri, position: pos, suggested: suggested)
         }
     }
 }
@@ -706,16 +721,22 @@ enum Markdown {
         return modules.contains { path == $0 || path.hasPrefix($0 + "/") }
     }
 
-    static func hoverCard(diagnostics: [String], markdown: String, constants: [GoEnumConstant] = [], localModules: [String] = []) -> NSAttributedString {
+    static func hoverCard(diagnostics: [String], markdown: String, constants: [GoEnumConstant] = [], localModules: [String] = [],
+                          diagnosticLinks: [(title: String, url: URL)?] = []) -> NSAttributedString {
         let isLocal: (URL) -> Bool = { isLocalDocLink($0, modules: localModules) }
         let out = NSMutableAttributedString()
         let size = max(11, Theme.fontSize - 1)
         let mono = NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
         let prose = NSFont.systemFont(ofSize: size)
         func gap() { if out.length > 0 { out.append(NSAttributedString(string: "\n\n", attributes: [.font: NSFont.systemFont(ofSize: 4)])) } }
-        for d in diagnostics {
+        for (i, d) in diagnostics.enumerated() {
             gap()
             out.append(NSAttributedString(string: "⚠ " + d, attributes: [.font: prose, .foregroundColor: Theme.warning]))
+            // og's style findings link the guide section they come from.
+            if i < diagnosticLinks.count, let link = diagnosticLinks[i] {
+                out.append(NSAttributedString(string: "\n", attributes: [.font: prose]))
+                out.append(NSAttributedString(string: link.title, attributes: [.font: prose, .foregroundColor: Theme.function, .link: link.url]))
+            }
         }
         var code: [String] = []
         var text: [String] = []

@@ -32,6 +32,8 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
     var gitChanges: [GitLineChange] = []
     var pendingActions: (version: Int, actions: [LSPCodeAction])?
     var estimateRemovedNewlines = 0
+    /// og's Go style checks (EditorController+Style.swift).
+    let style = StyleCheckState()
     private var gitTask: Task<Void, Never>?
 
     init(context: ProjectContext, document: Document) {
@@ -96,6 +98,7 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
         applyDiagnostics()
         updateBanner()
         refreshGitChanges()
+        scheduleStyleCheck(delay: 0)
     }
 
     private func configureTextView() {
@@ -205,6 +208,7 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
                 guard let self else { return }
                 self.document.markEdited()
                 self.scheduleHighlight()
+                self.scheduleStyleCheck()
                 self.gutter.needsDisplay = true
             }
         }
@@ -298,7 +302,7 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
 
     // MARK: - Diagnostics
 
-    var diagnostics: [LSPDiagnostic] { context.diagnostics[document.uri] ?? [] }
+    var diagnostics: [LSPDiagnostic] { (context.diagnostics[document.uri] ?? []) + style.diagnostics }
 
     func applyDiagnostics() {
         guard let lm = textView.layoutManager else { return }

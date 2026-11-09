@@ -128,3 +128,64 @@ func sseLine(_ content: String, stop: Bool = false) -> String {
 func errCheckAtEnd(_ src: String) -> GoErrCheckSuggestion? {
     GoErrCheck.suggestion(in: src as NSString, caret: (src as NSString).length)
 }
+
+// MARK: - Go style (GoStyleTests)
+
+/// `rule@line` (1-based) for every style finding.
+func styleFindings(_ src: String, file: String = "x.go") -> [String] {
+    GoStyle.check(src, fileName: file).map { "\($0.rule.id)@\($0.range.start.line + 1)" }
+}
+
+/// The new name of a rename fix for `rule`, or nil.
+func styleRename(_ src: String, rule: String, file: String = "x.go") -> String? {
+    guard let f = GoStyle.check(src, fileName: file).first(where: { $0.rule.id == rule })?.fix,
+          case .rename(_, let name) = f.kind else { return nil }
+    return name
+}
+
+/// The text after applying the edit fix for `rule`, or nil.
+func styleApplyFix(_ src: String, rule: String, file: String = "x.go") -> String? {
+    guard let f = GoStyle.check(src, fileName: file).first(where: { $0.rule.id == rule })?.fix,
+          case .edits(let edits, _) = f.kind else { return nil }
+    let ns = NSMutableString(string: src)
+    let lines = TextLines(src)
+    for r in edits.map({ (lines.nsRange(for: $0.range), $0.newText) }).sorted(by: { $0.0.location > $1.0.location }) {
+        ns.replaceCharacters(in: r.0, with: r.1)
+    }
+    return ns as String
+}
+
+/// Style completions at the `|` marker.
+func styleCompletionItems(_ marked: String, file: String = "x_test.go", package: [String] = [],
+                          candidates: [(String, String?)] = []) -> [GoStyleCompletion] {
+    let ns = marked as NSString
+    let caret = ns.range(of: "|").location
+    guard caret != NSNotFound else { return [] }
+    let text = ns.replacingCharacters(in: NSRange(location: caret, length: 1), with: "") as NSString
+    return GoStyleCompletions.items(in: text, caret: caret, fileName: file, packageSources: package,
+                                    candidates: candidates.map { GoCompletionCandidate(label: $0.0, detail: $0.1) })
+}
+
+func styleLabels(_ marked: String, file: String = "x_test.go", package: [String] = [], candidates: [(String, String?)] = []) -> [String] {
+    styleCompletionItems(marked, file: file, package: package, candidates: candidates).map(\.label)
+}
+
+/// Applies the style completion whose label contains `label` at the `|` marker; `‸` marks the caret.
+func styleComplete(_ marked: String, label: String = "", file: String = "x_test.go", package: [String] = [],
+                   candidates: [(String, String?)] = []) -> String? {
+    guard let item = styleCompletionItems(marked, file: file, package: package, candidates: candidates)
+        .first(where: { label.isEmpty || $0.label.contains(label) }) else { return nil }
+    let ns = marked as NSString
+    let caret = ns.range(of: "|").location
+    let text = ns.replacingCharacters(in: NSRange(location: caret, length: 1), with: "") as NSString
+    let out = text.replacingCharacters(in: item.replaceRange, with: item.text) as NSString
+    let c = item.replaceRange.location + item.caretOffset
+    return out.substring(to: c) + "‸" + out.substring(from: c)
+}
+
+func styleTriggers(_ marked: String) -> Bool {
+    let ns = marked as NSString
+    let caret = ns.range(of: "|").location
+    let text = ns.replacingCharacters(in: NSRange(location: caret, length: 1), with: "") as NSString
+    return GoStyleCompletions.shouldTrigger(in: text, caret: caret)
+}
