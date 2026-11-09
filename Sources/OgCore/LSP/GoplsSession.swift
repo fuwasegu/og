@@ -396,9 +396,28 @@ public actor GoplsSession {
     static let settings: JSONValue = [
         "usePlaceholders": false,
         "completeUnimported": true,
-        "staticcheck": false,
+        // Effective Go / Google Go style: staticcheck plus the style checks it leaves off by default.
+        // Modernizers (`any`, rangeint, slicescontains, minmax, ...) are on by default in gopls.
+        "staticcheck": true,
+        "analyses": GoplsSession.analyses,
         "semanticTokens": false,
         "hints": ["parameterNames": true, "assignVariableTypes": false, "compositeLiteralFields": true]
+    ]
+
+    /// Analyzer switches on top of `staticcheck: true`. og's own style checks (`GoStyle`) cover
+    /// receiver names (ST1006) and error variable names (ST1012) with quick fixes, so those are off.
+    static let analyses: JSONValue = [
+        "ST1003": true,         // initialisms and underscores in names (URL, ID, HTTP)
+        "ST1005": true,         // error strings: no capital, no trailing punctuation
+        "ST1016": true,         // consistent receiver names
+        "ST1020": true,         // doc comment of an exported func starts with its name
+        "ST1021": true,         // ... of an exported type
+        "ST1022": true,         // ... of an exported var / const
+        "ST1006": false,
+        "ST1012": false,
+        "ST1000": false,        // package comment: og completes `// Package x` instead of nagging
+        "appendclipped": true,  // modernize: slices.Concat
+        "slicesdelete": true    // modernize: slices.Delete
     ]
 
     static let capabilities: JSONValue = [
