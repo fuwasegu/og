@@ -20,6 +20,9 @@ extension EditorController {
         } else if s.count == 1, let c = s.unicodeScalars.first, CharacterSet.letters.contains(c) || s == "_" {
             // Short debounce: fast typists coalesce into one request, a pause shows the list at once.
             if !isInsideStringOrComment(caretOffset) { scheduleCompletion(delay: 0.04) }
+        } else {
+            // Space, parens, operators: the word ended, so a pending request is moot.
+            completionTimer?.invalidate()
         }
         if s == "(" || s == "," { showSignatureHelp() }
         if s == ")" { info?.closeIf(kind: .signature) }

@@ -42,7 +42,9 @@ final class Document {
     }
 
     /// Called from the storage delegate as soon as characters change.
-    func storageDidChange() { linesCache = nil }
+    func storageDidChange() { linesCache = nil; editGeneration &+= 1 }
+    /// Bumps synchronously on every storage edit (unlike `version`, which follows markEdited).
+    private(set) var editGeneration = 0
 
     private var differsFromDisk: Bool {
         storage.length != knownNS.length || !(storage.string as NSString).isEqual(knownNS)
@@ -50,6 +52,7 @@ final class Document {
 
     func markEdited() {
         linesCache = nil
+        editGeneration &+= 1
         version += 1
         let wasDirty = dirty
         dirty = differsFromDisk

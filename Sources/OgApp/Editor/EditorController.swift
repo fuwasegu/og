@@ -12,6 +12,7 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
     private let banner = EditorBanner()
     private var bannerHeight: NSLayoutConstraint!
     private var highlightTimer: Timer?
+    private var highlightTask: Task<Void, Never>?
     /// Characters whose syntax colors are current.
     private var highlighted = IndexSet()
     private(set) var tokens: [GoToken] = []
@@ -235,11 +236,18 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
     /// Re-tokenizes, then colors only the visible window (± a couple of screens).
     /// Scrolling colors more on demand (`highlightVisibleIfNeeded`). Temporary attributes: no undo, no storage edits.
     func rehighlight() {
-        let ns = document.storage.string as NSString
-        guard document.isGo, ns.length < 3_000_000 else { return }
-        tokens = GoLexer.tokenize(ns)
-        highlighted = IndexSet()
-        highlightVisibleIfNeeded(force: true)
+        guard document.isGo, document.storage.length < 3_000_000 else { return }
+        // Lex an immutable snapshot off the main thread; apply only if no edit happened meanwhile.
+        let snapshot = document.lines  // Sendable: wraps an immutable copy of the buffer
+        let generation = document.editGeneration
+        highlightTask?.cancel()
+        highlightTask = Task { [weak self] in
+            let toks = await Task.detached(priority: .userInitiated) { GoLexer.tokenize(snapshot.text) }.value
+            guard let self, !Task.isCancelled, self.document.editGeneration == generation else { return }
+            self.tokens = toks
+            self.highlighted = IndexSet()
+            self.highlightVisibleIfNeeded(force: true)
+        }
     }
 
     /// Characters on screen, widened by two screens on each side.

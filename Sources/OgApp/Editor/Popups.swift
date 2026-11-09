@@ -19,7 +19,10 @@ final class CompletionPopup: NSObject, NSTableViewDataSource, NSTableViewDelegat
     private var shown: [LSPCompletionItem] = []
     private var anchor = 0          // UTF-16 offset where the typed prefix starts
     private var staleRanges = false
-    var isVisible: Bool { panel.isVisible }
+    /// The panel stays attached to the editor window and is shown/hidden with alpha: attaching and
+    /// ordering a child window on every keystroke costs ~10 ms in the window server.
+    private var showing = false
+    var isVisible: Bool { showing }
 
     init(editor: EditorController) {
         self.editor = editor
@@ -85,10 +88,19 @@ final class CompletionPopup: NSObject, NSTableViewDataSource, NSTableViewDelegat
         let inWindow = editor.textView.convert(rect, to: nil)
         let screen = window.convertToScreen(inWindow)
         let height = min(CGFloat(shown.count) * 20 + 28, 280)
-        panel.setFrame(NSRect(x: screen.minX - 24, y: screen.minY - height - 2, width: 480, height: height), display: true)
-        if !panel.isVisible {
+        let frame = NSRect(x: screen.minX - 24, y: screen.minY - height - 2, width: 480, height: height).integral
+        // Re-placing a window forces a layout pass of the table; skip it when nothing moved.
+        if panel.frame != frame { panel.setFrame(frame, display: false) }
+        if panel.parent !== window {
+            panel.parent?.removeChildWindow(panel)
+            panel.alphaValue = 0
             window.addChildWindow(panel, ordered: .above)
             panel.orderFront(nil)
+        }
+        if !showing {
+            showing = true
+            panel.alphaValue = 1
+            panel.ignoresMouseEvents = false
         }
         _ = explicit
     }
@@ -152,10 +164,10 @@ final class CompletionPopup: NSObject, NSTableViewDataSource, NSTableViewDelegat
     @objc private func doubleClicked() { acceptSelected() }
 
     func close() {
-        if panel.isVisible {
-            panel.parent?.removeChildWindow(panel)
-            panel.orderOut(nil)
-        }
+        guard showing else { return }
+        showing = false
+        panel.alphaValue = 0
+        panel.ignoresMouseEvents = true
     }
 
     private func updateDetail() {
@@ -169,32 +181,12 @@ final class CompletionPopup: NSObject, NSTableViewDataSource, NSTableViewDelegat
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         let item = shown[row]
-        let cell = NSTableCellView()
-        let kind = NSTextField(labelWithString: Self.kindGlyph(item.kind))
-        kind.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .bold)
-        kind.textColor = Self.kindColor(item.kind)
-        kind.alignment = .center
-        let label = NSTextField(labelWithString: item.label)
-        label.font = Theme.editorFont
-        label.textColor = Theme.text
-        label.lineBreakMode = .byTruncatingTail
-        let detail = NSTextField(labelWithString: item.detail ?? "")
-        detail.font = Theme.smallFont
-        detail.textColor = Theme.secondaryText
-        detail.lineBreakMode = .byTruncatingTail
-        detail.alignment = .right
-        detail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let stack = NSStackView(views: [kind, label, detail])
-        stack.spacing = 6
-        stack.edgeInsets = NSEdgeInsets(top: 0, left: 6, bottom: 0, right: 8)
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        cell.addSubview(stack)
-        NSLayoutConstraint.activate([
-            kind.widthAnchor.constraint(equalToConstant: 16),
-            stack.leadingAnchor.constraint(equalTo: cell.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: cell.trailingAnchor),
-            stack.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
-        ])
+        let cell = (tableView.makeView(withIdentifier: CompletionCell.id, owner: nil) as? CompletionCell) ?? CompletionCell()
+        cell.kind.stringValue = Self.kindGlyph(item.kind)
+        cell.kind.textColor = Self.kindColor(item.kind)
+        cell.label.stringValue = item.label
+        cell.label.font = Theme.editorFont
+        cell.detail.stringValue = item.detail ?? ""
         return cell
     }
 
@@ -350,4 +342,41 @@ final class LinkOpener: NSObject, NSTextViewDelegate {
 /// The card never becomes key, so it must take the first click itself (links).
 final class CardTextView: NSTextView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
+/// One completion row; reused by the table instead of being rebuilt on every refilter.
+@MainActor
+final class CompletionCell: NSTableCellView {
+    static let id = NSUserInterfaceItemIdentifier("og.completion.cell")
+    let kind = NSTextField(labelWithString: "")
+    let label = NSTextField(labelWithString: "")
+    let detail = NSTextField(labelWithString: "")
+
+    init() {
+        super.init(frame: .zero)
+        identifier = Self.id
+        kind.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .bold)
+        kind.alignment = .center
+        label.font = Theme.editorFont
+        label.textColor = Theme.text
+        label.lineBreakMode = .byTruncatingTail
+        detail.font = Theme.smallFont
+        detail.textColor = Theme.secondaryText
+        detail.lineBreakMode = .byTruncatingTail
+        detail.alignment = .right
+        detail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let stack = NSStackView(views: [kind, label, detail])
+        stack.spacing = 6
+        stack.edgeInsets = NSEdgeInsets(top: 0, left: 6, bottom: 0, right: 8)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            kind.widthAnchor.constraint(equalToConstant: 16),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stack.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+    }
+
+    required init?(coder: NSCoder) { nil }
 }
