@@ -111,6 +111,23 @@ enum DebugDriver {
             RenameSheet.debugApply()
             try? await Task.sleep(nanoseconds: 500_000_000)
             print("rename: \(RenameSheet.debugStatus)")
+        case "ai":
+            let m = ModelServerManager.shared
+            let a = arg.split(separator: " ", maxSplits: 1).map(String.init)
+            switch a.first ?? "" {
+            case "custom": var c = m.config; c.backend = .custom; c.customCommand = a.count > 1 ? a[1] : ""; m.config = c
+            case "on": m.enabled = true
+            case "off": m.enabled = false
+            case "restart": m.restart()
+            case "pid": print("ai pids: \(m.debugPIDs)")
+            default: break
+            }
+            print("ai: \(m.statusText) phase=\(m.phase)")
+        case "ghost":
+            guard let ed = project?.editorArea.current else { return }
+            ed.requestGhost()
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            print("ghost: \(ed.textView.ghostText ?? "(none)")")
         case "log":
             print(arg)
         case "dump":

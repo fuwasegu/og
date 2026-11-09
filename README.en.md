@@ -31,7 +31,7 @@ Requires macOS 14 or later.
 - Search: go to file / symbol, recent files, find and replace in files
 - Terminal: tabbed xterm-compatible terminal
 - Go helpers: postfix completion (`.err`, `.var`, `.for`, `.nn`, …), struct tags, table-driven test generation
-- Local AI completion via `llama-server` (loopback endpoints only; off by default)
+- Local AI completion: og starts, supervises and stops llama.cpp (`llama-server`) or MLX (`mlx_lm.server`) itself; pick the model in Settings. Bound to 127.0.0.1 only; off by default
 
 The first debug session triggers macOS's "Developer Tools Access" prompt; `sudo DevToolsSecurity -enable` removes it.
 

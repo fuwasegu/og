@@ -1,23 +1,33 @@
 import AppKit
 import OgCore
 
-/// Preferences: font size, local AI completion, session behavior.
+/// Preferences: editor font, session, and the app-owned local AI server (spec/req/model_server.fsl).
 @MainActor
-final class SettingsWindowController: NSWindowController {
+final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     static let shared = SettingsWindowController()
     private let fontSize = NSStepper()
     private let fontLabel = NSTextField(labelWithString: "")
-    private let aiEnabled = NSButton(checkboxWithTitle: "Enable inline completion from a local llama-server (FIM)", target: nil, action: nil)
-    private let aiEndpoint = NSTextField()
-    private let aiStatus = NSTextField(labelWithString: "")
     private let reopen = NSButton(checkboxWithTitle: "Reopen the last project on launch", target: nil, action: nil)
 
+    private let aiEnabled = NSButton(checkboxWithTitle: "Enable inline AI completion (runs a local model server; code never leaves this Mac)", target: nil, action: nil)
+    private let backend = NSPopUpButton()
+    private let model = NSComboBox()
+    private let custom = NSTextField()
+    private let customRow = NSStackView()
+    private let status = NSTextField(labelWithString: "")
+    private let actionButton = NSButton(title: "Restart", target: nil, action: nil)
+    private let logView = NSTextView()
+
     private init() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 260), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 520), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         w.title = "Settings"
         super.init(window: w)
         build()
+        load()
         w.center()
+        NotificationCenter.default.addObserver(forName: .ogModelServerChanged, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshStatus() }
+        }
     }
 
     required init?(coder: NSCoder) { nil }
@@ -26,56 +36,158 @@ final class SettingsWindowController: NSWindowController {
         fontSize.minValue = 9
         fontSize.maxValue = 32
         fontSize.increment = 1
-        fontSize.doubleValue = Double(Theme.fontSize)
         fontSize.target = self
         fontSize.action = #selector(fontChanged)
-        fontLabel.stringValue = "Editor font size: \(Int(Theme.fontSize))"
-        aiEnabled.state = EditorController.aiEnabled ? .on : .off
-        aiEnabled.target = self
-        aiEnabled.action = #selector(aiChanged)
-        aiEndpoint.stringValue = EditorController.aiEndpoint
-        aiEndpoint.placeholderString = "http://127.0.0.1:8080"
-        aiEndpoint.target = self
-        aiEndpoint.action = #selector(aiChanged)
-        aiStatus.font = Theme.smallFont
-        aiStatus.textColor = .secondaryLabelColor
-        aiStatus.stringValue = "Only loopback addresses are accepted; code never leaves this Mac."
-        reopen.state = ((UserDefaults.standard.object(forKey: "og.reopenLast") as? Bool) ?? true) ? .on : .off
         reopen.target = self
         reopen.action = #selector(reopenChanged)
 
-        let fontRow = NSStackView(views: [fontLabel, fontSize])
-        let endpointRow = NSStackView(views: [NSTextField(labelWithString: "Endpoint:"), aiEndpoint])
-        aiEndpoint.widthAnchor.constraint(equalToConstant: 300).isActive = true
-        let stack = NSStackView(views: [fontRow, reopen, NSBox(), aiEnabled, endpointRow, aiStatus])
+        aiEnabled.target = self
+        aiEnabled.action = #selector(enabledChanged)
+        for b in ModelBackend.allCases { backend.addItem(withTitle: b.title) }
+        backend.target = self
+        backend.action = #selector(backendChanged)
+        model.isEditable = true
+        model.completes = false
+        model.delegate = self
+        model.target = self
+        model.action = #selector(modelChanged)
+        model.placeholderString = "preset, Hugging Face repo, or path"
+        custom.placeholderString = "e.g. /path/to/server --port {port}"
+        custom.target = self
+        custom.action = #selector(customChanged)
+        actionButton.target = self
+        actionButton.action = #selector(actionClicked)
+        status.font = Theme.uiFont
+        logView.isEditable = false
+        logView.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+        logView.backgroundColor = Theme.background
+        logView.textColor = Theme.secondaryText
+        logView.isVerticallyResizable = true
+        logView.autoresizingMask = [.width]
+        let logScroll = NSScrollView()
+        logScroll.documentView = logView
+        logScroll.hasVerticalScroller = true
+        logScroll.heightAnchor.constraint(equalToConstant: 180).isActive = true
+
+        func row(_ label: String, _ v: NSView) -> NSStackView {
+            let l = NSTextField(labelWithString: label)
+            l.alignment = .right
+            l.widthAnchor.constraint(equalToConstant: 80).isActive = true
+            return NSStackView(views: [l, v])
+        }
+        model.widthAnchor.constraint(equalToConstant: 420).isActive = true
+        custom.widthAnchor.constraint(equalToConstant: 420).isActive = true
+        customRow.setViews([NSTextField(labelWithString: "Command"), custom], in: .leading)
+        let hint = NSTextField(wrappingLabelWithString: "llama.cpp: install with `brew install llama.cpp` (or mise). MLX: needs `uv` (`brew install uv`); the model is downloaded on first start. og binds the server to 127.0.0.1 on a free port and stops it when you quit.")
+        hint.font = Theme.smallFont
+        hint.textColor = .secondaryLabelColor
+
+        let statusRow = NSStackView(views: [status, NSView(), actionButton])
+        let stack = NSStackView(views: [
+            NSStackView(views: [fontLabel, fontSize]), reopen, NSBox(),
+            aiEnabled, row("Backend", backend), row("Model", model), customRow, hint, statusRow, logScroll
+        ])
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 12
+        stack.spacing = 10
         stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+        statusRow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
+        logScroll.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
         window?.contentView = stack
     }
 
+    private func load() {
+        fontSize.doubleValue = Double(Theme.fontSize)
+        fontLabel.stringValue = "Editor font size: \(Int(Theme.fontSize))"
+        reopen.state = ((UserDefaults.standard.object(forKey: "og.reopenLast") as? Bool) ?? true) ? .on : .off
+        let m = ModelServerManager.shared
+        aiEnabled.state = m.enabled ? .on : .off
+        let cfg = m.config
+        backend.selectItem(at: ModelBackend.allCases.firstIndex(of: cfg.backend) ?? 0)
+        fillModels(for: cfg.backend)
+        model.stringValue = ModelPreset.all.first { $0.id == cfg.model }?.title ?? cfg.model
+        custom.stringValue = cfg.customCommand
+        updateRows()
+        refreshStatus()
+    }
+
+    private func fillModels(for b: ModelBackend) {
+        model.removeAllItems()
+        model.addItems(withObjectValues: ModelPreset.presets(for: b).map(\.title))
+    }
+
+    private func updateRows() {
+        let b = ModelBackend.allCases[max(0, backend.indexOfSelectedItem)]
+        customRow.isHidden = b != .custom
+        model.isEnabled = b != .custom
+    }
+
+    private func refreshStatus() {
+        let m = ModelServerManager.shared
+        switch m.phase {
+        case .off: status.stringValue = "Server: off"; status.textColor = .secondaryLabelColor; actionButton.title = "Start"
+        case .starting(let d): status.stringValue = "Server: \(d)"; status.textColor = .systemOrange; actionButton.title = "Restart"
+        case .ready: status.stringValue = "Server: ready on 127.0.0.1:\(m.port ?? 0)"; status.textColor = .systemGreen; actionButton.title = "Restart"
+        case .failed(let why): status.stringValue = "Server failed: \(why)"; status.textColor = .systemRed; actionButton.title = "Retry"
+        }
+        actionButton.isEnabled = m.enabled
+        logView.string = m.log.suffix(200).joined(separator: "\n")
+        logView.scrollToEndOfDocument(nil)
+    }
+
+    // MARK: - Actions
+
+    private func save(_ change: (inout ModelServerConfig) -> Void) {
+        var cfg = ModelServerManager.shared.config
+        change(&cfg)
+        ModelServerManager.shared.config = cfg
+    }
+
+    @objc private func enabledChanged() {
+        ModelServerManager.shared.enabled = aiEnabled.state == .on
+        refreshStatus()
+    }
+
+    @objc private func backendChanged() {
+        let b = ModelBackend.allCases[max(0, backend.indexOfSelectedItem)]
+        fillModels(for: b)
+        let first = ModelPreset.presets(for: b).first
+        model.stringValue = first?.title ?? ""
+        updateRows()
+        save { $0.backend = b; $0.model = first?.id ?? "" }
+    }
+
+    @objc private func modelChanged() {
+        let text = model.stringValue.trimmingCharacters(in: .whitespaces)
+        let id = ModelPreset.all.first { $0.title == text }?.id ?? text
+        guard !id.isEmpty else { return }
+        save { $0.model = id }
+    }
+
+    func comboBoxSelectionDidChange(_ notification: Notification) {
+        DispatchQueue.main.async { [weak self] in
+            MainActor.assumeIsolated { self?.modelChanged() }
+        }
+    }
+
+    @objc private func customChanged() {
+        save { $0.customCommand = custom.stringValue }
+    }
+
+    @objc private func actionClicked() {
+        let m = ModelServerManager.shared
+        switch m.phase {
+        case .failed: m.retry()
+        case .off: m.enabled = true
+        default: m.restart()
+        }
+    }
+
     @objc private func fontChanged() {
-        AppDelegate.shared?.activeProject?.ogZoomReset(nil)
         Theme.fontSize = CGFloat(fontSize.doubleValue)
         UserDefaults.standard.set(fontSize.doubleValue, forKey: "og.fontSize")
         fontLabel.stringValue = "Editor font size: \(Int(Theme.fontSize))"
         if let p = AppDelegate.shared?.activeProject { for e in p.editorArea.editors { e.applyFontChange() } }
-    }
-
-    @objc private func aiChanged() {
-        let text = aiEndpoint.stringValue.trimmingCharacters(in: .whitespaces)
-        if let url = URL(string: text), LocalCompletionClient.isLoopback(url) {
-            EditorController.aiEndpoint = text
-            aiStatus.stringValue = "Only loopback addresses are accepted; code never leaves this Mac."
-            aiStatus.textColor = .secondaryLabelColor
-        } else {
-            // spec completion.fsl DES-1: non-loopback endpoints are rejected.
-            aiStatus.stringValue = "Rejected: the endpoint must be 127.0.0.1, ::1 or localhost."
-            aiStatus.textColor = .systemRed
-            aiEndpoint.stringValue = EditorController.aiEndpoint
-        }
-        EditorController.aiEnabled = aiEnabled.state == .on
     }
 
     @objc private func reopenChanged() {

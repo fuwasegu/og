@@ -140,6 +140,7 @@ extension ProjectWindowController: NSMenuItemValidation {
     @objc func ogTableTest(_ sender: Any?) { editor?.generateTableTest() }
     @objc func ogRequestAICompletion(_ sender: Any?) {
         guard EditorController.aiEnabled else { context.setStatus("Enable local AI completion in Settings (⌘,)"); return }
+        guard ModelServerManager.shared.client != nil else { context.setStatus(ModelServerManager.shared.statusText); return }
         editor?.requestGhost()
     }
 

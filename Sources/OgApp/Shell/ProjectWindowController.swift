@@ -170,6 +170,7 @@ final class StatusBarView: NSView {
     private let message = NSTextField(labelWithString: "")
     private let branch = NSButton(title: "", target: nil, action: nil)
     private let position = NSTextField(labelWithString: "")
+    private let ai = NSButton(title: "", target: nil, action: nil)
     private var messageTimer: Timer?
 
     override init(frame: NSRect) {
@@ -190,7 +191,13 @@ final class StatusBarView: NSView {
         branch.imagePosition = .imageLeading
         branch.target = self
         branch.action = #selector(branchClicked)
-        let stack = NSStackView(views: [gopls, message, NSView(), branch, position])
+        ai.bezelStyle = .recessed
+        ai.isBordered = false
+        ai.font = Theme.smallFont
+        ai.contentTintColor = Theme.secondaryText
+        ai.target = self
+        ai.action = #selector(aiClicked)
+        let stack = NSStackView(views: [gopls, message, NSView(), ai, branch, position])
         stack.orientation = .horizontal
         stack.spacing = 14
         stack.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 0, right: 12)
@@ -223,7 +230,11 @@ final class StatusBarView: NSView {
         nc.addObserver(forName: .ogGitStatusChanged, object: context, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.refresh() }
         }
+        nc.addObserver(forName: .ogModelServerChanged, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshAI() }
+        }
         refresh()
+        refreshAI()
     }
 
     func refresh() {
@@ -232,6 +243,21 @@ final class StatusBarView: NSView {
         if case .ready = context.goplsStatus { gopls.textColor = Theme.secondaryText } else { gopls.textColor = Theme.warning }
         branch.title = context.gitStatus.branch ?? ""
         branch.isHidden = context.gitStatus.branch == nil
+    }
+
+    func refreshAI() {
+        let m = ModelServerManager.shared
+        ai.isHidden = !m.enabled
+        ai.title = m.statusText
+        switch m.phase {
+        case .ready: ai.contentTintColor = Theme.secondaryText
+        case .failed: ai.contentTintColor = Theme.error
+        default: ai.contentTintColor = Theme.warning
+        }
+    }
+
+    @objc private func aiClicked() {
+        SettingsWindowController.shared.showWindow(nil)
     }
 
     func setMessage(_ text: String) {

@@ -120,15 +120,7 @@ extension EditorController {
 
     // MARK: - Ghost text (local AI)
 
-    static var aiEnabled: Bool {
-        get { (UserDefaults.standard.object(forKey: "og.ai.enabled") as? Bool) ?? false }
-        set { UserDefaults.standard.set(newValue, forKey: "og.ai.enabled") }
-    }
-
-    static var aiEndpoint: String {
-        get { UserDefaults.standard.string(forKey: "og.ai.endpoint") ?? "http://127.0.0.1:8080" }
-        set { UserDefaults.standard.set(newValue, forKey: "og.ai.endpoint") }
-    }
+    static var aiEnabled: Bool { ModelServerManager.shared.enabled }
 
     func scheduleGhost() {
         ghostTimer?.invalidate()
@@ -140,8 +132,9 @@ extension EditorController {
     }
 
     func requestGhost() {
+        // ASSUME-3: only while the app-owned server is ready.
         guard completion?.isVisible != true, textView.selectedRange().length == 0,
-              let url = URL(string: Self.aiEndpoint), let client = LocalCompletionClient(endpoint: url) else { return }
+              let client = ModelServerManager.shared.client else { return }
         let ns = document.storage.string as NSString
         let caret = caretOffset
         // Only at end of line (ignoring trailing whitespace / closers).

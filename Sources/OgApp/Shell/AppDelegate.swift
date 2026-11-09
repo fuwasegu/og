@@ -22,6 +22,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             showWelcome()
         }
         DebugDriver.startIfRequested()
+        ModelServerManager.shared.startIfEnabled()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        ModelServerManager.shared.shutdownForQuit()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }

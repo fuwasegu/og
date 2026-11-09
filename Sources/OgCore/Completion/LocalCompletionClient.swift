@@ -4,11 +4,22 @@ import Foundation
 
 /// Local-only FIM completion against llama-server (spec/design/completion.fsl).
 public final class LocalCompletionClient: Sendable {
+    /// Wire format of the server.
+    public enum API: Sendable, Hashable, Codable {
+        /// llama.cpp `/infill` (the server applies the model's FIM template).
+        case llamaInfill
+        /// OpenAI-compatible `/v1/completions` with a Qwen-style FIM prompt (mlx_lm.server).
+        case openAIFIM(model: String)
+    }
+
     public let endpoint: URL
+    public let api: API
+
     /// Returns nil unless `endpoint` is a loopback http(s) URL (DES-1).
-    public init?(endpoint: URL) {
+    public init?(endpoint: URL, api: API = .llamaInfill) {
         guard LocalCompletionClient.isLoopback(endpoint) else { return nil }
         self.endpoint = endpoint
+        self.api = api
     }
 
     /// DES-1: only `http`/`https` on 127.0.0.1, ::1 or localhost (no credentials).
@@ -77,6 +88,9 @@ public final class LocalCompletionClient: Sendable {
 
     /// llama.cpp `/infill` request.
     func makeRequest(prefix: String, suffix: String, maxTokens: Int) -> URLRequest {
+        if case .openAIFIM(let model) = api {
+            return makeOpenAIRequest(model: model, prefix: prefix, suffix: suffix, maxTokens: maxTokens)
+        }
         var req = URLRequest(url: endpoint.appendingPathComponent("infill"))
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -185,5 +199,26 @@ struct CompletionStreamLimiter: Sendable {
         }
         text += emit
         return (emit, finished)
+    }
+}
+
+extension LocalCompletionClient {
+    /// OpenAI-compatible completion with the Qwen2.5-Coder FIM template.
+    func makeOpenAIRequest(model: String, prefix: String, suffix: String, maxTokens: Int) -> URLRequest {
+        var req = URLRequest(url: endpoint.appendingPathComponent("v1/completions"))
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        let body: [String: Any] = [
+            "model": model,
+            "prompt": "<|fim_prefix|>\(prefix)<|fim_suffix|>\(suffix)<|fim_middle|>",
+            "max_tokens": max(1, maxTokens),
+            "stream": true,
+            "temperature": 0.1,
+            "top_p": 0.9,
+            "stop": ["\n\n", "<|endoftext|>", "<|fim_pad|>", "<|file_sep|>"],
+        ]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
+        return req
     }
 }
