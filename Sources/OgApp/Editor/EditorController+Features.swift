@@ -276,7 +276,7 @@ extension EditorController {
     }
 
     /// gopls hover text, shared by prefetch and display; reset whenever the buffer changes.
-    private func hoverAnswer(at offset: Int) -> Task<String?, Never> {
+    private func hoverAnswer(at offset: Int) -> Task<HoverInfo, Never> {
         if hoverCacheVersion != document.version {
             hoverCache.removeAll()
             hoverCacheVersion = document.version
@@ -285,9 +285,16 @@ extension EditorController {
         let lines = TextLines(nsString: document.storage.string as NSString)
         let pos = lines.position(forOffset: offset)
         let uri = document.uri, doc = document, ctx = context
-        let t = Task { @MainActor () -> String? in
+        let t = Task { @MainActor () -> HoverInfo in
             await ctx.documents.flush(doc)
-            return await ctx.gopls.hover(uri: uri, position: pos)
+            let md = await ctx.gopls.hover(uri: uri, position: pos)
+            var info = HoverInfo(markdown: md)
+            // Enum-like type: list its constants from the declaring package.
+            if let md, let name = HoverInfo.declaredTypeName(md),
+               let def = await ctx.gopls.definition(uri: uri, position: pos).first, let file = def.url {
+                info.constants = await Task.detached { HoverInfo.constants(ofType: name, nextTo: file) }.value
+            }
+            return info
         }
         hoverCache[offset] = t
         return t
@@ -310,7 +317,8 @@ extension EditorController {
             }
             guard let self else { return }
             if let word, self.hoverWord != word { return }  // the mouse moved on
-            let card = Markdown.hoverCard(diagnostics: diags.map(\.message), markdown: hover ?? "", localModules: self.localModulePaths())
+            let card = Markdown.hoverCard(diagnostics: diags.map(\.message), markdown: hover.markdown ?? "",
+                                          constants: hover.constants, localModules: self.localModulePaths())
             guard card.length > 0 else { return }
             if self.info == nil { self.info = InfoPopup(editor: self) }
             self.info?.show(attributed: card, at: rect, in: self.textView, kind: .hover)
@@ -679,7 +687,7 @@ enum Markdown {
         return modules.contains { path == $0 || path.hasPrefix($0 + "/") }
     }
 
-    static func hoverCard(diagnostics: [String], markdown: String, localModules: [String] = []) -> NSAttributedString {
+    static func hoverCard(diagnostics: [String], markdown: String, constants: [GoEnumConstant] = [], localModules: [String] = []) -> NSAttributedString {
         let isLocal: (URL) -> Bool = { isLocalDocLink($0, modules: localModules) }
         let out = NSMutableAttributedString()
         let size = max(11, Theme.fontSize - 1)
@@ -692,6 +700,7 @@ enum Markdown {
         }
         var code: [String] = []
         var text: [String] = []
+        var shownConstants = false
         var inCode = false
         func flushText() {
             let body = text.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -714,6 +723,18 @@ enum Markdown {
                     let src = code.joined(separator: "\n").trimmingCharacters(in: .newlines)
                     if !src.isEmpty { gap(); out.append(highlighted(src, font: mono)) }
                     code.removeAll()
+                    if !constants.isEmpty, !shownConstants {
+                        shownConstants = true
+                        let shown = constants.prefix(40)
+                        let width = shown.map { ($0.name as NSString).length }.max() ?? 0
+                        var body = shown.map { c in
+                            c.value.map { c.name.padding(toLength: width, withPad: " ", startingAt: 0) + " = " + $0 } ?? c.name
+                        }.joined(separator: "\n")
+                        if constants.count > shown.count { body += "\n// … \(constants.count - shown.count) more" }
+                        gap()
+                        out.append(NSAttributedString(string: "\(constants.count) values\n", attributes: [.font: NSFont.systemFont(ofSize: size - 1), .foregroundColor: Theme.secondaryText]))
+                        out.append(highlighted(body, font: mono))
+                    }
                 } else {
                     flushText()
                 }
@@ -810,6 +831,37 @@ enum Markdown {
             buf.append(c); i += 1
         }
         flush()
+        return out
+    }
+}
+
+/// gopls hover plus og's own additions (constants of an enum-like type).
+struct HoverInfo: Sendable {
+    var markdown: String?
+    var constants: [GoEnumConstant] = []
+
+    /// `T` when the hover's code block declares a defined (non-struct, non-interface, non-alias) type.
+    static func declaredTypeName(_ md: String) -> String? {
+        guard let line = md.components(separatedBy: "\n").first(where: { $0.hasPrefix("type ") }) else { return nil }
+        let parts = line.dropFirst(5).split(separator: " ", maxSplits: 1).map(String.init)
+        guard parts.count == 2, !parts[0].contains("[") else { return nil }
+        let rest = parts[1]
+        if rest.hasPrefix("struct") || rest.hasPrefix("interface") || rest.hasPrefix("=") || rest.hasPrefix("func") { return nil }
+        return parts[0]
+    }
+
+    /// Constants of `type` declared in the package (non-test files) of `file`, in source order.
+    static func constants(ofType type: String, nextTo file: URL) -> [GoEnumConstant] {
+        let dir = file.deletingLastPathComponent()
+        let names = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
+            .filter { $0.hasSuffix(".go") && !$0.hasSuffix("_test.go") }
+        // The declaring file first, then the rest alphabetically.
+        let ordered = [file.lastPathComponent] + names.filter { $0 != file.lastPathComponent }.sorted()
+        var out: [GoEnumConstant] = []
+        for name in ordered where names.contains(name) {
+            guard let src = try? String(contentsOf: dir.appendingPathComponent(name), encoding: .utf8) else { continue }
+            out += GoEnumScanner.constants(ofType: type, in: src)
+        }
         return out
     }
 }

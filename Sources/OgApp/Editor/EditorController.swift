@@ -19,7 +19,7 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
     /// Hover: word under the mouse, pending timer, and per-version cache of gopls answers.
     var hoverWord: NSRange?
     var hoverTimer: Timer?
-    var hoverCache: [Int: Task<String?, Never>] = [:]
+    var hoverCache: [Int: Task<HoverInfo, Never>] = [:]
     var hoverCacheVersion = -1
     var ghostTask: Task<Void, Never>?
     var ghostTimer: Timer?
