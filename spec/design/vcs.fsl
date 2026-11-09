@@ -1,0 +1,165 @@
+// og — Git design (GitService actor running the git CLI)
+//
+// Refines: spec/req/vcs.fsl (mapping: spec/design/vcs_refines_req.fsl)
+//
+// DES-1: Every git invocation goes through one GitService queue, so og never
+//        races itself for .git/index.lock. Status uses --no-optional-locks.
+// DES-2: A queued operation re-checks the real working tree when it runs. The
+//        cached status shown in the tree is never used to decide whether an
+//        operation is allowed; a refused operation shows git's message.
+// DES-3: Status refresh is triggered by FSEvents and after each operation.
+// DES-4: While an operation is queued or running (typically ~100 ms), keystrokes,
+//        autosave, ticking and rollback are deferred until it finishes, so the
+//        operation decides against a stable working tree.
+//
+// ASSUME-1 (representation only): 2 files, 2 branches, at most one queued op.
+// ASSUME-2 (gap, not modeled): git commands run from the terminal change the
+//   repository behind og's back; the requirements do not cover them yet.
+spec VcsDesign {
+  entity File
+  number Branch
+
+  enum Op { ONone, OCommit, OCheckout, OStash, OUnstash }
+
+  state {
+    unsaved: Map<File, Bool>,
+    changed: Map<File, Bool>,
+    staged:  Map<File, Bool>,
+    shown:   Map<File, Bool>,
+    stashed: Map<File, Bool>,
+    branch:  Branch,
+    queued:  Op,                 // DES-1: operation waiting in the GitService queue
+    target:  Branch              // branch for a queued checkout
+  }
+
+  init {
+    branch = 0
+    queued = ONone
+    target = 0
+    forall f: File {
+      unsaved[f] = false
+      changed[f] = false
+      staged[f] = false
+      shown[f] = false
+      stashed[f] = false
+    }
+  }
+
+  def clean() = forall f: File { not changed[f] and not unsaved[f] }
+  def has_stash() = exists f: File { stashed[f] }
+  def dirty_any() = exists f: File { changed[f] or unsaved[f] }
+
+  action edit(f: File) "MODEL-1: the user edits a file" {
+    requires queued == ONone   // DES-4
+    requires not unsaved[f]
+    unsaved[f] = true
+  }
+
+  action autosave(f: File) "MODEL-2: autosave writes the edit to disk" {
+    requires queued == ONone   // DES-4
+    requires unsaved[f]
+    unsaved[f] = false
+    changed[f] = true
+  }
+
+  fair action refresh() "DES-3: `git status --porcelain=v2 --no-optional-locks` updates the tree and gutter" {
+    requires exists f: File { shown[f] != changed[f] }
+    forall f: File { shown[f] = changed[f] }
+  }
+
+  action stage(f: File, on: Bool) "DES-VCS-1: tick or untick a file in the commit panel" {
+    requires queued == ONone   // DES-4
+    requires changed[f] or unsaved[f]
+    requires staged[f] != on
+    staged[f] = on
+  }
+
+  action discard(f: File) "DES-VCS-2: rollback a file (`git restore`)" {
+    requires queued == ONone   // DES-4
+    requires changed[f] or unsaved[f]
+    unsaved[f] = false
+    changed[f] = false
+    staged[f] = false
+  }
+
+  // ---- queued operations ----
+
+  action enqueue(op: Op, b: Branch) "DES-1: the user asks for commit / checkout / stash / unstash; it waits in the queue" {
+    requires queued == ONone
+    requires op != ONone
+    queued = op
+    target = b
+  }
+
+  fair action run_commit() "DES-2: commit runs: flush all files, then `git commit` the ticked files" {
+    requires queued == OCommit
+    requires exists f: File { staged[f] }
+    queued = ONone
+    forall f: File {
+      unsaved[f] = false
+      if staged[f] {
+        changed[f] = false
+        staged[f] = false
+      } else {
+        changed[f] = changed[f] or unsaved[f]
+      }
+    }
+  }
+
+  fair action run_checkout() "DES-2: checkout runs only if the real working tree is clean" {
+    requires queued == OCheckout
+    requires clean()
+    requires branch != target
+    queued = ONone
+    branch = target
+  }
+
+  fair action run_stash() "DES-2: `git stash push` runs if there is anything to stash and no stash yet" {
+    requires queued == OStash
+    requires not has_stash()
+    requires dirty_any()
+    queued = ONone
+    forall f: File {
+      stashed[f] = changed[f] or unsaved[f]
+      changed[f] = false
+      unsaved[f] = false
+      staged[f] = false
+    }
+  }
+
+  fair action run_unstash() "DES-2: `git stash pop` runs only onto a clean working tree" {
+    requires queued == OUnstash
+    requires has_stash()
+    requires clean()
+    queued = ONone
+    forall f: File {
+      changed[f] = stashed[f]
+      stashed[f] = false
+    }
+  }
+
+  fair action refuse() "DES-2: the queued operation is not allowed by the real state; git's message is shown" {
+    requires (queued == OCommit and not (exists f: File { staged[f] }))
+          or (queued == OCheckout and (not clean() or branch == target))
+          or (queued == OStash and (has_stash() or not dirty_any()))
+          or (queued == OUnstash and (not has_stash() or not clean()))
+    queued = ONone
+  }
+
+  invariant StagedIsChanged "MODEL-3: induction aid" {
+    forall f: File { staged[f] => (changed[f] or unsaved[f]) }
+  }
+
+  leadsTo QueueDrains "DES-1: every queued operation eventually runs or is refused" {
+    queued != ONone ~> queued == ONone
+  }
+
+  leadsTo StatusCatchesUp "DES-3: the tree and gutter eventually show the real state" {
+    forall f: File { shown[f] != changed[f] ~> shown[f] == changed[f] }
+  }
+}
+
+verify {
+  instances File = 2
+  values Branch = 0..1
+}

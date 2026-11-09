@@ -1,0 +1,200 @@
+// og — Rename design (TransactionalRenameManager actor)
+//
+// Refines: spec/req/refactor.fsl (mapping: spec/design/refactor_refines_req.fsl)
+//
+// DES-1: gopls `textDocument/rename` is computed asynchronously; an edit while it
+//        is computing forces a recompute before the preview opens.
+// DES-2: Apply is two-phase. Stage: write every renamed file to a temp file next
+//        to it. Commit: back up the original, then rename temp -> target, one file
+//        at a time. A staging failure deletes the temps (nothing was replaced). A
+//        commit failure restores every committed file from its backup.
+// DES-3: Backups are deleted only after every file is committed.
+//
+// ASSUME-1 (representation only): 2 affected files. Verify with --depth 12
+//   (a full rename takes 9 steps).
+spec RefactorDesign {
+  entity File
+
+  enum RPhase { RIdle, RComputing, RPreview, RStaging, RCommitting }
+  enum RForm  { ROriginal, RRenamed }
+
+  state {
+    phase:     RPhase,
+    edited:    Bool,                // DES-1: an edit happened while computing
+    stale:     Bool,
+    staged:    Map<File, Bool>,     // temp file written
+    backup:    Map<File, Bool>,     // original kept as backup
+    form:      Map<File, RForm>,
+    can_undo:  Bool
+  }
+
+  init {
+    phase = RIdle
+    edited = false
+    stale = false
+    can_undo = false
+    forall f: File {
+      staged[f] = false
+      backup[f] = false
+      form[f] = ROriginal
+    }
+  }
+
+  def all_original() = forall f: File { form[f] == ROriginal }
+  def all_renamed()  = forall f: File { form[f] == RRenamed }
+
+  action request() "DES-1: ask gopls to compute the rename" {
+    requires phase == RIdle
+    requires all_original()
+    phase = RComputing
+    edited = false
+    can_undo = false
+  }
+
+  action edit_while_computing(f: File) "DES-1: an edit while gopls computes invalidates the result" {
+    requires phase == RComputing
+    edited = true
+  }
+
+  fair action recompute() "DES-1: a result invalidated by an edit is computed again" {
+    requires phase == RComputing
+    requires edited
+    edited = false
+  }
+
+  fair action computed() "DES-1: gopls returns an up-to-date result; the diff preview opens" {
+    requires phase == RComputing
+    requires not edited
+    phase = RPreview
+    stale = false
+  }
+
+  action abandon() "DES-1: the user abandons the request while gopls is still computing" {
+    requires phase == RComputing
+    phase = RIdle
+  }
+
+  action cancel() "DES-RF-1: the user closes the preview" {
+    requires phase == RPreview
+    phase = RIdle
+  }
+
+  action edit_during_preview(f: File) "DES-RF-2: an edit while previewing marks the preview stale" {
+    requires phase == RPreview
+    stale = true
+  }
+
+  action refresh_preview() "DES-RF-3: a stale preview is recomputed" {
+    requires phase == RPreview
+    requires stale
+    stale = false
+  }
+
+  action apply() "DES-2: the user confirms a fresh preview; staging starts" {
+    requires phase == RPreview
+    requires not stale
+    phase = RStaging
+  }
+
+  fair action stage_ok(f: File) "DES-2: one renamed file is written to its temp file" {
+    requires phase == RStaging
+    requires not staged[f]
+    staged[f] = true
+  }
+
+  action stage_fail(f: File) "DES-2: writing a temp file fails; temps are deleted and nothing was replaced" {
+    requires phase == RStaging
+    requires not staged[f]
+    phase = RIdle
+    forall g: File { staged[g] = false }
+  }
+
+  fair action begin_commit() "DES-2: every temp file exists; start replacing" {
+    requires phase == RStaging
+    requires forall f: File { staged[f] }
+    phase = RCommitting
+  }
+
+  fair action commit_ok(f: File) "DES-2: back up the original and atomically rename the temp file over it" {
+    requires phase == RCommitting
+    requires form[f] == ROriginal
+    backup[f] = true
+    form[f] = RRenamed
+    staged[f] = false
+  }
+
+  action commit_fail(f: File) "DES-2: a replace fails; every replaced file is restored from its backup" {
+    requires phase == RCommitting
+    requires form[f] == ROriginal
+    phase = RIdle
+    forall g: File {
+      form[g] = ROriginal
+      backup[g] = false
+      staged[g] = false
+    }
+  }
+
+  fair action finish() "DES-3: all files replaced; backups are dropped; one-step undo becomes available" {
+    requires phase == RCommitting
+    requires all_renamed()
+    phase = RIdle
+    can_undo = true
+    forall f: File { backup[f] = false }
+  }
+
+  action undo_rename() "DES-RF-4: undo applies the inverse rename to every file" {
+    requires phase == RIdle
+    requires can_undo
+    can_undo = false
+    forall f: File { form[f] = ROriginal }
+  }
+
+  action edit_after_rename(f: File) "DES-RF-5: editing a renamed file ends the one-step undo" {
+    requires phase == RIdle
+    requires all_renamed()
+    can_undo = false
+  }
+
+  action next_rename() "MODEL-1: the renamed code becomes the new baseline" {
+    requires phase == RIdle
+    requires all_renamed()
+    requires not can_undo
+    forall f: File { form[f] = ROriginal }
+  }
+
+  invariant RollbackPossible "DES-2: every replaced file has a backup until the rename finishes" {
+    forall f: File { (phase == RCommitting and form[f] == RRenamed) => backup[f] }
+  }
+
+  invariant NothingReplacedWhileStaging "DES-2: staging never touches the real files" {
+    (phase == RStaging or phase == RComputing or phase == RPreview) => all_original()
+  }
+
+  invariant NoPartialRename "DES-2: outside of commit, files are never left partly renamed" {
+    phase != RCommitting => (all_original() or all_renamed())
+  }
+
+  invariant BackupsOnlyDuringCommit "DES-3: no backup is left behind" {
+    forall f: File { backup[f] => (phase == RCommitting and form[f] == RRenamed) }
+  }
+
+  invariant UndoMeansRenamed "MODEL-2: induction aid" {
+    can_undo => (phase == RIdle and all_renamed())
+  }
+
+  invariant StagedOnlyWhileApplying "MODEL-3: induction aid" {
+    forall f: File { staged[f] => ((phase == RStaging) or (phase == RCommitting and form[f] == ROriginal)) }
+  }
+
+  invariant CommitHasAllStaged "MODEL-4: induction aid; during commit every unreplaced file is staged" {
+    forall f: File { (phase == RCommitting and form[f] == ROriginal) => staged[f] }
+  }
+
+  leadsTo ApplyEnds "DES-2: an apply always ends, renamed or rolled back" {
+    (phase == RStaging or phase == RCommitting) ~> phase == RIdle
+  }
+}
+
+verify {
+  instances File = 2
+}

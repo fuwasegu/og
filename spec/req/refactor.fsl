@@ -1,0 +1,164 @@
+// og — Refactoring requirements (cross-file symbol rename)
+//
+// Source: README.md — "rename across packages with a Unified Diff preview before
+// applying; apply atomically via temp files; if any single file fails, roll every
+// file back to its original state" + rollback of the last rename.
+//
+// ASSUME-1 (representation only): each affected file is either in its original
+//   form or in its renamed form; 2 files are enough to expose partial application.
+// ASSUME-2 (confirmed 2026-11-09): if the user edits an affected file while the
+//   preview is open, the preview becomes stale and must be recomputed before apply.
+// ASSUME-3 (confirmed 2026-11-09): "undo rename" is offered only until the user
+//   edits one of the renamed files; after that, normal per-file undo applies.
+requirements Refactor {
+  entity File
+
+  enum Phase { Idle, Previewing, Applying }
+  enum Form  { Original, Renamed }
+
+  state {
+    phase:    Phase,
+    form:     Map<File, Form>,
+    written:  Map<File, Bool>,   // during apply: this file has been replaced
+    stale:    Bool,              // preview no longer matches the files
+    can_undo: Bool               // last rename can be undone as one unit
+  }
+
+  init {
+    phase = Idle
+    stale = false
+    can_undo = false
+    forall f: File {
+      form[f] = Original
+      written[f] = false
+    }
+  }
+
+  def all_original() = forall f: File { form[f] == Original }
+  def all_renamed()  = forall f: File { form[f] == Renamed }
+
+  action preview() "RF-1: the user requests a rename; a diff of every affected file is shown before anything changes" {
+    requires phase == Idle
+    requires all_original()
+    phase = Previewing
+    stale = false
+    can_undo = false
+  }
+
+  action cancel() "RF-1: the user closes the preview; nothing changes" {
+    requires phase == Previewing
+    phase = Idle
+  }
+
+  action edit_during_preview(f: File) "RF-1: editing an affected file while previewing makes the preview stale (ASSUME-2)" {
+    requires phase == Previewing
+    stale = true
+  }
+
+  action refresh_preview() "RF-1: a stale preview is recomputed (ASSUME-2)" {
+    requires phase == Previewing
+    requires stale
+    stale = false
+  }
+
+  action apply() "RF-1: the user confirms a fresh preview; files start being replaced" {
+    requires phase == Previewing
+    requires not stale
+    phase = Applying
+  }
+
+  action write_ok(f: File) "RF-1: one affected file is replaced atomically" {
+    requires phase == Applying
+    requires not written[f]
+    written[f] = true
+    form[f] = Renamed
+  }
+
+  action write_fail(f: File) "RF-1: replacing one file fails; every file is rolled back to its original" {
+    requires phase == Applying
+    requires not written[f]
+    phase = Idle
+    forall g: File {
+      form[g] = Original
+      written[g] = false
+    }
+  }
+
+  action finish() "RF-1: when every file is replaced, the rename is complete and can be undone" {
+    requires phase == Applying
+    requires forall f: File { written[f] }
+    phase = Idle
+    can_undo = true
+    forall f: File { written[f] = false }
+  }
+
+  action undo_rename() "RF-1: the last rename is undone in every file at once" {
+    requires phase == Idle
+    requires can_undo
+    can_undo = false
+    forall f: File { form[f] = Original }
+  }
+
+  action edit_after_rename(f: File) "RF-1: editing a renamed file ends the one-step undo of the rename (ASSUME-3)" {
+    requires phase == Idle
+    requires all_renamed()
+    can_undo = false
+  }
+
+  action next_rename() "MODEL-1: after a completed rename, the renamed code becomes the new baseline" {
+    requires phase == Idle
+    requires all_renamed()
+    requires not can_undo
+    forall f: File { form[f] = Original }
+  }
+
+  invariant NoPartialRename "RF-1: outside of an apply in progress, files are never left partly renamed" {
+    phase != Applying => (all_original() or all_renamed())
+  }
+
+  invariant NothingChangesBeforeApply "RF-1: previewing never modifies files" {
+    phase == Previewing => all_original()
+  }
+
+  invariant UndoMeansRenamed "RF-1: undo is offered only for a completed rename" {
+    can_undo => (phase == Idle and all_renamed())
+  }
+
+  invariant WrittenTracksForm "MODEL-2: induction aid; during apply a file is renamed exactly when written" {
+    forall f: File { (phase == Applying => (written[f] == (form[f] == Renamed))) and (phase != Applying => not written[f]) }
+  }
+
+  acceptance AC-RF-1 "RF-1: preview, apply, and every file is renamed" {
+    preview() apply() write_ok(0) write_ok(1) finish()
+    expect form[0] == Renamed and form[1] == Renamed and can_undo
+  }
+
+  acceptance AC-RF-2 "RF-1: one failed write rolls back the file already written" {
+    preview() apply() write_ok(0) write_fail(1)
+    expect form[0] == Original and phase == Idle
+  }
+
+  acceptance AC-RF-3 "RF-1: undo restores every file" {
+    preview() apply() write_ok(0) write_ok(1) finish() undo_rename()
+    expect form[0] == Original and form[1] == Original
+  }
+
+  forbidden FB-RF-1 "RF-1: a stale preview cannot be applied (ASSUME-2)" {
+    preview() edit_during_preview(0) apply()
+    expect rejected
+  }
+
+  forbidden FB-RF-2 "RF-1: a rename cannot finish while a file is unwritten" {
+    preview() apply() write_ok(0) finish()
+    expect rejected
+  }
+
+  forbidden FB-RF-3 "RF-1: undo is not offered after the user edits a renamed file (ASSUME-3)" {
+    preview() apply() write_ok(0) write_ok(1) finish() edit_after_rename(0) undo_rename()
+    expect rejected
+  }
+}
+
+verify {
+  instances File = 2
+}

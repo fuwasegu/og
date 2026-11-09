@@ -1,0 +1,325 @@
+// og — Workspace design (DocumentStore + FileWriter actor + FSEvents watcher)
+//
+// Refines: spec/req/workspace.fsl (mapping: spec/design/workspace_refines_req.fsl)
+//
+// Components (Swift):
+//   DocumentStore  @MainActor  — tabs, buffers, dirty / conflict / error flags
+//   FileWriter     actor       — atomic write (temp file + rename) with a
+//                                compare-before-replace check against the disk
+//                                content the editor last observed
+//   FileWatcher    actor       — FSEvents stream; delivers change events late
+//
+// DES-1: A write captures a snapshot of the buffer. While it is in flight, keystrokes
+//        for that file are queued and applied after it completes, so the snapshot
+//        always equals the buffer.
+// DES-2: The editor tracks `known` = disk content it last read, wrote, or was told
+//        about. A write lands only if the real disk still equals `known`; otherwise
+//        it is aborted and the pending FSEvents notification raises the conflict.
+// DES-3: Our own writes update `known` together with the real disk, so their
+//        FSEvents echo is recognised (real == known) and ignored.
+// DES-4: Closing a dirty tab or the project first issues writes; the close itself
+//        happens only once every affected tab is clean.
+//
+// ASSUME-1 (representation only): 2 files, 3 content values.
+// ASSUME-2 (environment): foreign processes eventually stop rewriting a file.
+//   Progress of writes and notifications is claimed only under this assumption.
+spec WorkspaceDesign {
+  entity File
+  number Content
+
+  state {
+    project_open: Bool,
+    on_disk:  Map<File, Bool>,
+    real:     Map<File, Content>,        // actual bytes on disk
+    known:    Map<File, Content>,        // DES-2: disk content as observed by the editor
+    unseen:   Map<File, Bool>,           // an FSEvents notification is pending
+    open:     Map<File, Bool>,
+    buf:      Map<File, Content>,
+    dirty:    Map<File, Bool>,
+    conflict: Map<File, Bool>,
+    inflight: Map<File, Bool>,           // DES-1: a write of this file is in flight
+    snapshot: Map<File, Content>,        // content being written
+    save_error: Map<File, Bool>,
+    writable: Map<File, Bool>,           // environment
+    focused:  Option<File>,
+    typed:    Map<File, Option<Content>>, // MODEL: ghost, same meaning as in requirements
+    quiet:    Bool                       // ASSUME-2: foreign writers have stopped
+  }
+
+  init {
+    project_open = false
+    focused = none
+    quiet = false
+    forall f: File {
+      on_disk[f] = true
+      real[f] = 0
+      known[f] = 0
+      unseen[f] = false
+      open[f] = false
+      buf[f] = 0
+      dirty[f] = false
+      conflict[f] = false
+      inflight[f] = false
+      snapshot[f] = 0
+      save_error[f] = false
+      writable[f] = true
+      typed[f] = none
+    }
+  }
+
+  // ---- environment ----
+
+  action disk_trouble(f: File, ok: Bool) "MODEL-3: writes to a file start failing or succeed again" {
+    requires writable[f] != ok
+    writable[f] = ok
+  }
+
+  fair action settle() "ASSUME-2: foreign writers eventually stop" {
+    requires not quiet
+    quiet = true
+  }
+
+  action foreign_write(f: File, c: Content) "MODEL-4: another process rewrites a file; the editor learns of it only via FSEvents" {
+    requires not quiet
+    requires project_open
+    requires on_disk[f]
+    requires real[f] != c
+    real[f] = c
+    unseen[f] = c != known[f]   // MODEL-11: a notification that would change nothing (echo) is folded away
+  }
+
+  // ---- project ----
+
+  action open_project() "DES-WS-1: open a folder; start the watcher" {
+    requires not project_open
+    project_open = true
+  }
+
+  action close_project() "DES-4: close the project once every tab is clean and no write is in flight" {
+    requires project_open
+    requires forall f: File { not dirty[f] and not inflight[f] and not conflict[f] }
+    project_open = false
+    focused = none
+    forall f: File {
+      open[f] = false
+      save_error[f] = false
+    }
+  }
+
+  // ---- tree ----
+
+  action create_file(f: File) "DES-WS-2: create an empty file and open it focused" {
+    requires project_open
+    requires not on_disk[f]
+    on_disk[f] = true
+    real[f] = 0
+    known[f] = 0
+    unseen[f] = false
+    open[f] = true
+    buf[f] = 0
+    dirty[f] = false
+    conflict[f] = false
+    save_error[f] = false
+    focused = some(f)
+  }
+
+  action delete_file(f: File) "DES-WS-3: delete a file (no write in flight); its tab closes" {
+    requires project_open
+    requires on_disk[f]
+    requires not inflight[f]
+    on_disk[f] = false
+    unseen[f] = false
+    open[f] = false
+    dirty[f] = false
+    conflict[f] = false
+    typed[f] = none
+    save_error[f] = false
+    if focused == some(f) { focused = none }
+  }
+
+  // ---- tabs and editing ----
+
+  action open_tab(f: File) "DES-WS-4: open a tab with the observed disk content (pending notifications are drained first)" {
+    requires project_open
+    requires on_disk[f]
+    requires not open[f]
+    requires not unseen[f]
+    open[f] = true
+    buf[f] = known[f]
+    dirty[f] = false
+    conflict[f] = false
+    save_error[f] = false
+    focused = some(f)
+  }
+
+  action switch_tab(f: File) "DES-WS-5: move focus; the left tab is then picked up by autosave" {
+    requires project_open
+    requires open[f]
+    requires focused != some(f)
+    focused = some(f)
+  }
+
+  action edit(f: File, c: Content) "DES-1: apply a keystroke to the focused tab; queued while its write is in flight" {
+    requires project_open
+    requires focused == some(f)
+    requires not inflight[f]
+    requires buf[f] != c
+    buf[f] = c
+    dirty[f] = true
+    typed[f] = some(c)
+  }
+
+  action discard(f: File) "DES-WS-6: after a failed save, drop the edits and show the observed disk content" {
+    requires save_error[f]
+    requires not conflict[f]
+    requires not inflight[f]
+    buf[f] = known[f]
+    dirty[f] = false
+    typed[f] = none
+    save_error[f] = false
+  }
+
+  action close_tab(f: File) "DES-4: close a clean tab" {
+    requires project_open
+    requires open[f]
+    requires not dirty[f]
+    requires not inflight[f]
+    open[f] = false
+    save_error[f] = false
+    if focused == some(f) { focused = none }
+  }
+
+  // ---- FileWriter ----
+
+  action write_request(f: File) "DES-1: autosave / Cmd-S / close: hand a snapshot of a dirty tab to FileWriter" {
+    requires project_open
+    requires dirty[f]
+    requires not conflict[f]
+    requires not inflight[f]
+    inflight[f] = true
+    snapshot[f] = buf[f]
+  }
+
+  fair action write_done(f: File) "DES-2: FileWriter finishes a write whose base is still current; it lands, or fails and leaves the tab dirty with an error (D-6)" {
+    requires inflight[f]
+    requires not unseen[f]
+    requires not conflict[f]
+    inflight[f] = false
+    if writable[f] {
+      real[f] = snapshot[f]
+      known[f] = snapshot[f]
+      dirty[f] = false
+      typed[f] = none
+      save_error[f] = false
+    } else {
+      save_error[f] = true
+    }
+  }
+
+  fair action write_abort(f: File) "DES-2: the disk changed behind our back (or a conflict arose); the write is dropped and nothing is replaced" {
+    requires inflight[f]
+    requires unseen[f] or conflict[f]
+    inflight[f] = false
+  }
+
+  // ---- FileWatcher ----
+
+  fair action notify(f: File) "DES-WS-8: an FSEvents notification reveals foreign content; a clean tab reloads, a dirty tab conflicts (DES-3: echoes of our own writes never reach here)" {
+    requires project_open
+    requires unseen[f]
+    unseen[f] = false
+    known[f] = real[f]
+    if open[f] and not dirty[f] { buf[f] = real[f] }
+    if open[f] and dirty[f] { conflict[f] = true }
+  }
+
+  // ---- conflict resolution ----
+
+  action keep_mine(f: File) "DES-WS-9: keep the buffer; overwrite the disk (the user has seen the foreign content)" {
+    requires conflict[f]
+    requires writable[f]
+    requires not inflight[f]
+    requires not unseen[f]
+    real[f] = buf[f]
+    known[f] = buf[f]
+    dirty[f] = false
+    conflict[f] = false
+    typed[f] = none
+    save_error[f] = false
+  }
+
+  action take_disk(f: File) "DES-WS-10: drop the buffer; show the observed disk content" {
+    requires conflict[f]
+    requires not inflight[f]
+    buf[f] = known[f]
+    dirty[f] = false
+    conflict[f] = false
+    typed[f] = none
+    save_error[f] = false
+  }
+
+  // ---- design properties ----
+
+  invariant SnapshotIsBuffer "DES-1: an in-flight write always carries exactly the buffer content" {
+    forall f: File { inflight[f] => (open[f] and dirty[f] and snapshot[f] == buf[f]) }
+  }
+
+  invariant DivergenceIsReported "DES-2: a notification is pending exactly when the real disk differs from what the editor believes" {
+    forall f: File { on_disk[f] => ((real[f] != known[f]) == unseen[f]) }
+  }
+
+  trans NeverClobberUnseen "DES-2: the editor never overwrites disk content it has not observed" {
+    forall f: File { (old(on_disk[f]) and real[f] != old(real[f])) => (old(real[f]) == old(known[f]) or old(unseen[f])) }
+  }
+
+  invariant NoSilentLoss "ED-2: typed content survives until saved or explicitly discarded" {
+    forall f: File { typed[f] is some(c) => ((open[f] and buf[f] == c) or known[f] == c) }
+  }
+
+  invariant TypedOnlyWhenDirty "MODEL-1: induction aid" {
+    forall f: File { typed[f] != none => dirty[f] }
+  }
+
+  invariant DirtyMeansTyped "MODEL-2: induction aid" {
+    forall f: File { dirty[f] => (open[f] and typed[f] == some(buf[f])) }
+  }
+
+  invariant CleanTabMatchesKnown "MODEL-5: induction aid; a clean tab shows the observed disk content" {
+    forall f: File { (open[f] and not dirty[f]) => buf[f] == known[f] }
+  }
+
+  invariant ConflictOnlyWhenDirty "MODEL-6: induction aid" {
+    forall f: File { conflict[f] => (open[f] and dirty[f]) }
+  }
+
+  invariant ErrorOnlyWhenDirty "MODEL-7: induction aid" {
+    forall f: File { save_error[f] => dirty[f] }
+  }
+
+  invariant TabsOnlyInProject "MODEL-8: induction aid" {
+    forall f: File { open[f] => (project_open and on_disk[f]) }
+  }
+
+  invariant FocusIsOpenTab "MODEL-9: induction aid" {
+    focused is some(f) => open[f]
+  }
+
+  invariant NoNotesOffDisk "MODEL-10: induction aid; deleted or closed-project files have nothing pending" {
+    forall f: File { (unseen[f] or inflight[f]) => on_disk[f] }
+  }
+
+  leadsTo WriteCompletes "DES-1: every in-flight write eventually completes, fails or aborts" {
+    forall f: File { inflight[f] ~> not inflight[f] }
+  }
+
+  leadsTo NotificationsDrain "DES-3: every pending FSEvents notification is eventually processed" {
+    forall f: File { (unseen[f] and project_open) ~> (not unseen[f] or not project_open) }
+  }
+
+  terminal { not project_open }
+}
+
+verify {
+  instances File = 2
+  values Content = 0..2
+}

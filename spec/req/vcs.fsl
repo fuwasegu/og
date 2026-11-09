@@ -1,0 +1,160 @@
+// og — Version control (Git) requirements
+//
+// Source: owner decisions D-1 (GoLand equivalent) and D-4 (Git in full scope:
+// status in the tree, diff gutter, commit, branch switching).
+//
+// ASSUME-1 (representation only): 2 files, 2 branches; a file is either unchanged
+//   or changed relative to HEAD, line-level detail is abstracted away.
+// ASSUME-2 (confirmed 2026-11-09, follows D-2): commit and checkout autosave all
+//   files first, so Git always sees what the editor shows.
+// ASSUME-3 (confirmed 2026-11-09): switching branches with uncommitted changes is
+//   refused; the user commits, stashes or discards first. One stash entry.
+// ASSUME-4 (confirmed 2026-11-09): push / pull / merge are not part of this layer yet.
+requirements Vcs {
+  entity File
+  number Branch
+
+  state {
+    unsaved: Map<File, Bool>,   // editor has edits not yet written to disk
+    changed: Map<File, Bool>,   // working tree differs from HEAD
+    staged:  Map<File, Bool>,   // selected for the next commit
+    shown:   Map<File, Bool>,   // tree color / diff gutter currently shows "changed"
+    stashed: Map<File, Bool>,   // file's changes are in the stash
+    branch:  Branch
+  }
+
+  init {
+    branch = 0
+    forall f: File {
+      unsaved[f] = false
+      changed[f] = false
+      staged[f] = false
+      shown[f] = false
+      stashed[f] = false
+    }
+  }
+
+  def clean() = forall f: File { not changed[f] and not unsaved[f] }
+  def has_stash() = exists f: File { stashed[f] }
+
+  action edit(f: File) "MODEL-1: the user edits a file" {
+    requires not unsaved[f]
+    unsaved[f] = true
+  }
+
+  action autosave(f: File) "MODEL-2: autosave writes the edit to disk; the file now differs from HEAD" {
+    requires unsaved[f]
+    unsaved[f] = false
+    changed[f] = true
+  }
+
+  fair action refresh() "VCS-1: the tree status and diff gutter catch up with the working tree (VCS-2)" {
+    requires exists f: File { shown[f] != changed[f] }
+    forall f: File { shown[f] = changed[f] }
+  }
+
+  action stage(f: File, on: Bool) "VCS-3: the user selects or deselects a changed file for commit" {
+    requires changed[f] or unsaved[f]
+    requires staged[f] != on
+    staged[f] = on
+  }
+
+  action commit() "VCS-3: commit autosaves, then records the selected files; they become unchanged (ASSUME-2)" {
+    requires exists f: File { staged[f] }
+    forall f: File {
+      unsaved[f] = false
+      if staged[f] {
+        changed[f] = false
+        staged[f] = false
+      } else {
+        changed[f] = changed[f] or unsaved[f]
+      }
+    }
+  }
+
+  action discard(f: File) "VCS-3: the user explicitly rolls back a file to HEAD" {
+    requires changed[f] or unsaved[f]
+    unsaved[f] = false
+    changed[f] = false
+    staged[f] = false
+  }
+
+  action checkout(b: Branch) "VCS-3: switching branches is allowed only with a clean working tree (ASSUME-3)" {
+    requires branch != b
+    requires clean()
+    branch = b
+  }
+
+  action stash() "VCS-3: the user stashes all changes; the working tree becomes clean (ASSUME-3)" {
+    requires not has_stash()
+    requires exists f: File { changed[f] or unsaved[f] }
+    forall f: File {
+      stashed[f] = changed[f] or unsaved[f]
+      changed[f] = false
+      unsaved[f] = false
+      staged[f] = false
+    }
+  }
+
+  action unstash() "VCS-3: the user restores the stash onto a clean working tree (ASSUME-3)" {
+    requires has_stash()
+    requires clean()
+    forall f: File {
+      changed[f] = stashed[f]
+      stashed[f] = false
+    }
+  }
+
+  invariant StagedIsChanged "VCS-3: only a changed file can be selected for commit" {
+    forall f: File { staged[f] => (changed[f] or unsaved[f]) }
+  }
+
+  trans StashedNotLost "VCS-3: a stashed change leaves the stash only by being restored into the working tree" {
+    forall f: File { (old(stashed[f]) and not stashed[f]) => changed[f] }
+  }
+
+  trans StashTakesEverything "VCS-3: stashing moves every change into the stash; nothing is dropped" {
+    forall f: File {
+      (not old(has_stash()) and has_stash()) => (stashed[f] == (old(changed[f]) or old(unsaved[f])))
+    }
+  }
+
+  leadsTo StatusCatchesUp "VCS-1: the tree status and gutter eventually show the real working tree state (VCS-2)" {
+    forall f: File { shown[f] != changed[f] ~> shown[f] == changed[f] }
+  }
+
+  acceptance AC-VCS-1 "VCS-3: edit, select, commit; the file is unchanged afterwards" {
+    edit(0) autosave(0) stage(0, true) commit()
+    expect not changed[0] and not staged[0]
+  }
+
+  acceptance AC-VCS-2 "VCS-3: stash, switch branch, come back, restore" {
+    edit(0) autosave(0) stash() checkout(1) checkout(0) unstash()
+    expect changed[0] and branch == 0
+  }
+
+  acceptance AC-VCS-3 "VCS-1: the tree shows a saved change after refresh" {
+    edit(0) autosave(0) refresh()
+    expect shown[0]
+  }
+
+  forbidden FB-VCS-1 "VCS-3: switching branches with uncommitted changes is refused (ASSUME-3)" {
+    edit(0) autosave(0) checkout(1)
+    expect rejected
+  }
+
+  forbidden FB-VCS-2 "VCS-3: unsaved edits also block switching branches (ASSUME-3)" {
+    edit(0) checkout(1)
+    expect rejected
+  }
+
+  forbidden FB-VCS-3 "VCS-3: commit with nothing selected is refused" {
+    edit(0) autosave(0) commit()
+    expect rejected
+  }
+}
+
+verify {
+  instances File = 2
+  values Branch = 0..1
+}

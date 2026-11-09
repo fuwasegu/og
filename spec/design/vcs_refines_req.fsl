@@ -1,0 +1,14 @@
+// VcsDesign ⊑ Vcs
+// Queueing is invisible; an operation takes effect when GitService runs it.
+refinement VcsRefinesReq {
+  impl VcsDesign
+  abs  Vcs
+  maps auto
+
+  action enqueue(op, b)   -> stutter
+  action refuse()         -> stutter
+  action run_commit()     -> commit()
+  action run_checkout()   -> checkout(target)
+  action run_stash()      -> stash()
+  action run_unstash()    -> unstash()
+}

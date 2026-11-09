@@ -8,9 +8,14 @@ VERSION="${1:-$(tr -d '[:space:]' < VERSION)}"
 export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-/tmp/og-clang-module-cache}"
 
 echo "▶ Building og release binary (version: $VERSION)..."
-swift build --disable-sandbox -c release
-
-BIN_PATH="$(swift build --disable-sandbox -c release --show-bin-path)/og"
+if swift package --version >/dev/null 2>&1; then
+    swift build --disable-sandbox -c release
+    BIN_PATH="$(swift build --disable-sandbox -c release --show-bin-path)/og"
+else
+    # SwiftPM unavailable (broken CommandLineTools): fall back to the swiftc-only build.
+    bash scripts/dev-build.sh release
+    BIN_PATH="$ROOT_DIR/.build/dev/og"
+fi
 APP_DIR="$ROOT_DIR/build/og.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"

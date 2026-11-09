@@ -1,0 +1,163 @@
+// og — Local model server lifecycle (owned by the application)
+//
+// Source: owner decisions in the 2026-11-09 session.
+//   D-9:  og starts, supervises and stops the local completion server itself
+//         (llama.cpp `llama-server` or MLX `mlx_lm.server`). It never attaches
+//         to a server started outside og.
+//   D-10: the model is chosen in og's settings.
+//
+// ASSUME-1 (confirmed by default 2026-11-09): one server for the whole app, started
+//   when AI completion is enabled (including at launch) and stopped when it is
+//   disabled or the app quits.
+// ASSUME-2: an unexpected exit is restarted automatically; after MAXR consecutive
+//   failures og stops retrying and shows an error until the user retries.
+// ASSUME-3: completion requests are sent only while the server is ready; while it
+//   is starting (including model download) no ghost text is shown.
+// ASSUME-4: changing the model restarts the server.
+// ASSUME-5 (representation only): two models, MAXR = 2.
+requirements ModelServer {
+  number Model
+  number Tries
+  const MAXR = 2
+
+  enum Phase { Off, Starting, Ready, Failed }
+
+  state {
+    app_running: Bool,
+    enabled:  Bool,
+    phase:    Phase,
+    model:    Model,     // model selected in settings
+    loaded:   Model,     // model the running server serves
+    failures: Tries      // consecutive failed starts / crashes
+  }
+
+  init {
+    app_running = true
+    enabled = false
+    phase = Off
+    model = 0
+    loaded = 0
+    failures = 0
+  }
+
+  def running() = phase == Starting or phase == Ready
+
+  action enable() "AI-1: turning AI completion on starts the server with the selected model" {
+    requires app_running
+    requires not enabled
+    enabled = true
+    phase = Starting
+    loaded = model
+    failures = 0
+  }
+
+  action disable() "AI-2: turning AI completion off stops the server" {
+    requires enabled
+    enabled = false
+    phase = Off
+  }
+
+  fair action became_ready() "AI-3: once the server answers its health check it is ready for completion" {
+    requires phase == Starting
+    phase = Ready
+    failures = 0
+  }
+
+  action start_failed() "AI-4: a start that fails (bad executable, download error, crash) counts as a failure (ASSUME-2)" {
+    requires phase == Starting
+    requires failures < MAXR
+    failures = failures + 1
+    if failures + 1 < MAXR { phase = Starting } else { phase = Failed }
+  }
+
+  action crashed() "AI-4: an unexpected exit of a ready server is restarted automatically (ASSUME-2)" {
+    requires phase == Ready
+    phase = Starting
+    failures = 1
+  }
+
+  action retry() "AI-5: after giving up, the user can retry; the currently selected model is loaded" {
+    requires enabled
+    requires phase == Failed
+    phase = Starting
+    loaded = model
+    failures = 0
+  }
+
+  action select_model(m: Model) "AI-6: selecting another model restarts a running server with it (ASSUME-4)" {
+    requires model != m
+    model = m
+    if enabled and phase != Failed {
+      phase = Starting
+      loaded = m
+      failures = 0
+    }
+  }
+
+  action quit() "AI-2: quitting the app stops the server" {
+    requires app_running
+    app_running = false
+    enabled = false
+    phase = Off
+  }
+
+  invariant ServerOnlyWhenWanted "AI-1: a server runs only while the app runs and AI completion is enabled" {
+    running() => (enabled and app_running)
+  }
+
+  invariant ServesSelectedModel "AI-6: a ready server always serves the model selected in settings" {
+    phase == Ready => loaded == model
+  }
+
+  invariant BoundedRetries "AI-4: og never retries more than MAXR times in a row" {
+    failures <= MAXR
+  }
+
+  invariant OffWhenDisabled "AI-2: when AI completion is off, no server is running" {
+    not enabled => phase == Off
+  }
+
+  invariant RunningServesSelected "MODEL-1: induction aid; a starting or ready server loads the selected model" {
+    running() => loaded == model
+  }
+
+  invariant EnabledOnlyWhileRunning "MODEL-2: induction aid" {
+    enabled => app_running
+  }
+
+  leadsTo StartSettles "AI-3: a start always ends ready, failed, or stopped" {
+    phase == Starting ~> (phase == Ready or phase == Failed or phase == Off)
+  }
+
+  acceptance AC-AI-1 "AI-1: enable, ready" {
+    enable() became_ready()
+    expect phase == Ready
+  }
+
+  acceptance AC-AI-2 "AI-4: repeated failures end in Failed; retry starts again" {
+    enable() start_failed() start_failed() retry()
+    expect phase == Starting
+  }
+
+  acceptance AC-AI-3 "AI-6: switching model while ready restarts with the new model" {
+    enable() became_ready() select_model(1) became_ready()
+    expect phase == Ready and loaded == 1
+  }
+
+  forbidden FB-AI-1 "AI-1: the server cannot start while AI completion is off" {
+    became_ready()
+    expect rejected
+  }
+
+  forbidden FB-AI-2 "AI-5: retry is only offered after giving up" {
+    enable() retry()
+    expect rejected
+  }
+
+  terminal { not app_running }
+}
+
+verify {
+  values Model = 0..1
+  values Tries = 0..2
+}

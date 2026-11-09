@@ -1,0 +1,20 @@
+// RunDebugDesign ⊑ RunDebug
+// Stepping looks paused; the user-visible breakpoint is the gutter state.
+refinement RunDebugRefinesReq {
+  impl RunDebugDesign
+  abs  RunDebug
+  maps auto
+
+  map st[c: Cfg] = if st[c] == RRunning then Running
+                   else if st[c] == RPaused or st[c] == RStepping then Paused
+                   else if st[c] == RDone then Done
+                   else Idle
+  map has_bp = bp_user
+
+  action sync_breakpoints()      -> stutter
+  action zombie_exit(c)          -> stutter
+  action stopped_at_breakpoint(c) -> hit_breakpoint(c)
+  action stopped_at_removed(c)   -> stutter
+  action step_stopped(c)         -> stutter
+  action step_exited(c)          -> stop(c)
+}

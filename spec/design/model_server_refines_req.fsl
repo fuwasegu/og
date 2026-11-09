@@ -1,0 +1,19 @@
+// ModelServerDesign ⊑ ModelServer
+// Spawning and loading both look like "starting"; process bookkeeping is invisible.
+refinement ModelServerRefinesReq {
+  impl ModelServerDesign
+  abs  ModelServer
+  maps auto
+
+  map phase = if phase == DReady then Ready
+              else if phase == DFailed then Failed
+              else if phase == DOff then Off
+              else Starting
+
+  action spawned()            -> stutter
+  action spawn_error()        -> start_failed()
+  action health_ok()          -> became_ready()
+  action exit_while_loading() -> start_failed()
+  action exit_while_ready()   -> crashed()
+  action zombie_exit()        -> stutter
+}

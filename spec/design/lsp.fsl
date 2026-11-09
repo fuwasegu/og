@@ -1,0 +1,255 @@
+// og — Language server design (GoplsSupervisor + GoplsClient actor)
+//
+// Refines: spec/req/lsp.fsl (mapping: spec/design/lsp_refines_req.fsl)
+//
+// Components (Swift):
+//   GoplsSupervisor actor — spawns gopls, runs `initialize`, detects exit,
+//                           restarts with exponential backoff
+//   GoplsClient     actor — JSON-RPC over stdio; one ordered outgoing stream
+//   DocumentSync    @MainActor — turns buffer versions into didOpen/didChange
+//
+// DES-1: Notifications and requests share one ordered stdio stream, and gopls
+//        handles them in order. So once didChange(v) is written to the stream,
+//        every later request is answered against version >= v. The requirements'
+//        "version gopls knows" is therefore the last version written (`sent`).
+// DES-2: Each gopls process has a generation number. Responses are matched by
+//        request id within the current generation; anything from an older
+//        process is dropped.
+// DES-3: After `initialize` succeeds, didOpen is replayed for every open tab at
+//        its current version, in the same main-actor turn.
+// DES-4: Backoff waiting is internal; the requirements see it as "crashed".
+//
+// ASSUME-1 (representation only): versions and generations are small bounded
+//   counters; consecutive didChange messages for one file are collapsed.
+spec LanguageDesign {
+  entity File
+  number Ver
+  number Gen
+  const MAXV = 3
+  const MAXG = 2
+
+  enum Phase { PStopped, PSpawning, PInitializing, PReady, PCrashed, PBackoff }
+
+  state {
+    project_open: Bool,
+    phase:    Phase,
+    gen:      Gen,                     // DES-2: generation of the current process
+    doc_open: Map<File, Bool>,
+    ver:      Map<File, Ver>,
+    sent:     Map<File, Option<Ver>>,  // DES-1: last version written to the stream
+    srv:      Map<File, Option<Ver>>,  // version gopls has actually processed
+    req:      Map<File, Option<Ver>>,  // outstanding edit-bearing request, by version
+    req_gen:  Map<File, Gen>,          // generation the request was sent to
+    answered: Map<File, Bool>,         // its response has arrived
+    diag:     Map<File, Option<Ver>>
+  }
+
+  init {
+    project_open = false
+    phase = PStopped
+    gen = 0
+    forall f: File {
+      doc_open[f] = false
+      ver[f] = 0
+      sent[f] = none
+      srv[f] = none
+      req[f] = none
+      req_gen[f] = 0
+      answered[f] = false
+      diag[f] = none
+    }
+  }
+
+  def live() = phase == PSpawning or phase == PInitializing or phase == PReady
+
+  // ---- supervisor ----
+
+  action open_project() "DES-LSP-1: opening a project spawns gopls at the project root" {
+    requires not project_open
+    project_open = true
+    phase = PSpawning
+  }
+
+  action close_project() "DES-LSP-2: closing the project shuts gopls down" {
+    requires project_open
+    project_open = false
+    phase = PStopped
+    forall f: File {
+      doc_open[f] = false
+      sent[f] = none
+      srv[f] = none
+      req[f] = none
+      answered[f] = false
+      diag[f] = none
+    }
+  }
+
+  fair action spawned() "DES-2: the process starts with a new generation number" {
+    requires phase == PSpawning
+    requires gen < MAXG
+    phase = PInitializing
+    gen = gen + 1
+  }
+
+  fair action initialized() "DES-3: `initialize` succeeded; didOpen is replayed for every open tab" {
+    requires phase == PInitializing
+    phase = PReady
+    forall f: File {
+      if doc_open[f] { sent[f] = some(ver[f]) } else { sent[f] = none }
+      srv[f] = none
+    }
+  }
+
+  action exited() "DES-LSP-3: the gopls process exits unexpectedly; queued messages and outstanding requests are lost" {
+    requires live()
+    phase = PCrashed
+    forall f: File {
+      sent[f] = none
+      srv[f] = none
+      req[f] = none
+      answered[f] = false
+    }
+  }
+
+  fair action wait_backoff() "DES-4: the supervisor waits out the backoff interval" {
+    requires phase == PCrashed
+    phase = PBackoff
+  }
+
+  fair action respawn() "DES-4: after the backoff, gopls is spawned again" {
+    requires project_open
+    requires phase == PBackoff
+    phase = PSpawning
+  }
+
+  // ---- document sync ----
+
+  action open_doc(f: File) "DES-LSP-4: opening a tab writes didOpen when gopls is ready" {
+    requires project_open
+    requires not doc_open[f]
+    doc_open[f] = true
+    if phase == PReady { sent[f] = some(ver[f]) }
+  }
+
+  action close_doc(f: File) "DES-LSP-5: closing a tab writes didClose and clears its diagnostics" {
+    requires doc_open[f]
+    doc_open[f] = false
+    sent[f] = none
+    srv[f] = none
+    req[f] = none
+    answered[f] = false
+    diag[f] = none
+  }
+
+  action edit(f: File) "DES-LSP-6: a keystroke bumps the buffer version; never blocked by gopls" {
+    requires doc_open[f]
+    requires ver[f] < MAXV
+    ver[f] = ver[f] + 1
+  }
+
+  fair action send_change(f: File) "DES-1: DocumentSync writes didChange for the latest version" {
+    requires phase == PReady
+    requires doc_open[f]
+    requires sent[f] != some(ver[f])
+    sent[f] = some(ver[f])
+  }
+
+  fair action process(f: File) "DES-1: gopls processes the stream up to the last written version" {
+    requires phase == PReady
+    requires srv[f] != sent[f]
+    srv[f] = sent[f]
+  }
+
+  action publish(f: File, v: Ver) "DES-LSP-7: gopls publishes diagnostics for a version it has processed; older ones never replace newer" {
+    requires phase == PReady
+    requires doc_open[f]
+    requires exists s: Ver { srv[f] == some(s) and v <= s }
+    if diag[f] == none or (exists d: Ver { diag[f] == some(d) and d <= v }) {
+      diag[f] = some(v)
+    }
+  }
+
+  // ---- edit-bearing requests ----
+
+  action request(f: File) "DES-2: completion / quick fix / organize imports is sent, tagged with version and generation" {
+    requires phase == PReady
+    requires doc_open[f]
+    requires sent[f] == some(ver[f])
+    requires req[f] == none
+    req[f] = some(ver[f])
+    req_gen[f] = gen
+    answered[f] = false
+  }
+
+  fair action respond(f: File) "DES-1: gopls answers once it has processed the version the request was made against" {
+    requires phase == PReady
+    requires req[f] != none
+    requires not answered[f]
+    requires req_gen[f] == gen
+    requires exists r: Ver { exists s: Ver { req[f] == some(r) and srv[f] == some(s) and r <= s } }
+    answered[f] = true
+  }
+
+  action apply(f: File) "DES-LSP-8: a response for the current version and generation is applied as a new version" {
+    requires answered[f]
+    requires req[f] == some(ver[f])
+    requires req_gen[f] == gen
+    requires ver[f] < MAXV
+    req[f] = none
+    answered[f] = false
+    ver[f] = ver[f] + 1
+  }
+
+  action drop(f: File) "DES-LSP-9: a response for an older version is dropped" {
+    requires answered[f]
+    requires req[f] != some(ver[f])
+    req[f] = none
+    answered[f] = false
+  }
+
+  // ---- design properties ----
+
+  invariant ProcessedNotAhead "DES-1: gopls never processes more than was written" {
+    forall f: File { srv[f] != none => (exists s: Ver { exists t: Ver { srv[f] == some(s) and sent[f] == some(t) and s <= t } }) }
+  }
+
+  invariant SentNotAhead "DES-1: nothing newer than the buffer is ever written" {
+    forall f: File { sent[f] is some(t) => (doc_open[f] and t <= ver[f]) }
+  }
+
+  invariant RequestsBelongToCurrentProcess "DES-2: an outstanding request always belongs to the live process" {
+    forall f: File { req[f] != none => (phase == PReady and req_gen[f] == gen) }
+  }
+
+  invariant AnsweredHasRequest "MODEL-1: induction aid" {
+    forall f: File { answered[f] => req[f] != none }
+  }
+
+  invariant StreamOnlyWhenReady "MODEL-2: induction aid" {
+    forall f: File { (sent[f] != none or srv[f] != none) => phase == PReady }
+  }
+
+  invariant PhaseFollowsProject "MODEL-3: induction aid" {
+    (phase != PStopped) == project_open
+  }
+
+  invariant DiagNotFromFuture "MODEL-4: induction aid" {
+    forall f: File { diag[f] is some(d) => (doc_open[f] and d <= ver[f]) }
+  }
+
+  invariant PendingNotFromFuture "MODEL-5: induction aid" {
+    forall f: File { req[f] is some(p) => (doc_open[f] and p <= ver[f]) }
+  }
+
+  invariant RequestWasSent "MODEL-6: induction aid; a request's version was already written" {
+    forall f: File { req[f] != none => (exists r: Ver { exists t: Ver { req[f] == some(r) and sent[f] == some(t) and r <= t } }) }
+  }
+
+  terminal { not project_open }
+}
+
+verify {
+  instances File = 2
+  values Ver = 0..3
+  values Gen = 0..2
+}

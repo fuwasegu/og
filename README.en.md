@@ -1,12 +1,12 @@
 <p align="center">
-  <img src="docs/assets/icon.png" width="120" height="120" alt="og icon">
+  <img src="docs/assets/icon.png" width="128" height="128" alt="og icon">
 </p>
 
 <h1 align="center">og</h1>
 
 <p align="center">
-  A 120fps native macOS code editor built exclusively for Go.<br>
-  Zero Electron, zero WebViews — instant startup, sub-millisecond typing, and a built-in native PTY terminal.
+  A native macOS IDE for writing Go by hand.<br>
+  GoLand-style workflows, built with AppKit only.
 </p>
 
 <p align="center">
@@ -14,89 +14,49 @@
   <a href="README.md">日本語</a>
 </p>
 
-<p align="center">
-  <img src="https://img.shields.io/badge/macOS-14+-blue" alt="macOS 14+">
-  <img src="https://img.shields.io/badge/Swift-6.0-orange" alt="Swift 6.0">
-  <img src="https://img.shields.io/badge/Go-gopls-00ADD8" alt="Go / gopls">
-</p>
+## Why og
+
+Letting an AI write the code is becoming the default. og goes the other way: it makes the time you spend writing Go yourself feel good.
+
+- Completion, navigation, refactoring, run, debug and Git, with GoLand's keymap.
+- Completion and warnings that steer you toward Effective Go and the Google Go Style Guide.
+- AI completion is off until you turn it on, and the model only ever runs on your Mac.
 
 ## Install
 
 ```sh
 brew install --cask fuwasegu/tap/og
+brew install go gopls delve
 ```
 
-To upgrade:
-
-```sh
-brew upgrade --cask fuwasegu/tap/og
-```
-
-Requires **macOS 14 (Sonoma)+**. Or grab `og.app.zip` directly from [Releases](https://github.com/fuwasegu/og/releases/latest).
+Requires macOS 14 or later. On first launch a setup assistant walks through theme, font, the Go tools and AI completion; reopen it from og ▸ Setup Assistant….
 
 ## Features
 
-- **Zero WebViews, True 120fps Rendering** — Both the code editor and the integrated terminal render directly via AppKit (`NSView`) and `CoreText` on GPU-backed layers. Only visible rows intersecting the viewport are drawn, and syntax highlighting is cached per buffer version so scrolling and rapid typing stay locked at 120Hz.
-- **GoLand-Style Postfix Completion (`Tab`)** — Append `.err`, `.var`, `.forr`, `.for`, `.nn`, `.nil`, `.return`, `.print`, `.not`, or `.len` to any Go expression and press `Tab` to expand it into idiomatic Go boilerplate (e.g., `err.err` → `if err != nil { return err }`, `NewServer().var` → `server := NewServer()`), with a live preview badge right beside your cursor.
-- **One-Click Struct Tag Generator (`⌘⇧T` / `🏷 +json tags`)** — Click the inline `🏷 +json tags` badge on any `struct` declaration or choose from the **Struct Tags** toolbar menu (`json (snake_case)`, `json (camelCase)`, `json (omitempty)`, `json + yaml`, `db + json`) to automatically generate or update backtick struct tags.
-- **Table-Driven Test Generator (`⌘⇧G` / `🧪 +Table Test`)** — Click `🧪 +Table Test` next to any function/method (or press `⌘⇧G`) to scaffold an idiomatic Go table-driven test (`tests := []struct{ ... }` + `t.Run`) and jump straight to it.
-- **Bidirectional Interface ⇄ Struct Navigation (`⇄ implements` / `⇣ implemented by`)** — Live AST analysis annotates structs with the interfaces they satisfy (`⇄ implements Handler`) and interfaces with the structs that implement them (`⇣ implemented by Server`). Click any badge, press `⌘B` / `⌘Click`, or use the **Structure** menu to jump directly to declarations.
-- **Zero-Config `gopls` with Auto-Healing** — Automatically spawns and supervises `gopls` over JSON-RPC 2.0 for live diagnostics, inline error underlines, and latency telemetry. If `gopls` ever crashes, `og` restarts it with exponential backoff and seamlessly restores your open buffer state.
-- **Automatic `gofmt` on Save** — Pressing `⌘S` formats your Go file via `gofmt` while preserving your cursor position, alongside smart bracket/quote auto-pairing (`{}` / `()` / `[]` / `""`) and `⌘/` line comment toggling.
-- **Transactional Symbol Rename with Diff Preview (`⌘⇧R`)** — Preview cross-file symbol renames as a Unified Diff before touching disk. Changes are committed atomically via temporary files and automatically roll back across all files if any write fails.
-- **Inline Test, Benchmark & `main()` Runner** — Click `▶ Run Test`, `▶ Bench`, or `▶ Run main` directly in the editor to execute tests or `go run .` without leaving your code.
-- **Built-in Native PTY Terminal (`⌘J`)** — Toggle a dockable terminal backed directly by Darwin `openpty` and `DispatchSourceRead` with 24-bit TrueColor and ANSI support — run `go run`, `git`, or CLI agents without leaving the editor.
-- **100% Local AI Inline Completion (FIM)** — Connects to a local `llama-server` (`127.0.0.1:8080`) for Fill-in-the-Middle streaming ghost text.
+- **Editing:** folders with `go.mod` / `go.work`, file tree, tabs, session restore; syntax highlighting, smart indent, bracket pairing, line commands, extend selection, IME
+- **Saving:** GoLand-style autosave; `⌘S` organizes imports and runs gofmt; clean buffers reload on external changes, edited ones show a conflict bar
+- **gopls:** completion, diagnostics, hover, signature help, go to definition / implementation / type, find usages, quick fixes, file structure, automatic restart
+- **Hover cards:** highlighted code, clickable doc links, and the constants of enum-like types
+- **Writing helpers:** `if err != nil { … }` after an error assignment (plus a `%w`-wrapping variant), `.switch` that fills every case of an enum-like type, postfix templates (`.err`, `.var`, `.for`, `.nn`, …), `// Name` doc comments, consistent receivers, `NewT` constructors, `got` / `want` and `cmp.Diff` test templates, table-driven tests, struct tags
+- **Style guidance:** naming (initialisms, getters, stutter, `ErrX` / `XError`, `-er` interfaces, `this` / `self`), `ctx` first, no `else` after `return`, doc comments, and gopls staticcheck; each warning links to its guide section
+- **Refactoring:** rename with a diff preview, all-or-nothing apply with rollback, one-step undo
+- **Run & debug:** gutter ▶ for `go run`, tests and benchmarks with a test tree; delve breakpoints, stepping, variables, evaluate
+- **Git, search, terminal:** tree and gutter status, commit, branches, stash; go to file / symbol, find and replace in files; a tabbed xterm-compatible terminal
+- **Look:** dark, light, or follow the system; any installed monospaced font
+- **Local AI completion (opt-in):** og starts, supervises and stops llama.cpp (`llama-server`) or MLX (`mlx_lm.server`) itself, bound to 127.0.0.1; pick the model in Settings
 
-## Keyboard Shortcuts
+The first debug session triggers macOS's "Developer Tools Access" prompt; `sudo DevToolsSecurity -enable` removes it.
 
-| Shortcut | Action |
-|---|---|
-| `Tab` | Expand GoLand Postfix Completion (`.err`, `.var`, `.forr`, `.nn`, etc.) / Accept AI Ghost Text |
-| `⌘B` / `⌘Click` | Go to Declaration (struct, interface, func, method) |
-| `⌘⇧T` | Generate `json` (`snake_case`) struct tags for current struct |
-| `⌘⇧G` | Generate GoLand Table-Driven Test for current function |
-| `⌘⇧R` | Transactional symbol rename (with Unified Diff preview) |
-| `⌘D` | Duplicate current line or selection (GoLand style) |
-| `⌥⇧↑` / `⌥⇧↓` | Move current line up / down |
-| `⌘/` | Toggle line comment (`//`) |
-| `⌘O` | Open `.go` file |
-| `⌘S` | Save + auto-format with `gofmt` |
-| `⌘J` | Toggle built-in native PTY terminal |
-| `⌘C` / `⌘X` / `⌘V` | Copy / Cut / Paste (whole line when nothing is selected) |
-| `⌘Z` / `⌘⇧Z` | Undo / Redo |
-| Double / Triple-click | Select word (identifier) / Select full line |
+## Icon
 
-## Requirements
-
-- **macOS 14 (Sonoma)** or later
-- **[Go](https://go.dev/)** and **[`gopls`](https://pkg.go.dev/golang.org/x/tools/gopls)**
-  ```sh
-  brew install go gopls
-  ```
-- *(Optional)* Local `llama-server` running on `http://127.0.0.1:8080` for local FIM inline completions.
+A gopher peeking up from below, with eyes that spell `og`. The Go gopher was designed by Renée French and is licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). The icon is generated by `scripts/generate-icon.swift`.
 
 ## Development
 
-```sh
-# Build and launch from source
-make run
+Specs live in `spec/` (FSL, verified with `fslc`). See `spec/README.md` and `AGENTS.md`.
 
-# Package build/og.app bundle (with AppIcon.icns)
+```sh
+make check
+make spec
 make app
 ```
-
-<details>
-<summary>Verification Harness & Releasing</summary>
-
-```sh
-# Install pre-commit / pre-push guardrails
-make install-hooks
-
-# Run all 4 verification gates (Static Guardrails, StrictConcurrency Debug, 300-step Fuzz + Latency SLAs, Release)
-make check
-```
-
-Pushing a `v*` tag triggers GitHub Actions (`.github/workflows/release.yml`) to run the harness, package and sign `og.app`, publish a GitHub Release, and update `fuwasegu/homebrew-tap` automatically.
-
-</details>

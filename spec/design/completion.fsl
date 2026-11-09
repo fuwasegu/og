@@ -1,0 +1,161 @@
+// og — Inline completion design (CompletionClient actor + GhostTextController)
+//
+// Refines: spec/req/completion.fsl (mapping: spec/design/completion_refines_req.fsl)
+//
+// DES-1: The endpoint comes from settings and is validated when it is set: only
+//        loopback hosts (127.0.0.1, ::1, localhost) are accepted. Requests always
+//        go to the validated endpoint.
+// DES-2: A request is sent after typing pauses (debounce). Each request is tagged
+//        with the document version; the HTTP stream is cancelled on the next edit
+//        and late chunks with an old tag are dropped.
+// DES-3: Ghost text appears with the first streamed chunk and grows with later
+//        chunks. Tab accepts what is shown and cancels the rest of the stream.
+//
+// ASSUME-1 (representation only): one bounded counter for edits and cursor moves.
+spec CompletionDesign {
+  number Ver
+  const MAXV = 3
+
+  enum Host { Loopback, Elsewhere }
+
+  state {
+    endpoint:  Host,                 // DES-1: validated endpoint from settings
+    server_up: Bool,
+    ver:       Ver,
+    idle:      Bool,                 // DES-2: the debounce interval has elapsed
+    pending:   Option<Ver>,          // request sent, no chunk yet
+    streaming: Option<Ver>,          // chunks are arriving for this version
+    ghost:     Option<Ver>,
+    postfix:   Bool,
+    sent_remote: Bool                // MODEL-1: ghost — code ever sent off-machine
+  }
+
+  init {
+    endpoint = Loopback
+    server_up = true
+    ver = 0
+    idle = false
+    pending = none
+    streaming = none
+    ghost = none
+    postfix = false
+    sent_remote = false
+  }
+
+  action set_endpoint(h: Host) "DES-1: settings accept only a loopback endpoint" {
+    requires h == Loopback
+    endpoint = h
+  }
+
+  action server_down() "DES-CMP-1: llama-server stops; requests and streams end" {
+    requires server_up
+    server_up = false
+    pending = none
+    streaming = none
+  }
+
+  action server_back() "DES-CMP-2: llama-server is reachable again" {
+    requires not server_up
+    server_up = true
+  }
+
+  action debounce() "DES-2: typing has paused long enough" {
+    requires not idle
+    idle = true
+  }
+
+  action request() "DES-2: send a FIM request for the current version to the validated endpoint" {
+    requires idle
+    requires server_up
+    requires pending == none and streaming == none
+    requires ghost == none
+    pending = some(ver)
+    sent_remote = sent_remote or endpoint == Elsewhere
+  }
+
+  action first_chunk() "DES-3: the first chunk for the current version shows the ghost text" {
+    requires pending == some(ver)
+    pending = none
+    streaming = some(ver)
+    ghost = some(ver)
+  }
+
+  action more_chunks() "DES-3: later chunks extend the ghost text" {
+    requires streaming == some(ver)
+    streaming = some(ver)
+  }
+
+  action stream_end() "DES-3: the stream finishes" {
+    requires streaming != none
+    streaming = none
+  }
+
+  action late_chunk() "DES-2: a response tagged with an older version is dropped" {
+    requires pending != none
+    requires pending != some(ver)
+    pending = none
+  }
+
+  action edit(match: Bool) "DES-2: a keystroke or cursor move hides ghost text, cancels the stream and restarts the debounce" {
+    requires ver < MAXV
+    ver = ver + 1
+    ghost = none
+    streaming = none
+    idle = false
+    postfix = match
+  }
+
+  action tab_accept() "DES-3: Tab inserts the ghost text shown so far and cancels the stream" {
+    requires ghost == some(ver)
+    requires not postfix
+    requires ver < MAXV
+    ghost = none
+    streaming = none
+    idle = false
+    ver = ver + 1
+  }
+
+  action tab_postfix() "DES-CMP-3: Tab expands the matching postfix template; ghost text is dropped" {
+    requires postfix
+    requires ver < MAXV
+    postfix = false
+    ghost = none
+    streaming = none
+    idle = false
+    ver = ver + 1
+  }
+
+  action escape() "DES-CMP-4: Esc hides the ghost text and cancels the stream" {
+    requires ghost != none
+    ghost = none
+    streaming = none
+  }
+
+  invariant EndpointIsLoopback "DES-1: the endpoint in use is always a loopback address" {
+    endpoint == Loopback
+  }
+
+  invariant NeverLeavesMachine "DES-1: code is never sent off-machine" {
+    not sent_remote
+  }
+
+  invariant StreamMatchesGhost "DES-3: a live stream always feeds the ghost text currently shown" {
+    streaming != none => (streaming == some(ver) and ghost == some(ver))
+  }
+
+  invariant GhostIsCurrent "MODEL-2: induction aid" {
+    ghost == none or ghost == some(ver)
+  }
+
+  invariant PendingNotFromFuture "MODEL-3: induction aid" {
+    pending is some(p) => p <= ver
+  }
+
+  invariant OneInFlight "MODEL-4: induction aid; never a request and a stream at once" {
+    not (pending != none and streaming != none)
+  }
+}
+
+verify {
+  values Ver = 0..3
+}

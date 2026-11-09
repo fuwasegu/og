@@ -1,0 +1,182 @@
+// og — Model server design (ModelServerManager on the main actor + child process)
+//
+// Refines: spec/req/model_server.fsl (mapping: spec/design/model_server_refines_req.fsl)
+//
+// DES-1: The server is a child process in its own process group, bound to
+//        127.0.0.1 on a free port chosen by og. Stopping sends SIGTERM to the group
+//        (SIGKILL after a grace period).
+// DES-2: "Ready" means the health endpoint answered (llama.cpp `/health`,
+//        mlx_lm `/v1/models`); until then og only polls (model download included).
+// DES-3: At most one server process exists. A replacement (model change, retry,
+//        restart) is spawned only after the previous process has exited.
+// DES-4: Exit events carry the process generation; events from a process og
+//        already stopped are ignored.
+// DES-5: Quitting the app waits for the server process to exit.
+//
+// ASSUME-1 (representation only): two models, MAXR = 2.
+spec ModelServerDesign {
+  number Model
+  number Tries
+  const MAXR = 2
+
+  enum DPhase { DOff, DSpawning, DLoading, DReady, DFailed }
+
+  state {
+    app_running: Bool,
+    enabled:  Bool,
+    phase:    DPhase,
+    model:    Model,
+    loaded:   Model,
+    failures: Tries,
+    alive:    Bool,      // the current server process is running
+    zombie:   Bool       // DES-3/DES-4: a stopped process has not exited yet
+  }
+
+  init {
+    app_running = true
+    enabled = false
+    phase = DOff
+    model = 0
+    loaded = 0
+    failures = 0
+    alive = false
+    zombie = false
+  }
+
+  def starting() = phase == DSpawning or phase == DLoading
+
+  action enable() "DES-AI-1: AI completion turned on; a server for the selected model is requested" {
+    requires app_running
+    requires not enabled
+    enabled = true
+    phase = DSpawning
+    loaded = model
+    failures = 0
+  }
+
+  action disable() "DES-1: AI completion turned off; the process group is signalled" {
+    requires enabled
+    enabled = false
+    phase = DOff
+    zombie = zombie or alive
+    alive = false
+  }
+
+  fair action spawned() "DES-3: the process is launched once no previous process is alive" {
+    requires phase == DSpawning
+    requires not zombie
+    requires not alive
+    phase = DLoading
+    alive = true
+  }
+
+  action spawn_error() "DES-AI-2: the executable could not be launched" {
+    requires phase == DSpawning
+    requires not zombie
+    requires not alive
+    requires failures < MAXR
+    failures = failures + 1
+    if failures + 1 < MAXR { phase = DSpawning } else { phase = DFailed }
+  }
+
+  fair action health_ok() "DES-2: the health endpoint answered" {
+    requires phase == DLoading
+    requires alive
+    phase = DReady
+    failures = 0
+  }
+
+  action exit_while_loading() "DES-4: the current process exited before becoming ready" {
+    requires phase == DLoading
+    requires alive
+    requires failures < MAXR
+    alive = false
+    failures = failures + 1
+    if failures + 1 < MAXR { phase = DSpawning } else { phase = DFailed }
+  }
+
+  action exit_while_ready() "DES-4: the current ready process exited unexpectedly; restart" {
+    requires phase == DReady
+    requires alive
+    alive = false
+    phase = DSpawning
+    failures = 1
+  }
+
+  fair action zombie_exit() "DES-4: a stopped process finally exits; its event is ignored" {
+    requires zombie
+    zombie = false
+  }
+
+  action retry() "DES-AI-3: the user retries after og gave up" {
+    requires enabled
+    requires phase == DFailed
+    phase = DSpawning
+    loaded = model
+    failures = 0
+  }
+
+  action select_model(m: Model) "DES-3: a new model stops the current process; the replacement waits for its exit" {
+    requires model != m
+    model = m
+    if enabled and phase != DFailed {
+      phase = DSpawning
+      loaded = m
+      failures = 0
+      zombie = zombie or alive
+      alive = false
+    }
+  }
+
+  action quit() "DES-5: quitting stops the server and waits for it to exit" {
+    requires app_running
+    app_running = false
+    enabled = false
+    phase = DOff
+    alive = false
+    zombie = false
+  }
+
+  invariant AtMostOneServer "DES-3: never two server processes at once" {
+    not (alive and zombie)
+  }
+
+  invariant AliveOnlyWhenLoadingOrReady "DES-1: a live process belongs to a loading or ready server" {
+    alive => (phase == DLoading or phase == DReady)
+  }
+
+  invariant NothingAfterQuit "DES-5: no process survives the app" {
+    not app_running => (not alive and not zombie)
+  }
+
+  invariant RunningOnlyWhenEnabled "MODEL-1: induction aid" {
+    (starting() or phase == DReady) => (enabled and app_running and loaded == model)
+  }
+
+  invariant DisabledIsOff "MODEL-2: induction aid" {
+    not enabled => phase == DOff
+  }
+
+  invariant EnabledOnlyWhileRunning "MODEL-3: induction aid" {
+    enabled => app_running
+  }
+
+  invariant BoundedRetries "MODEL-4: induction aid" {
+    failures <= MAXR
+  }
+
+  invariant LoadingIsAlive "MODEL-5: induction aid; loading and ready always have a live process" {
+    (phase == DLoading or phase == DReady) => alive
+  }
+
+  leadsTo ZombiesExit "DES-4: a stopped process always exits eventually" {
+    zombie ~> not zombie
+  }
+
+  terminal { not app_running }
+}
+
+verify {
+  values Model = 0..1
+  values Tries = 0..2
+}
