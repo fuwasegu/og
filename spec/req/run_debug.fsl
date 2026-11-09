@@ -1,0 +1,160 @@
+// og — Run / test / debug requirements
+//
+// Source: README.md ("Run Test / Bench / Run main badges next to functions, run a
+// single test or `go run .` with one click") + owner decisions D-1 (GoLand
+// equivalent) and D-4 (debugger in full scope: breakpoints, stepping, variables).
+//
+// ASSUME-1 (representation only): 2 run configurations, 3 run generations.
+// ASSUME-2 (confirmed 2026-11-09, follows D-2): starting a run autosaves all files
+//   first, so the run always sees what the editor shows. Modeled as `saved`.
+// ASSUME-3 (confirmed 2026-11-09): re-running a configuration that is still active
+//   stops the previous process first; one live process per configuration.
+// ASSUME-4 (confirmed 2026-11-09): the result view of a configuration shows only the
+//   latest run; stopping a run keeps the results reported so far.
+requirements RunDebug {
+  entity Cfg
+  number Gen
+  const MAXG = 2
+
+  enum St { Idle, Running, Paused, Done }
+
+  state {
+    saved:    Bool,                  // editor has no unsaved edits
+    st:       Map<Cfg, St>,
+    debug:    Map<Cfg, Bool>,        // current run is a debug session
+    gen:      Map<Cfg, Gen>,         // generation of the current/latest run
+    results:  Map<Cfg, Option<Gen>>, // generation the result view belongs to
+    has_bp:   Bool                   // at least one breakpoint is set
+  }
+
+  init {
+    saved = true
+    has_bp = false
+    forall c: Cfg {
+      st[c] = Idle
+      debug[c] = false
+      gen[c] = 0
+      results[c] = none
+    }
+  }
+
+  def active(c: Cfg) = st[c] == Running or st[c] == Paused
+
+  action edit() "MODEL-1: the user edits a file, leaving unsaved changes" {
+    saved = false
+  }
+
+  action toggle_breakpoint(on: Bool) "RUN-4: breakpoints can be set or cleared at any time" {
+    requires has_bp != on
+    has_bp = on
+  }
+
+  action start(c: Cfg, dbg: Bool) "RUN-1: run or debug a configuration (from the toolbar or a gutter badge); files are autosaved first (RUN-2)" {
+    requires not active(c)
+    requires gen[c] < MAXG
+    saved = true
+    st[c] = Running
+    debug[c] = dbg
+    gen[c] = gen[c] + 1
+    results[c] = none
+  }
+
+  action rerun(c: Cfg) "RUN-1: re-running an active configuration stops the old process and starts a new run (ASSUME-3)" {
+    requires active(c)
+    requires gen[c] < MAXG
+    saved = true
+    st[c] = Running
+    gen[c] = gen[c] + 1
+    results[c] = none
+  }
+
+  action exit(c: Cfg) "RUN-3: the process exits; the result view shows this run's results" {
+    requires st[c] == Running
+    st[c] = Done
+    results[c] = some(gen[c])
+  }
+
+  action stop(c: Cfg) "RUN-3: the user stops a run; results reported so far stay visible (ASSUME-4)" {
+    requires active(c)
+    st[c] = Done
+    results[c] = some(gen[c])
+  }
+
+  action hit_breakpoint(c: Cfg) "RUN-4: a debug session pauses when execution reaches a breakpoint" {
+    requires st[c] == Running
+    requires debug[c]
+    requires has_bp
+    st[c] = Paused
+  }
+
+  action step(c: Cfg) "RUN-4: step over / into / out while paused; the session pauses again on the next line" {
+    requires st[c] == Paused
+    st[c] = Paused
+  }
+
+  action resume(c: Cfg) "RUN-4: continue execution from a pause" {
+    requires st[c] == Paused
+    st[c] = Running
+  }
+
+  action inspect(c: Cfg) "RUN-4: variables and the call stack are available only while paused" {
+    requires st[c] == Paused
+    st[c] = Paused
+  }
+
+  action dismiss(c: Cfg) "MODEL-2: closing a finished run's tab returns the configuration to idle" {
+    requires st[c] == Done
+    st[c] = Idle
+  }
+
+  invariant ResultsAreLatest "RUN-3: the result view never shows results from an older run" {
+    forall c: Cfg { results[c] is some(g) => g == gen[c] }
+  }
+
+  invariant ResultsOnlyWhenFinished "RUN-3: results belong to a finished run, never to a live one" {
+    forall c: Cfg { active(c) => results[c] == none }
+  }
+
+  invariant PauseOnlyInDebug "RUN-4: only a debug session can be paused" {
+    forall c: Cfg { st[c] == Paused => debug[c] }
+  }
+
+  trans StartSaves "RUN-1: starting or re-running always leaves no unsaved edits (ASSUME-2)" {
+    forall c: Cfg { old(gen[c]) != gen[c] => saved }
+  }
+
+  acceptance AC-RUN-1 "RUN-3: a test run that exits shows its results" {
+    start(0, false) exit(0)
+    expect results[0] == some(1)
+  }
+
+  acceptance AC-RUN-2 "RUN-4: debug, pause at a breakpoint, step, inspect, continue" {
+    toggle_breakpoint(true) start(0, true) hit_breakpoint(0) step(0) inspect(0) resume(0) exit(0)
+    expect st[0] == Done
+  }
+
+  acceptance AC-RUN-3 "RUN-1: rerun replaces the active run (ASSUME-3)" {
+    start(0, false) rerun(0)
+    expect gen[0] == 2 and st[0] == Running
+  }
+
+  forbidden FB-RUN-1 "RUN-4: a plain run never pauses at a breakpoint" {
+    toggle_breakpoint(true) start(0, false) hit_breakpoint(0)
+    expect rejected
+  }
+
+  forbidden FB-RUN-2 "RUN-4: variables cannot be inspected while running" {
+    start(0, true) inspect(0)
+    expect rejected
+  }
+
+  forbidden FB-RUN-3 "RUN-1: start is not offered while the configuration is active (rerun is) (ASSUME-3)" {
+    start(0, false) start(0, false)
+    expect rejected
+  }
+}
+
+verify {
+  instances Cfg = 2
+  values Gen = 0..2
+}

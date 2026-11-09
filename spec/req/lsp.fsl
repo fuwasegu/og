@@ -1,0 +1,208 @@
+// og — Language server (gopls) requirements
+//
+// Source: README.md ("gopls starts automatically", "auto-restart with exponential
+// backoff, restoring open documents") + owner decision D-1 (GoLand equivalent).
+//
+// ASSUME-1 (representation only): document versions are a small bounded counter.
+// ASSUME-2 (representation only): one request kind stands for every request whose
+//   response carries text edits (completion, quick fix, organize imports, format).
+//   Read-only requests (hover, signature, definition, usages) cannot corrupt the
+//   buffer, so they are not modeled.
+// ASSUME-3 (confirmed 2026-11-09): there is no cap on restart attempts; the backoff
+//   interval is an implementation detail outside this layer.
+requirements Language {
+  entity File
+  number Ver
+  const MAXV = 3
+
+  enum Server { Stopped, Starting, Ready, Crashed }
+
+  state {
+    project_open: Bool,
+    server:   Server,
+    doc_open: Map<File, Bool>,          // file has an editor tab
+    ver:      Map<File, Ver>,           // editor's current document version
+    synced:   Map<File, Option<Ver>>,   // version the server knows; none = not opened on server
+    pending:  Map<File, Option<Ver>>,   // version an outstanding edit-bearing request was made against
+    diag:     Map<File, Option<Ver>>    // version of the diagnostics currently shown
+  }
+
+  init {
+    project_open = false
+    server = Stopped
+    forall f: File {
+      doc_open[f] = false
+      ver[f] = 0
+      synced[f] = none
+      pending[f] = none
+      diag[f] = none
+    }
+  }
+
+  // ---- lifecycle ----
+
+  action open_project() "LSP-6: opening a project starts gopls at the project root" {
+    requires not project_open
+    project_open = true
+    server = Starting
+  }
+
+  action close_project() "LSP-6: closing the project stops gopls" {
+    requires project_open
+    project_open = false
+    server = Stopped
+    forall f: File {
+      doc_open[f] = false
+      synced[f] = none
+      pending[f] = none
+      diag[f] = none
+    }
+  }
+
+  fair action server_ready() "LSP-6: when gopls becomes ready, every open document is (re)sent at its current version" {
+    requires server == Starting
+    server = Ready
+    forall f: File {
+      if doc_open[f] { synced[f] = some(ver[f]) } else { synced[f] = none }
+    }
+  }
+
+  action server_crash() "LSP-6: gopls may crash at any time; outstanding requests are dropped" {
+    requires server == Ready or server == Starting
+    server = Crashed
+    forall f: File {
+      synced[f] = none
+      pending[f] = none
+    }
+  }
+
+  fair action restart() "LSP-6: after a crash, gopls is restarted automatically" {
+    requires project_open
+    requires server == Crashed
+    server = Starting
+  }
+
+  // ---- document sync ----
+
+  action open_doc(f: File) "LSP-1: opening a tab sends the document to gopls when it is ready" {
+    requires project_open
+    requires not doc_open[f]
+    doc_open[f] = true
+    if server == Ready { synced[f] = some(ver[f]) }
+  }
+
+  action close_doc(f: File) "LSP-1: closing a tab closes the document on gopls and clears its diagnostics" {
+    requires doc_open[f]
+    doc_open[f] = false
+    synced[f] = none
+    pending[f] = none
+    diag[f] = none
+  }
+
+  action edit(f: File) "LSP-1: editing is never blocked by gopls state; each edit bumps the version" {
+    requires doc_open[f]
+    requires ver[f] < MAXV
+    ver[f] = ver[f] + 1
+  }
+
+  fair action sync(f: File) "LSP-1: gopls receives the latest version of every open document while ready" {
+    requires server == Ready
+    requires doc_open[f]
+    requires synced[f] != some(ver[f])
+    synced[f] = some(ver[f])
+  }
+
+  action publish_diagnostics(f: File, v: Ver) "LSP-1: diagnostics for a version gopls knows are shown unless newer ones are already shown" {
+    requires server == Ready
+    requires doc_open[f]
+    requires exists s: Ver { synced[f] == some(s) and v <= s }
+    if diag[f] == none or (exists d: Ver { diag[f] == some(d) and d <= v }) {
+      diag[f] = some(v)
+    }
+  }
+
+  // ---- edit-bearing requests ----
+
+  action request_edits(f: File) "LSP-2: the user asks for completion, a quick fix or organize imports (LSP-4, LSP-5)" {
+    requires server == Ready
+    requires doc_open[f]
+    requires synced[f] == some(ver[f])
+    requires pending[f] == none
+    pending[f] = some(ver[f])
+  }
+
+  action apply_edits(f: File) "LSP-2: edits computed against the current version are applied as a new version (LSP-4, LSP-5)" {
+    requires pending[f] == some(ver[f])
+    requires ver[f] < MAXV
+    pending[f] = none
+    ver[f] = ver[f] + 1
+  }
+
+  action discard_edits(f: File) "LSP-2: a response computed against an older version is discarded (LSP-4, LSP-5)" {
+    requires pending[f] != none
+    requires pending[f] != some(ver[f])
+    pending[f] = none
+  }
+
+  // ---- properties ----
+
+  invariant ServerFollowsProject "LSP-6: gopls runs only while a project is open" {
+    (server != Stopped) == project_open
+  }
+
+  invariant NeverAhead "LSP-1: gopls never knows a version newer than the editor" {
+    forall f: File { synced[f] is some(s) => (doc_open[f] and s <= ver[f]) }
+  }
+
+  invariant SyncOnlyWhenRunning "LSP-6: documents are known to gopls only while it is ready" {
+    forall f: File { synced[f] != none => server == Ready }
+  }
+
+  invariant DiagNotFromFuture "LSP-1: shown diagnostics never describe a version newer than the editor" {
+    forall f: File { diag[f] is some(d) => (doc_open[f] and d <= ver[f]) }
+  }
+
+  invariant PendingNotFromFuture "LSP-2: an outstanding request was made against a version the editor has had" {
+    forall f: File { pending[f] is some(p) => (doc_open[f] and p <= ver[f]) }
+  }
+
+  trans DiagMonotonic "LSP-1: shown diagnostics are never replaced by older ones" {
+    forall f: File {
+      (old(diag[f]) is some(a) and diag[f] is some(b)) => a <= b
+    }
+  }
+
+  // ---- acceptance / forbidden ----
+
+  acceptance AC-LSP-1 "LSP-6: after a crash, gopls restarts and resyncs edits made meanwhile" {
+    open_project() open_doc(0) server_ready() server_crash() edit(0) restart() server_ready()
+    expect server == Ready and synced[0] == some(1)
+  }
+
+  acceptance AC-LSP-2 "LSP-2: edits for the current version are applied" {
+    open_project() open_doc(0) server_ready() request_edits(0) apply_edits(0)
+    expect ver[0] == 1 and pending[0] == none
+  }
+
+  forbidden FB-LSP-1 "LSP-2: edits computed before the user typed again are not applied" {
+    open_project() open_doc(0) server_ready() request_edits(0) edit(0) apply_edits(0)
+    expect rejected
+  }
+
+  forbidden FB-LSP-2 "LSP-1: diagnostics for a version gopls has not seen are not shown" {
+    open_project() open_doc(0) server_ready() edit(0) publish_diagnostics(0, 1)
+    expect rejected
+  }
+
+  forbidden FB-LSP-3 "MODEL-1: requests are not sent while gopls is restarting" {
+    open_project() open_doc(0) server_ready() server_crash() request_edits(0)
+    expect rejected
+  }
+
+  terminal { not project_open }
+}
+
+verify {
+  instances File = 2
+  values Ver = 0..3
+}

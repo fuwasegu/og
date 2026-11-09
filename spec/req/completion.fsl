@@ -1,0 +1,137 @@
+// og — Inline completion requirements (local AI ghost text + Tab arbitration)
+//
+// Source: README.md — "local llama-server (Fill-in-the-Middle), never sends code
+// outside, streams ghost text at the cursor"; "Tab: expand postfix template /
+// accept AI completion (ghost text)" + owner decision D-5 (keep local AI).
+//
+// ASSUME-1 (representation only): document versions and cursor moves are folded
+//   into one bounded edit counter `ver`.
+// ASSUME-2 (confirmed 2026-11-09): when both a postfix template and ghost text are
+//   available, Tab expands the postfix template and drops the ghost text.
+// ASSUME-3 (confirmed 2026-11-09): if the local server is not reachable, the feature
+//   is silently unavailable; the editor behaves as if no suggestion exists.
+requirements Completion {
+  number Ver
+  const MAXV = 3
+
+  enum Endpoint { Local, Remote }
+
+  state {
+    server_up: Bool,
+    ver:       Ver,            // bumps on every edit or cursor move
+    pending:   Option<Ver>,    // a request is streaming for this version
+    ghost:     Option<Ver>,    // ghost text shown, computed for this version
+    postfix:   Bool,           // a postfix template matches at the cursor
+    sent_remote: Bool          // MODEL-1: ghost — code was ever sent off-machine
+  }
+
+  init {
+    server_up = true
+    ver = 0
+    pending = none
+    ghost = none
+    postfix = false
+    sent_remote = false
+  }
+
+  action server_down() "GO-5: the local completion server stops; outstanding requests end (ASSUME-3)" {
+    requires server_up
+    server_up = false
+    pending = none
+  }
+
+  action server_back() "GO-5: the local completion server becomes reachable again (ASSUME-3)" {
+    requires not server_up
+    server_up = true
+  }
+
+  action request(to: Endpoint) "GO-5: after typing pauses, a completion request is sent only to the local server" {
+    requires server_up
+    requires pending == none
+    requires ghost == none
+    requires to == Local
+    pending = some(ver)
+    sent_remote = sent_remote or to == Remote
+  }
+
+  action stream() "GO-5: streamed tokens are shown as ghost text only if the document has not changed" {
+    requires pending == some(ver)
+    pending = none
+    ghost = some(ver)
+  }
+
+  action drop_stale() "GO-5: a response for an older version is discarded" {
+    requires pending != none
+    requires pending != some(ver)
+    pending = none
+  }
+
+  action edit(match: Bool) "GO-5: typing or moving the cursor hides the ghost text" {
+    requires ver < MAXV
+    ver = ver + 1
+    ghost = none
+    postfix = match
+  }
+
+  action tab_accept() "GO-5: Tab inserts the ghost text when no postfix template applies" {
+    requires ghost == some(ver)
+    requires not postfix
+    requires ver < MAXV
+    ghost = none
+    ver = ver + 1
+  }
+
+  action tab_postfix() "GO-1: Tab expands a matching postfix template and drops any ghost text (ASSUME-2)" {
+    requires postfix
+    requires ver < MAXV
+    postfix = false
+    ghost = none
+    ver = ver + 1
+  }
+
+  action escape() "GO-5: Esc dismisses the ghost text" {
+    requires ghost != none
+    ghost = none
+  }
+
+  invariant GhostIsCurrent "GO-5: ghost text on screen was always computed for the current document" {
+    ghost == none or ghost == some(ver)
+  }
+
+  invariant NeverLeavesMachine "GO-5: code is never sent to a non-local endpoint" {
+    not sent_remote
+  }
+
+  invariant PendingNotFromFuture "MODEL-2: an outstanding request was made against a version the editor has had" {
+    pending is some(p) => p <= ver
+  }
+
+  acceptance AC-CMP-1 "GO-5: request, stream, Tab inserts the suggestion" {
+    request(Local) stream() tab_accept()
+    expect ver == 1 and ghost == none
+  }
+
+  acceptance AC-CMP-2 "GO-1: postfix wins over ghost text (ASSUME-2)" {
+    edit(true) request(Local) stream() tab_postfix()
+    expect ghost == none and not postfix
+  }
+
+  forbidden FB-CMP-1 "GO-5: a suggestion that arrives after the user typed is not shown" {
+    request(Local) edit(false) stream()
+    expect rejected
+  }
+
+  forbidden FB-CMP-2 "GO-5: requests to a remote endpoint are refused" {
+    request(Remote)
+    expect rejected
+  }
+
+  forbidden FB-CMP-3 "GO-1: Tab does not accept ghost text while a postfix template matches (ASSUME-2)" {
+    edit(true) request(Local) stream() tab_accept()
+    expect rejected
+  }
+}
+
+verify {
+  values Ver = 0..3
+}

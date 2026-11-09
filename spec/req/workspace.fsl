@@ -1,0 +1,266 @@
+// og — Workspace requirements (project, file tree, tabs, save, external changes)
+//
+// Source: README.md + owner decisions in the 2026-11-09 rebuild session.
+//   D-1: Scope is "GoLand equivalent".
+//   D-2: Save model is GoLand-style autosave (on focus loss / tab switch / idle,
+//        plus explicit Cmd-S). No "save changes?" prompt on close or quit.
+//   D-3: External change to an open file: reload silently if the buffer has no
+//        unsaved edits; otherwise show a conflict and let the user choose.
+//
+// ASSUME-1 (representation only): file content is abstracted to a small finite
+//   value; "edit" means the buffer now holds a value the user typed.
+// ASSUME-2 (representation only): 2 files, 3 content values are enough to show
+//   every interleaving of edit / autosave / external change / close.
+// ASSUME-3 (confirmed 2026-11-09): closing the project or quitting is blocked while
+//   any file is in conflict; the user must resolve the conflict first.
+// ASSUME-4 (confirmed 2026-11-09): rename / move in the tree keep the open tab and
+//   its buffer; they do not change save state, so they are not modeled here.
+requirements Workspace {
+  entity File
+  number Content
+
+  state {
+    project_open: Bool,
+    on_disk:Map<File, Bool>,      // file is present on disk inside the project
+    disk:     Map<File, Content>,   // content on disk
+    open:     Map<File, Bool>,      // file has an editor tab
+    buf:      Map<File, Content>,   // content shown in the tab
+    dirty:    Map<File, Bool>,      // tab has edits not yet written to disk
+    conflict: Map<File, Bool>,      // disk changed externally while tab was dirty
+    focused:  Option<File>,         // active tab
+    // MODEL: ghost — last content the user typed that is neither saved nor
+    // explicitly discarded by the user. Used only to state "no silent loss".
+    typed:    Map<File, Option<Content>>
+  }
+
+  init {
+    project_open = false
+    focused = none
+    forall f: File {
+      on_disk[f] = true
+      disk[f] = 0
+      open[f] = false
+      buf[f] = 0
+      dirty[f] = false
+      conflict[f] = false
+      typed[f] = none
+    }
+  }
+
+  // ---- WS: project ----
+
+  action open_project() "WS-1: the user opens a folder as a project" {
+    requires not project_open
+    project_open = true
+  }
+
+  action close_project() "WS-1: closing the project autosaves every dirty tab and closes all tabs (ED-2)" {
+    requires project_open
+    requires forall f: File { not conflict[f] }   // ASSUME-3
+    project_open = false
+    focused = none
+    forall f: File {
+      if dirty[f] { disk[f] = buf[f] }
+      open[f] = false
+      dirty[f] = false
+      typed[f] = none
+    }
+  }
+
+  // ---- FT: file tree ----
+
+  action create_file(f: File) "FT-2: the user creates a file from the tree; it opens in a new focused tab" {
+    requires project_open
+    requires not on_disk[f]
+    on_disk[f] = true
+    disk[f] = 0
+    open[f] = true
+    buf[f] = 0
+    dirty[f] = false
+    conflict[f] = false
+    focused = some(f)
+  }
+
+  action delete_file(f: File) "FT-2: the user deletes a file from the tree; its tab closes" {
+    requires project_open
+    requires on_disk[f]
+    on_disk[f] = false
+    open[f] = false
+    dirty[f] = false
+    conflict[f] = false
+    typed[f] = none                // explicit user decision to discard
+    if focused == some(f) { focused = none }
+  }
+
+  // ---- ED: tabs and editing ----
+
+  action open_tab(f: File) "ED-1: opening a file from the tree shows its disk content in a focused tab" {
+    requires project_open
+    requires on_disk[f]
+    requires not open[f]
+    open[f] = true
+    buf[f] = disk[f]
+    dirty[f] = false
+    conflict[f] = false
+    focused = some(f)
+  }
+
+  action switch_tab(f: File) "ED-1: switching tabs autosaves the tab being left (ED-2)" {
+    requires project_open
+    requires open[f]
+    requires focused != some(f)
+    focused = some(f)
+    forall g: File {
+      if focused == some(g) and dirty[g] and not conflict[g] {
+        disk[g] = buf[g]
+        dirty[g] = false
+        typed[g] = none
+      }
+    }
+  }
+
+  action edit(f: File, c: Content) "ED-3: the user edits the focused tab; it becomes dirty" {
+    requires project_open
+    requires focused == some(f)
+    requires buf[f] != c
+    buf[f] = c
+    dirty[f] = true
+    typed[f] = some(c)
+  }
+
+  action save(f: File) "ED-2: Cmd-S writes the focused tab to disk" {
+    requires project_open
+    requires focused == some(f)
+    requires dirty[f]
+    requires not conflict[f]
+    disk[f] = buf[f]
+    dirty[f] = false
+    typed[f] = none
+  }
+
+  action autosave() "ED-2: on focus loss or idle, every dirty tab without a conflict is written to disk" {
+    requires project_open
+    requires exists f: File { dirty[f] and not conflict[f] }
+    forall f: File {
+      if dirty[f] and not conflict[f] {
+        disk[f] = buf[f]
+        dirty[f] = false
+        typed[f] = none
+      }
+    }
+  }
+
+  action close_tab(f: File) "ED-1: closing a tab autosaves it first; no prompt (ED-2)" {
+    requires project_open
+    requires open[f]
+    requires not conflict[f]
+    if dirty[f] { disk[f] = buf[f] }
+    open[f] = false
+    dirty[f] = false
+    typed[f] = none
+    if focused == some(f) { focused = none }
+  }
+
+  // ---- ED-6: external changes ----
+
+  action external_change(f: File, c: Content) "ED-6: another process rewrites a file; a clean tab reloads, a dirty tab enters conflict" {
+    requires project_open
+    requires on_disk[f]
+    requires disk[f] != c
+    disk[f] = c
+    if open[f] and not dirty[f] { buf[f] = c }
+    if open[f] and dirty[f] { conflict[f] = true }
+  }
+
+  action keep_mine(f: File) "ED-6: in a conflict, the user keeps the buffer and overwrites disk" {
+    requires conflict[f]
+    disk[f] = buf[f]
+    dirty[f] = false
+    conflict[f] = false
+    typed[f] = none
+  }
+
+  action take_disk(f: File) "ED-6: in a conflict, the user discards the buffer and reloads disk" {
+    requires conflict[f]
+    buf[f] = disk[f]
+    dirty[f] = false
+    conflict[f] = false
+    typed[f] = none                // explicit user decision to discard
+  }
+
+  // ---- Properties ----
+
+  invariant NoSilentLoss "ED-2: an edit the user typed is never lost unless the user explicitly discards it" {
+    forall f: File {
+      typed[f] is some(c) => ((open[f] and buf[f] == c) or disk[f] == c)
+    }
+  }
+
+  invariant DirtyMeansTyped "ED-2: a dirty tab always holds content the user typed" {
+    forall f: File { dirty[f] => (open[f] and typed[f] == some(buf[f])) }
+  }
+
+  invariant CleanTabMatchesDisk "ED-6: a tab without unsaved edits shows exactly what is on disk" {
+    forall f: File { (open[f] and not dirty[f]) => buf[f] == disk[f] }
+  }
+
+  invariant ConflictOnlyWhenDirty "ED-6: a conflict exists only on an open, dirty tab" {
+    forall f: File { conflict[f] => (open[f] and dirty[f]) }
+  }
+
+  invariant TabsOnlyInProject "WS-1: tabs exist only for existing files in an open project" {
+    forall f: File { open[f] => (project_open and on_disk[f]) }
+  }
+
+  invariant FocusIsOpenTab "ED-1: the focused tab is always an open tab" {
+    focused is some(f) => open[f]
+  }
+
+  invariant TypedOnlyWhenDirty "MODEL-1: induction aid; pending typed content exists exactly while the tab is dirty" {
+    forall f: File { typed[f] != none => dirty[f] }
+  }
+
+  // ---- Acceptance / forbidden ----
+
+  acceptance AC-WS-1 "ED-2: edit then switch tab autosaves the first file" {
+    open_project() open_tab(0) open_tab(1) switch_tab(0) edit(0, 1) switch_tab(1)
+    expect disk[0] == 1 and not dirty[0]
+  }
+
+  acceptance AC-WS-2 "ED-6: an external change reloads a clean tab silently" {
+    open_project() open_tab(0) external_change(0, 2)
+    expect buf[0] == 2 and not conflict[0]
+  }
+
+  acceptance AC-WS-3 "ED-6: an external change on a dirty tab raises a conflict, keep_mine wins" {
+    open_project() open_tab(0) edit(0, 1) external_change(0, 2) keep_mine(0)
+    expect disk[0] == 1 and not conflict[0]
+  }
+
+  acceptance AC-WS-4 "WS-1: closing the project saves pending edits (ED-2)" {
+    open_project() open_tab(0) edit(0, 2) close_project()
+    expect disk[0] == 2
+  }
+
+  forbidden FB-WS-1 "ED-6: autosave must not overwrite an external change while in conflict" {
+    open_project() open_tab(0) edit(0, 1) external_change(0, 2) save(0)
+    expect rejected
+  }
+
+  forbidden FB-WS-2 "ED-6: a conflicting tab cannot be closed without resolving it (ASSUME-3)" {
+    open_project() open_tab(0) edit(0, 1) external_change(0, 2) close_tab(0)
+    expect rejected
+  }
+
+  forbidden FB-WS-3 "ED-3: a file cannot be edited unless its tab is focused" {
+    open_project() open_tab(0) open_tab(1) edit(0, 1)
+    expect rejected
+  }
+
+  terminal { not project_open }
+}
+
+verify {
+  instances File = 2
+  values Content = 0..2
+}
