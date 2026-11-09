@@ -25,12 +25,22 @@ final class CodeTextView: NSTextView {
             Theme.debugLine.setFill()
             NSRect(x: 0, y: r.minY, width: bounds.width, height: r.height).fill()
         }
+        _ = (lm, tc)
+        guard let rectLine = currentLineRect() else { return }
+        currentLineColor.setFill()
+        rectLine.intersection(rect).fill()
+    }
+
+    /// Full-width rect of the caret's line (nil while a range is selected).
+    func currentLineRect() -> NSRect? {
+        guard let lm = layoutManager else { return nil }
         let sel = selectedRange()
-        guard sel.length == 0 else { return }
-        let length = (string as NSString).length
+        guard sel.length == 0 else { return nil }
+        let ns = string as NSString
+        let length = ns.length
         let caret = min(sel.location, length)
         var rectLine: NSRect
-        if length == 0 || (caret == length && (string as NSString).character(at: length - 1) == 10) {
+        if length == 0 || (caret == length && ns.character(at: length - 1) == 10) {
             rectLine = lm.extraLineFragmentRect
         } else {
             let glyph = lm.glyphIndexForCharacter(at: min(caret, max(0, length - 1)))
@@ -40,9 +50,7 @@ final class CodeTextView: NSTextView {
         rectLine.origin.x = 0
         rectLine.origin.y += textContainerOrigin.y
         rectLine.size.width = bounds.width
-        _ = tc
-        currentLineColor.setFill()
-        rectLine.intersection(rect).fill()
+        return rectLine
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -76,9 +84,12 @@ final class CodeTextView: NSTextView {
         }
     }
 
+    /// Cached line index of the buffer (owned by the document).
+    var lineIndex: TextLines { controller?.document.lines ?? TextLines(nsString: string as NSString) }
+
     func lineRect(forLine line: Int) -> NSRect? {
         guard let lm = layoutManager else { return nil }
-        let lines = TextLines(nsString: string as NSString)
+        let lines = lineIndex
         guard line >= 0, line < lines.lineCount else { return nil }
         let r = lines.lineRange(line)
         if r.location >= (string as NSString).length {
@@ -93,8 +104,11 @@ final class CodeTextView: NSTextView {
     }
 
     override func setSelectedRanges(_ ranges: [NSValue], affinity: NSSelectionAffinity, stillSelecting: Bool) {
+        let before = currentLineRect()
         super.setSelectedRanges(ranges, affinity: affinity, stillSelecting: stillSelecting)
-        needsDisplay = true
+        // Repaint only the old and new current-line bands, not the whole view.
+        if let before { setNeedsDisplay(before) }
+        if let after = currentLineRect() { setNeedsDisplay(after) }
         if !stillSelecting { controller?.selectionDidChange() }
     }
 
@@ -140,7 +154,7 @@ final class CodeTextView: NSTextView {
         }
         // Dedent a lone closing brace.
         if s == "}" && sel.length == 0 {
-            let lines = TextLines(nsString: ns)
+            let lines = lineIndex
             let line = lines.line(forOffset: sel.location)
             let lr = lines.lineRange(line)
             let before = ns.substring(with: NSRange(location: lr.location, length: sel.location - lr.location))
@@ -184,7 +198,7 @@ final class CodeTextView: NSTextView {
     override func insertNewline(_ sender: Any?) {
         let ns = string as NSString
         let sel = selectedRange()
-        let lines = TextLines(nsString: ns)
+        let lines = lineIndex
         let line = lines.line(forOffset: sel.location)
         let lr = lines.lineRange(line)
         let lineText = ns.substring(with: lr)
@@ -221,7 +235,7 @@ final class CodeTextView: NSTextView {
             let c = ns.character(at: i)
             if c == 125 { depth += 1 } else if c == 123 {
                 if depth == 0 {
-                    let lines = TextLines(nsString: ns)
+                    let lines = lineIndex
                     let t = lines.lineText(lines.line(forOffset: i))
                     return String(t.prefix { $0 == " " || $0 == "\t" })
                 }
@@ -244,7 +258,7 @@ final class CodeTextView: NSTextView {
 
     private func selectedLineRange() -> (range: NSRange, lines: TextLines, first: Int, last: Int) {
         let ns = string as NSString
-        let lines = TextLines(nsString: ns)
+        let lines = lineIndex
         let sel = selectedRange()
         let first = lines.line(forOffset: sel.location)
         var endOffset = NSMaxRange(sel)
@@ -302,8 +316,8 @@ final class CodeTextView: NSTextView {
         insertReplacing(info.range, with: newBlock, caret: info.range.location, selectLength: 0)
         if sel.length == 0 {
             // Move to next line like GoLand.
-            let nextLine = min(info.last + 1, TextLines(nsString: string as NSString).lineCount - 1)
-            let lines2 = TextLines(nsString: string as NSString)
+            let nextLine = min(info.last + 1, lineIndex.lineCount - 1)
+            let lines2 = lineIndex
             let r = lines2.lineRange(nextLine)
             setSelectedRange(NSRange(location: min(r.location + (sel.location - info.range.location), NSMaxRange(r)), length: 0))
         } else {

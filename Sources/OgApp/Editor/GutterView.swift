@@ -26,8 +26,7 @@ final class GutterView: NSRulerView {
         guard let editor, let tv = editor.textView as CodeTextView?, let lm = tv.layoutManager, let tc = tv.textContainer else { return }
         Theme.gutterBackground.setFill()
         bounds.fill()
-        let ns = tv.string as NSString
-        let lines = TextLines(nsString: ns)
+        let lines = editor.document.lines
         let visible = scrollView?.contentView.bounds ?? bounds
         let glyphRange = lm.glyphRange(forBoundingRect: visible, in: tc)
         let charRange = lm.characterRange(forGlyphRange: glyphRange, actualGlyphRange: nil)
@@ -130,7 +129,7 @@ final class GutterView: NSRulerView {
         let tv = editor.textView
         let tvPoint = tv.convert(NSPoint(x: 10, y: p.y), from: self)
         let idx = tv.characterIndexForInsertion(at: tvPoint)
-        let line = TextLines(nsString: tv.string as NSString).line(forOffset: idx)
+        let line = editor.document.lines.line(forOffset: idx)
         if p.x >= 42, let req = runTargets[line] {
             let menu = NSMenu()
             let run = NSMenuItem(title: "Run \(req.title)", action: #selector(runItem(_:)), keyEquivalent: "")

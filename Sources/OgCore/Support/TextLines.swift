@@ -12,7 +12,8 @@ public struct TextLines: @unchecked Sendable {  // `text` is an immutable copy
     }
 
     public init(nsString: NSString) {
-        self.text = NSString(string: nsString as String)
+        // One memcpy-style copy; avoids bridging through a Swift String.
+        self.text = (nsString.copy() as? NSString) ?? NSString(string: nsString as String)
         var starts = [0]
         let length = nsString.length
         var i = 0

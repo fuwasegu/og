@@ -9,7 +9,11 @@ final class Document {
     /// LSP document version; bumps on every edit.
     private(set) var version = 1
     /// DES-2: disk content as last read, written, or reported by FSEvents.
-    var known: String
+    var known: String { didSet { knownNS = NSString(string: known) } }
+    /// `known` as a real NSString, so the dirty check is a memcmp instead of a Unicode-aware Swift compare.
+    private var knownNS: NSString
+    /// Line index of the current buffer, rebuilt at most once per edit.
+    private var linesCache: TextLines?
     private(set) var dirty = false
     /// Disk changed externally while the buffer had unsaved edits.
     var conflict = false
@@ -25,13 +29,30 @@ final class Document {
     init(url: URL, text: String) {
         self.url = url
         self.known = text
+        self.knownNS = NSString(string: text)
         self.storage = NSTextStorage(string: text)
     }
 
+    /// The buffer's line index (UTF-16). Cached; invalidated synchronously on every storage edit.
+    var lines: TextLines {
+        if let c = linesCache { return c }
+        let l = TextLines(nsString: storage.string as NSString)
+        linesCache = l
+        return l
+    }
+
+    /// Called from the storage delegate as soon as characters change.
+    func storageDidChange() { linesCache = nil }
+
+    private var differsFromDisk: Bool {
+        storage.length != knownNS.length || !(storage.string as NSString).isEqual(knownNS)
+    }
+
     func markEdited() {
+        linesCache = nil
         version += 1
         let wasDirty = dirty
-        dirty = storage.string != known
+        dirty = differsFromDisk
         if !dirty { saveError = nil }
         for cb in onChange { cb(self) }
         if wasDirty != dirty { notifyState() }
@@ -39,7 +60,7 @@ final class Document {
 
     func markSaved(_ text: String) {
         known = text
-        dirty = storage.string != known
+        dirty = differsFromDisk
         saveError = nil
         conflict = false
         notifyState()
@@ -156,8 +177,9 @@ final class DocumentStore {
         guard !doc.conflict else { return false }
         guard doc.dirty || doc.saveError != nil else { return true }
         let snapshot = doc.text
-        let diskNow = (try? Data(contentsOf: doc.url)).flatMap { String(data: $0, encoding: .utf8) }
-        if let diskNow, diskNow != doc.known {
+        // Byte compare first (memcmp); decode only when the disk really differs.
+        let diskData = try? Data(contentsOf: doc.url)
+        if let diskData, diskData != Data(doc.known.utf8), let diskNow = String(data: diskData, encoding: .utf8) {
             // The disk changed behind our back: abort and let the change surface (DES-2).
             externalChange(doc, disk: diskNow)
             return false
@@ -221,8 +243,9 @@ final class DocumentStore {
             let url = URL(fileURLWithPath: path).standardizedFileURL
             if url.pathExtension == "go" { changedURIs.append(url.lspURI) }
             guard let doc = documents[url] else { continue }
-            guard let data = try? Data(contentsOf: url), let disk = String(data: data, encoding: .utf8) else { continue }
-            if disk == doc.known { continue } // DES-3 echo of our own write
+            guard let data = try? Data(contentsOf: url) else { continue }
+            if data == Data(doc.known.utf8) { continue } // DES-3 echo of our own write
+            guard let disk = String(data: data, encoding: .utf8) else { continue }
             externalChange(doc, disk: disk)
         }
         if let ctx = context, !changedURIs.isEmpty {

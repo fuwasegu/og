@@ -78,7 +78,91 @@ enum DebugDriver {
         case "caret":
             let a = arg.split(separator: " ").compactMap { Int($0) }
             guard a.count == 2, let ed = project?.editorArea.current else { return }
+            let t0 = Date()
             ed.reveal(line: a[0] - 1, column: a[1] - 1, length: 0)
+            ed.textView.window?.displayIfNeeded()
+            print(String(format: "caret %d: %.1fms", a[0], Date().timeIntervalSince(t0) * 1000))
+        case "complbench":
+            // complbench TEXT: type TEXT, then report how long until the completion popup is visible.
+            guard let ed = project?.editorArea.current else { return }
+            let tv = ed.textView
+            ed.completion?.close()
+            for ch in arg { tv.insertText(String(ch), replacementRange: tv.selectedRange()) }
+            let t0 = Date()
+            Task { @MainActor in
+                while ed.completion?.isVisible != true, Date().timeIntervalSince(t0) < 3 { try? await Task.sleep(nanoseconds: 2_000_000) }
+                print(ed.completion?.isVisible == true ? "completion after \(Int(Date().timeIntervalSince(t0) * 1000)) ms" : "completion: none")
+            }
+        case "scrollbench":
+            // scrollbench N: scroll N frames of 60 px and report per-frame cost (scroll + display).
+            guard let ed = project?.editorArea.current, let window = ed.textView.window else { return }
+            let n = Int(arg) ?? 200
+            let clip = ed.scrollView.contentView
+            var costs: [Double] = []
+            for _ in 0..<n {
+                let t0 = Date()
+                clip.scroll(to: NSPoint(x: clip.bounds.origin.x, y: clip.bounds.origin.y + 60))
+                ed.scrollView.reflectScrolledClipView(clip)
+                window.displayIfNeeded()
+                costs.append(Date().timeIntervalSince(t0) * 1000)
+            }
+            costs.sort()
+            print(String(format: "scroll frames=%d p50=%.2fms p95=%.2fms max=%.2fms", n, costs[n / 2], costs[n * 95 / 100], costs[n - 1]))
+        case "openbench":
+            let t0 = Date()
+            project?.context.open(URL(fileURLWithPath: arg))
+            project?.window?.displayIfNeeded()
+            print(String(format: "open %.1fms", Date().timeIntervalSince(t0) * 1000))
+        case "keybench":
+            // keybench down|up N: move the caret N times and report per-move cost (move + display).
+            guard let ed = project?.editorArea.current, let window = ed.textView.window else { return }
+            let parts = arg.split(separator: " ")
+            let n = parts.count > 1 ? Int(parts[1]) ?? 200 : 200
+            var costs: [Double] = []
+            for _ in 0..<n {
+                let t0 = Date()
+                if parts.first == "up" { ed.textView.moveUp(nil) } else { ed.textView.moveDown(nil) }
+                window.displayIfNeeded()
+                costs.append(Date().timeIntervalSince(t0) * 1000)
+            }
+            costs.sort()
+            print(String(format: "keys=%d p50=%.2fms p95=%.2fms max=%.2fms", n, costs[n / 2], costs[n * 95 / 100], costs[n - 1]))
+        case "bench":
+            // bench N: type N characters at the caret like a fast typist (25 ms apart) and report
+            // per-keystroke time (insert + display) and the worst main-thread stall seen meanwhile.
+            guard let ed = project?.editorArea.current, let window = ed.textView.window else { return }
+            let n = Int(arg) ?? 100
+            let tv = ed.textView
+            Task { @MainActor in
+                var costs: [Double] = []
+                var worstLag = 0.0
+                var last = Date()
+                var keyIndex = 0
+                let beat = Timer.scheduledTimer(withTimeInterval: 0.002, repeats: true) { _ in
+                    MainActor.assumeIsolated {
+                        let now = Date()
+                        let lag = now.timeIntervalSince(last) - 0.002
+                        if lag > 0.008 { print(String(format: "stall %.1fms at key %d", lag * 1000, keyIndex)) }
+                        worstLag = max(worstLag, lag)
+                        last = now
+                    }
+                }
+                let chars = Array("abc de(fg) hij\n")
+                for i in 0..<n {
+                    keyIndex = i
+                    let c = String(chars[i % chars.count])
+                    let t0 = Date()
+                    if c == "\n" { tv.insertNewline(nil) } else { tv.insertText(c, replacementRange: tv.selectedRange()) }
+                    window.displayIfNeeded()
+                    costs.append(Date().timeIntervalSince(t0) * 1000)
+                    try? await Task.sleep(nanoseconds: 25_000_000)
+                }
+                try? await Task.sleep(nanoseconds: 600_000_000)
+                beat.invalidate()
+                costs.sort()
+                func pct(_ p: Double) -> String { String(format: "%.2f", costs[min(costs.count - 1, Int(Double(costs.count) * p))]) }
+                print("bench keys=\(n) p50=\(pct(0.5))ms p95=\(pct(0.95))ms max=\(pct(1.0))ms worstStall=\(String(format: "%.1f", worstLag * 1000))ms")
+            }
         case "codeaction":
             // codeaction [title substring]: list gopls actions at the caret; apply the first match.
             guard let ed = project?.editorArea.current else { return }

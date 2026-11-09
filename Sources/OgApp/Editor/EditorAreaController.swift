@@ -255,9 +255,10 @@ extension DocumentStore {
 /// Simple tab strip.
 @MainActor
 final class TabBarView: NSView {
-    struct Tab { var title: String; var tooltip: String; var dirty: Bool; var problem: Bool; var hasErrors: Bool }
-    var tabs: [Tab] = [] { didSet { rebuild() } }
-    var selected: Int = -1 { didSet { rebuild() } }
+    struct Tab: Equatable { var title: String; var tooltip: String; var dirty: Bool; var problem: Bool; var hasErrors: Bool }
+    // Rebuilding the strip is expensive (views + constraints): only when something visible changed.
+    var tabs: [Tab] = [] { didSet { if tabs != oldValue { rebuild() } } }
+    var selected: Int = -1 { didSet { if selected != oldValue { rebuild() } } }
     var onSelect: ((Int) -> Void)?
     var onClose: ((Int) -> Void)?
     private let scroll = NSScrollView()

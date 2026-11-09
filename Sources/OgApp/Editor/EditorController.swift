@@ -12,6 +12,8 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
     private let banner = EditorBanner()
     private var bannerHeight: NSLayoutConstraint!
     private var highlightTimer: Timer?
+    /// Characters whose syntax colors are current.
+    private var highlighted = IndexSet()
     private(set) var tokens: [GoToken] = []
     private var observers: [NSObjectProtocol] = []
     var completion: CompletionPopup?
@@ -152,6 +154,10 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
 
     private func observe() {
         let nc = NotificationCenter.default
+        scrollView.contentView.postsBoundsChangedNotifications = true
+        observers.append(nc.addObserver(forName: NSView.boundsDidChangeNotification, object: scrollView.contentView, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.highlightVisibleIfNeeded() }
+        })
         observers.append(nc.addObserver(forName: .ogDiagnosticsChanged, object: context, queue: .main) { [weak self] n in
             let info = n.userInfo as? [String: any Sendable] ?? [:]
             MainActor.assumeIsolated {
@@ -181,6 +187,7 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
 
     func textStorage(_ textStorage: NSTextStorage, didProcessEditing editedMask: NSTextStorageEditActions, range editedRange: NSRange, changeInLength delta: Int) {
         guard editedMask.contains(.editedCharacters) else { return }
+        document.storageDidChange()
         // Keep base attributes on inserted text.
         textStorage.addAttributes([.font: Theme.editorFont, .foregroundColor: Theme.text], range: editedRange)
         // Keep breakpoints attached to their lines.
@@ -189,7 +196,7 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
         let lineDelta = inserted - estimateRemovedNewlines
         estimateRemovedNewlines = 0
         if lineDelta != 0 {
-            let line = TextLines(nsString: ns).line(forOffset: editedRange.location)
+            let line = document.lines.line(forOffset: editedRange.location)
             context.breakpoints.shift(document.url, from: line + 1, by: lineDelta)
         }
         DispatchQueue.main.async { [weak self] in
@@ -225,22 +232,60 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
         }
     }
 
-    /// Re-tokenizes and recolors using temporary attributes (no undo / storage edits).
+    /// Re-tokenizes, then colors only the visible window (± a couple of screens).
+    /// Scrolling colors more on demand (`highlightVisibleIfNeeded`). Temporary attributes: no undo, no storage edits.
     func rehighlight() {
-        guard let lm = textView.layoutManager else { return }
         let ns = document.storage.string as NSString
-        let full = NSRange(location: 0, length: ns.length)
         guard document.isGo, ns.length < 3_000_000 else { return }
         tokens = GoLexer.tokenize(ns)
-        lm.removeTemporaryAttribute(.foregroundColor, forCharacterRange: full)
-        for t in tokens {
-            guard let color = Theme.color(for: t.kind) else { continue }
+        highlighted = IndexSet()
+        highlightVisibleIfNeeded(force: true)
+    }
+
+    /// Characters on screen, widened by two screens on each side.
+    private var highlightWindow: NSRange {
+        guard let lm = textView.layoutManager, let tc = textView.textContainer else { return NSRange(location: 0, length: 0) }
+        var visible = textView.visibleRect
+        visible.origin.y -= visible.height * 2
+        visible.size.height *= 5
+        let glyphs = lm.glyphRange(forBoundingRect: visible, in: tc)
+        return lm.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
+    }
+
+    func highlightVisibleIfNeeded(force: Bool = false) {
+        guard document.isGo, let lm = textView.layoutManager else { return }
+        let window = highlightWindow
+        let length = document.storage.length
+        guard window.length > 0, NSMaxRange(window) <= length else { return }
+        if !force, highlighted.contains(integersIn: window.location..<NSMaxRange(window)) { return }
+        lm.removeTemporaryAttribute(.foregroundColor, forCharacterRange: window)
+        // First token that ends after the window start (tokens are sorted).
+        var lo = 0, hi = tokens.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if NSMaxRange(tokens[mid].range) <= window.location { lo = mid + 1 } else { hi = mid }
+        }
+        let end = NSMaxRange(window)
+        var i = lo
+        while i < tokens.count, tokens[i].location < end {
+            let t = tokens[i]
+            i += 1
+            guard let color = Theme.color(for: t.kind), NSMaxRange(t.range) <= length else { continue }
             lm.addTemporaryAttribute(.foregroundColor, value: color, forCharacterRange: t.range)
         }
+        highlighted.insert(integersIn: window.location..<NSMaxRange(window))
     }
 
     func isInsideStringOrComment(_ offset: Int) -> Bool {
-        tokens.contains { ($0.kind == .string || $0.kind == .comment) && offset > $0.location && offset < $0.location + $0.length }
+        // Tokens are sorted by location: binary search for the last token starting before `offset`.
+        var lo = 0, hi = tokens.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if tokens[mid].location < offset { lo = mid + 1 } else { hi = mid }
+        }
+        guard lo > 0 else { return false }
+        let t = tokens[lo - 1]
+        return (t.kind == .string || t.kind == .comment) && offset < t.location + t.length
     }
 
     // MARK: - Diagnostics
@@ -253,7 +298,7 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
         let full = NSRange(location: 0, length: ns.length)
         lm.removeTemporaryAttribute(.underlineStyle, forCharacterRange: full)
         lm.removeTemporaryAttribute(.underlineColor, forCharacterRange: full)
-        let lines = TextLines(nsString: ns)
+        let lines = document.lines
         for d in diagnostics {
             var r = lines.nsRange(for: d.range)
             if r.length == 0 {
@@ -305,7 +350,7 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
 
     func reveal(line: Int, column: Int, length: Int, select: Bool = true) {
         _ = view
-        let lines = TextLines(nsString: document.storage.string as NSString)
+        let lines = document.lines
         let offset = lines.offset(for: LSPPosition(line: line, character: column))
         let r = NSRange(location: offset, length: max(0, min(length, document.storage.length - offset)))
         if select { textView.setSelectedRange(r) }
@@ -343,11 +388,11 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
     var caretOffset: Int { textView.selectedRange().location }
 
     var caretPosition: LSPPosition {
-        TextLines(nsString: document.storage.string as NSString).position(forOffset: caretOffset)
+        document.lines.position(forOffset: caretOffset)
     }
 
     func selectionDidChange() {
-        let lines = TextLines(nsString: document.storage.string as NSString)
+        let lines = document.lines
         let p = lines.position(forOffset: caretOffset)
         context.window?.statusBar.setPosition(line: p.line + 1, column: p.character + 1, selection: textView.selectedRange().length)
         clampHorizontalScroll()
@@ -412,7 +457,7 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
         document.replaceAll(with: text)
         document.storage.setAttributes([.font: Theme.editorFont, .foregroundColor: Theme.text, .paragraphStyle: paragraphStyle()],
                                        range: NSRange(location: 0, length: document.storage.length))
-        let lines = TextLines(nsString: document.storage.string as NSString)
+        let lines = document.lines
         textView.setSelectedRange(NSRange(location: lines.offset(for: pos), length: 0))
         scrollView.contentView.scroll(to: visible)
         rehighlight()

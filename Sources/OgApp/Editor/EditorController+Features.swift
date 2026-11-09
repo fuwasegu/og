@@ -9,16 +9,17 @@ extension EditorController {
         if completion?.isVisible == true {
             if s.count == 1, let c = s.unicodeScalars.first, CharacterSet.alphanumerics.contains(c) || s == "_" {
                 completion?.refilter(text: document.storage.string as NSString, caret: caretOffset)
-                scheduleCompletion(delay: 0.12)
+                scheduleCompletion(delay: 0.08)
             } else if s == "." {
-                scheduleCompletion(delay: 0.02)
+                scheduleCompletion(delay: 0.0)
             } else {
                 completion?.close()
             }
         } else if s == "." {
-            scheduleCompletion(delay: 0.05)
+            scheduleCompletion(delay: 0.0)
         } else if s.count == 1, let c = s.unicodeScalars.first, CharacterSet.letters.contains(c) || s == "_" {
-            if !isInsideStringOrComment(caretOffset) { scheduleCompletion(delay: 0.25) }
+            // Short debounce: fast typists coalesce into one request, a pause shows the list at once.
+            if !isInsideStringOrComment(caretOffset) { scheduleCompletion(delay: 0.04) }
         }
         if s == "(" || s == "," { showSignatureHelp() }
         if s == ")" { info?.closeIf(kind: .signature) }
