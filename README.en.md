@@ -1,12 +1,26 @@
 <p align="center">
-  <img src="docs/assets/icon.png" width="120" height="120" alt="og icon">
+  <img src="docs/assets/icon.png" width="128" height="128" alt="og icon">
 </p>
 
 <h1 align="center">og</h1>
 
 <p align="center">
-  A native macOS IDE for Go — GoLand-style workflows, built with AppKit only.
+  A native macOS IDE for writing Go by hand.<br>
+  GoLand-style workflows, built with AppKit only.
 </p>
+
+<p align="center">
+  <a href="https://github.com/fuwasegu/og/releases/latest">Download</a> ·
+  <a href="README.md">日本語</a>
+</p>
+
+## Why og
+
+Letting an AI write the code is becoming the default. og goes the other way: it makes the time you spend writing Go yourself feel good.
+
+- Completion, navigation, refactoring, run, debug and Git, with GoLand's keymap.
+- Completion and warnings that steer you toward Effective Go and the Google Go Style Guide.
+- AI completion is off until you turn it on, and the model only ever runs on your Mac.
 
 ## Install
 
@@ -15,23 +29,21 @@ brew install --cask fuwasegu/tap/og
 brew install go gopls delve
 ```
 
-Requires macOS 14 or later.
+Requires macOS 14 or later. On first launch a setup assistant walks through theme, font, the Go tools and AI completion; reopen it from og ▸ Setup Assistant….
 
 ## Features
 
-- Projects: open a folder (`go.mod` / `go.work`), file tree, tabs, session restore
-- Editing: Go syntax highlighting, smart indent, bracket pairing, duplicate / move / comment lines, extend selection, IME
-- Saving: GoLand-style autosave (focus loss, tab switch, idle); `⌘S` organizes imports and runs gofmt
-- External changes: clean buffers reload silently; a buffer with unsaved edits shows a conflict bar
-- gopls: completion, diagnostics, hover, signature help, go to definition / implementation / type, find usages, quick fixes, file structure, automatic restart
-- Refactoring: rename with a diff preview, all-or-nothing apply with rollback, one-step undo
-- Run & test: gutter ▶ for `go run`, tests and benchmarks, with a test tree
-- Debugger: delve breakpoints, stepping, variables, evaluate
-- Git: tree and gutter status, commit, branch checkout / create, stash
-- Search: go to file / symbol, recent files, find and replace in files
-- Terminal: tabbed xterm-compatible terminal
-- Go helpers: postfix completion (`.err`, `.var`, `.for`, `.nn`, …; `.switch` on an enum-like type fills every case), struct tags, table-driven test generation
-- Local AI completion: og starts, supervises and stops llama.cpp (`llama-server`) or MLX (`mlx_lm.server`) itself; pick the model in Settings. Bound to 127.0.0.1 only; off by default
+- **Editing:** folders with `go.mod` / `go.work`, file tree, tabs, session restore; syntax highlighting, smart indent, bracket pairing, line commands, extend selection, IME
+- **Saving:** GoLand-style autosave; `⌘S` organizes imports and runs gofmt; clean buffers reload on external changes, edited ones show a conflict bar
+- **gopls:** completion, diagnostics, hover, signature help, go to definition / implementation / type, find usages, quick fixes, file structure, automatic restart
+- **Hover cards:** highlighted code, clickable doc links, and the constants of enum-like types
+- **Writing helpers:** `if err != nil { … }` after an error assignment (plus a `%w`-wrapping variant), `.switch` that fills every case of an enum-like type, postfix templates (`.err`, `.var`, `.for`, `.nn`, …), `// Name` doc comments, consistent receivers, `NewT` constructors, `got` / `want` and `cmp.Diff` test templates, table-driven tests, struct tags
+- **Style guidance:** naming (initialisms, getters, stutter, `ErrX` / `XError`, `-er` interfaces, `this` / `self`), `ctx` first, no `else` after `return`, doc comments, and gopls staticcheck; each warning links to its guide section
+- **Refactoring:** rename with a diff preview, all-or-nothing apply with rollback, one-step undo
+- **Run & debug:** gutter ▶ for `go run`, tests and benchmarks with a test tree; delve breakpoints, stepping, variables, evaluate
+- **Git, search, terminal:** tree and gutter status, commit, branches, stash; go to file / symbol, find and replace in files; a tabbed xterm-compatible terminal
+- **Look:** dark, light, or follow the system; any installed monospaced font
+- **Local AI completion (opt-in):** og starts, supervises and stops llama.cpp (`llama-server`) or MLX (`mlx_lm.server`) itself, bound to 127.0.0.1; pick the model in Settings
 
 The first debug session triggers macOS's "Developer Tools Access" prompt; `sudo DevToolsSecurity -enable` removes it.
 
