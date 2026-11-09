@@ -23,6 +23,7 @@ final class TerminalPanel: NSViewController {
     }
 
     private var tabs: [Tab] = []
+    private var themeObserver: Any?
     private var active: Tab?
     private let tabStrip = NSStackView()
     private let content = FocusForwardingView()
@@ -31,6 +32,16 @@ final class TerminalPanel: NSViewController {
     init(context: ProjectContext) {
         self.context = context
         super.init(nibName: nil, bundle: nil)
+        themeObserver = NotificationCenter.default.addObserver(forName: .ogThemeChanged, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                for t in self.tabs {
+                    self.style(t.terminal)
+                    t.terminal.font = Theme.editorFont
+                    t.terminal.needsDisplay = true
+                }
+            }
+        }
     }
 
     required init?(coder: NSCoder) { nil }
@@ -38,7 +49,7 @@ final class TerminalPanel: NSViewController {
     override func loadView() {
         let root = NSView()
         root.wantsLayer = true
-        root.layer?.backgroundColor = Theme.background.cgColor
+        Theme.paint(root, background: Theme.background)
 
         tabStrip.orientation = .horizontal
         tabStrip.spacing = 2
@@ -56,12 +67,12 @@ final class TerminalPanel: NSViewController {
 
         let strip = NSView()
         strip.wantsLayer = true
-        strip.layer?.backgroundColor = Theme.panelBackground.cgColor
+        Theme.paint(strip, background: Theme.panelBackground)
         tabStrip.translatesAutoresizingMaskIntoConstraints = false
         strip.addSubview(tabStrip)
 
         content.wantsLayer = true
-        content.layer?.backgroundColor = Theme.background.cgColor
+        Theme.paint(content, background: Theme.background)
         content.focusTarget = { [weak self] in self?.active?.terminal }
         emptyLabel.textColor = Theme.secondaryText
         emptyLabel.font = Theme.uiFont
@@ -218,10 +229,16 @@ final class TerminalPanel: NSViewController {
     }
 
     private func style(_ term: LocalProcessTerminalView) {
-        term.nativeBackgroundColor = Theme.background
-        term.nativeForegroundColor = Theme.text
-        term.caretColor = Theme.text
-        term.selectedTextBackgroundColor = Theme.selection
+        // SwiftTerm converts colors once: hand it the colors resolved for the current appearance.
+        func resolved(_ c: NSColor) -> NSColor {
+            var out = c
+            NSApp.effectiveAppearance.performAsCurrentDrawingAppearance { out = c.usingColorSpace(.sRGB) ?? c }
+            return out
+        }
+        term.nativeBackgroundColor = resolved(Theme.background)
+        term.nativeForegroundColor = resolved(Theme.text)
+        term.caretColor = resolved(Theme.text)
+        term.selectedTextBackgroundColor = resolved(Theme.selection)
         term.installColors(ANSIPalette.base.map { c in
             let rgb = c.usingColorSpace(.sRGB) ?? c
             return SwiftTerm.Color(red: UInt16(rgb.redComponent * 65535),
@@ -292,7 +309,7 @@ private final class TabHeaderView: NSView {
     }
     var isActive = false {
         didSet {
-            layer?.backgroundColor = (isActive ? Theme.background : NSColor.clear).cgColor
+            Theme.paint(self, background: isActive ? Theme.background : NSColor.clear)
             label.textColor = isActive ? Theme.text : Theme.secondaryText
         }
     }

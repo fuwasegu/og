@@ -80,9 +80,7 @@ extension ProjectWindowController: NSMenuItemValidation {
     @objc func ogToggleBottomPanel(_ sender: Any?) { toggleBottomPanel() }
 
     private func setFontSize(_ size: CGFloat) {
-        Theme.fontSize = max(9, min(32, size))
-        UserDefaults.standard.set(Double(Theme.fontSize), forKey: "og.fontSize")
-        for e in editorArea.editors { e.applyFontChange() }
+        Theme.setFont(family: Theme.fontFamily, size: max(9, min(32, size)))
     }
 
     @objc func ogZoomIn(_ sender: Any?) { setFontSize(Theme.fontSize + 1) }

@@ -12,8 +12,7 @@ final class WelcomeWindowController: NSWindowController, NSTableViewDataSource, 
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.isMovableByWindowBackground = true
-        window.appearance = NSAppearance(named: .darkAqua)
-        window.backgroundColor = Theme.background
+                window.backgroundColor = Theme.background
         super.init(window: window)
         build()
         window.center()
@@ -33,7 +32,7 @@ final class WelcomeWindowController: NSWindowController, NSTableViewDataSource, 
 
         let left = NSView()
         left.wantsLayer = true
-        left.layer?.backgroundColor = Theme.sidebarBackground.cgColor
+        Theme.paint(left, background: Theme.sidebarBackground)
         let icon = NSImageView(image: NSApp.applicationIconImage ?? NSImage())
         icon.imageScaling = .scaleProportionallyUpOrDown
         let title = NSTextField(labelWithString: "og")

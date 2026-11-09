@@ -24,7 +24,7 @@ final class EditorAreaController: NSViewController {
     override func loadView() {
         let root = NSView()
         root.wantsLayer = true
-        root.layer?.backgroundColor = Theme.background.cgColor
+        Theme.paint(root, background: Theme.background)
         tabBar.onSelect = { [weak self] i in self?.select(index: i) }
         tabBar.onClose = { [weak self] i in self?.closeTab(index: i) }
         empty.stringValue = "Go to File  ⇧⌘O\nFind in Files  ⇧⌘F\nRecent Files  ⌘E\nTerminal  ⌥F12"
@@ -267,7 +267,7 @@ final class TabBarView: NSView {
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
-        layer?.backgroundColor = Theme.sidebarBackground.cgColor
+        Theme.paint(self, background: Theme.sidebarBackground)
         stack.orientation = .horizontal
         stack.spacing = 0
         stack.alignment = .centerY
@@ -338,7 +338,7 @@ final class TabItemView: NSView {
         selectedTab = selected
         super.init(frame: .zero)
         wantsLayer = true
-        layer?.backgroundColor = (selected ? Theme.background : Theme.sidebarBackground).cgColor
+        Theme.paint(self, background: selected ? Theme.background : Theme.sidebarBackground)
         toolTip = tab.tooltip
         let icon = NSImageView(image: NSImage(systemSymbolName: tab.title.hasSuffix(".go") ? "chevron.left.forwardslash.chevron.right" : "doc.text", accessibilityDescription: nil) ?? NSImage())
         icon.contentTintColor = tab.title.hasSuffix(".go") ? NSColor(srgbRed: 0.0, green: 0.68, blue: 0.85, alpha: 1) : Theme.secondaryText
@@ -367,7 +367,7 @@ final class TabItemView: NSView {
         if selected {
             let bar = NSView()
             bar.wantsLayer = true
-            bar.layer?.backgroundColor = Theme.accent.cgColor
+            Theme.paint(bar, background: Theme.accent)
             bar.translatesAutoresizingMaskIntoConstraints = false
             addSubview(bar)
             NSLayoutConstraint.activate([

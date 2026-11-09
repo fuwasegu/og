@@ -121,7 +121,7 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
         tv.font = Theme.editorFont
         tv.textColor = Theme.text
         tv.backgroundColor = Theme.background
-        tv.insertionPointColor = NSColor.white
+        tv.insertionPointColor = Theme.caret
         tv.selectedTextAttributes = [.backgroundColor: Theme.selection]
         tv.typingAttributes = [.font: Theme.editorFont, .foregroundColor: Theme.text, .paragraphStyle: paragraphStyle()]
         tv.textContainerInset = NSSize(width: 4, height: 6)
@@ -158,6 +158,13 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
 
     private func observe() {
         let nc = NotificationCenter.default
+        observers.append(nc.addObserver(forName: .ogThemeChanged, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.applyFontChange()
+                self.textView.needsDisplay = true
+            }
+        })
         scrollView.contentView.postsBoundsChangedNotifications = true
         observers.append(nc.addObserver(forName: NSView.boundsDidChangeNotification, object: scrollView.contentView, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.highlightVisibleIfNeeded() }
@@ -516,7 +523,7 @@ final class EditorBanner: NSView {
         wantsLayer = true
         isHidden = true
         label.font = Theme.uiFont
-        label.textColor = .white
+        label.textColor = Theme.bannerText
         label.lineBreakMode = .byTruncatingTail
         stack.orientation = .horizontal
         stack.spacing = 8
@@ -547,7 +554,7 @@ final class EditorBanner: NSView {
             b.controlSize = .small
             stack.addArrangedSubview(b)
         }
-        layer?.backgroundColor = (style == .warning ? NSColor(srgbRed: 0.45, green: 0.35, blue: 0.10, alpha: 1) : NSColor(srgbRed: 0.50, green: 0.15, blue: 0.15, alpha: 1)).cgColor
+        Theme.paint(self, background: style == .warning ? Theme.bannerWarning : Theme.bannerError)
         isHidden = false
     }
 

@@ -59,7 +59,7 @@ final class RunPanel: NSViewController, NSOutlineViewDataSource, NSOutlineViewDe
     override func loadView() {
         let root = NSView()
         root.wantsLayer = true
-        root.layer?.backgroundColor = Theme.panelBackground.cgColor
+        Theme.paint(root, background: Theme.panelBackground)
 
         configure(rerunButton, symbol: "arrow.clockwise", tip: "Rerun (⌘R)", action: #selector(rerunClicked))
         configure(stopButton, symbol: "stop.fill", tip: "Stop", action: #selector(stopClicked))

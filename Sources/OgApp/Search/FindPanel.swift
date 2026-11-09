@@ -123,7 +123,7 @@ final class FindPanel: NSViewController, NSSearchFieldDelegate, NSOutlineViewDat
     override func loadView() {
         let root = NSView()
         root.wantsLayer = true
-        root.layer?.backgroundColor = Theme.panelBackground.cgColor
+        Theme.paint(root, background: Theme.panelBackground)
 
         queryField.placeholderString = "Find in files"
         queryField.font = Theme.editorFont.withSize(12)

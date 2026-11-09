@@ -22,7 +22,7 @@ final class SidebarController: NSViewController {
     override func loadView() {
         let root = NSView()
         root.wantsLayer = true
-        root.layer?.backgroundColor = Theme.sidebarBackground.cgColor
+        Theme.paint(root, background: Theme.sidebarBackground)
         segmented.selectedSegment = 0
         segmented.target = self
         segmented.action = #selector(switchView)

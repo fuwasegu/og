@@ -55,8 +55,8 @@ final class CompletionPopup: NSObject, NSTableViewDataSource, NSTableViewDelegat
         content.wantsLayer = true
         content.layer?.cornerRadius = 6
         content.layer?.borderWidth = 1
-        content.layer?.borderColor = Theme.border.cgColor
-        content.layer?.backgroundColor = Theme.panelBackground.cgColor
+        Theme.paint(content, border: Theme.border)
+        Theme.paint(content, background: Theme.panelBackground)
         for v in [scroll, detail] {
             v.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(v)
@@ -251,8 +251,8 @@ final class InfoPopup {
         box.wantsLayer = true
         box.layer?.cornerRadius = 6
         box.layer?.borderWidth = 1
-        box.layer?.borderColor = Theme.border.cgColor
-        box.layer?.backgroundColor = Theme.panelBackground.cgColor
+        Theme.paint(box, border: Theme.border)
+        Theme.paint(box, background: Theme.panelBackground)
         text.isEditable = false
         text.isSelectable = true
         text.drawsBackground = false

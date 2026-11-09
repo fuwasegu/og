@@ -417,7 +417,7 @@ final class DebugPanel: NSViewController, NSTableViewDataSource, NSTableViewDele
     override func loadView() {
         let root = NSView()
         root.wantsLayer = true
-        root.layer?.backgroundColor = Theme.panelBackground.cgColor
+        Theme.paint(root, background: Theme.panelBackground)
 
         toolbar.translatesAutoresizingMaskIntoConstraints = false
         split.translatesAutoresizingMaskIntoConstraints = false
@@ -537,7 +537,7 @@ final class DebugPanel: NSViewController, NSTableViewDataSource, NSTableViewDele
         let consolePane = NSView()
         let fieldBox = NSView()
         fieldBox.wantsLayer = true
-        fieldBox.layer?.backgroundColor = Theme.background.cgColor
+        Theme.paint(fieldBox, background: Theme.background)
         for v in [console.scroll, fieldBox] {
             v.translatesAutoresizingMaskIntoConstraints = false
             consolePane.addSubview(v)

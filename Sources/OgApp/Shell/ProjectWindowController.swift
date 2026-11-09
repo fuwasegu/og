@@ -27,8 +27,7 @@ final class ProjectWindowController: NSWindowController, NSWindowDelegate, NSSpl
         window.title = context.root.lastPathComponent
         window.subtitle = (context.root.deletingLastPathComponent().path as NSString).abbreviatingWithTildeInPath
         window.titlebarAppearsTransparent = false
-        window.appearance = NSAppearance(named: .darkAqua)
-        window.backgroundColor = Theme.background
+                window.backgroundColor = Theme.background
         window.minSize = NSSize(width: 800, height: 500)
         window.setFrameAutosaveName("og.project.\(context.root.path)")
         window.tabbingMode = .disallowed
@@ -176,7 +175,7 @@ final class StatusBarView: NSView {
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
-        layer?.backgroundColor = Theme.panelBackground.cgColor
+        Theme.paint(self, background: Theme.panelBackground)
         for f in [gopls, message, position] {
             f.font = Theme.smallFont
             f.textColor = Theme.secondaryText

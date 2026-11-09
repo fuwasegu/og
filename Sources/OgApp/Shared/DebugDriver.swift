@@ -130,6 +130,23 @@ enum DebugDriver {
             }
             costs.sort()
             print(String(format: "keys=%d p50=%.2fms p95=%.2fms max=%.2fms", n, costs[n / 2], costs[n * 95 / 100], costs[n - 1]))
+        case "onboard":
+            // onboard <step> <png>: snapshot a setup-assistant step.
+            let parts = arg.split(separator: " ", maxSplits: 1).map(String.init)
+            guard parts.count == 2, let n = Int(parts[0]),
+                  let view = OnboardingWindowController.shared.debugRender(step: n),
+                  let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
+            view.cacheDisplay(in: view.bounds, to: rep)
+            if let png = rep.representation(using: .png, properties: [:]) { try? png.write(to: URL(fileURLWithPath: parts[1])); print("snap \(parts[1])") }
+        case "theme":
+            // theme dark|light|system
+            if let m = ThemeMode(rawValue: arg) { Theme.mode = m }
+        case "font":
+            // font <size> [family…]  ("-" = system monospaced)
+            let parts = arg.split(separator: " ", maxSplits: 1).map(String.init)
+            let size = CGFloat(Double(parts.first ?? "") ?? Double(Theme.fontSize))
+            let fam = parts.count > 1 ? (parts[1] == "-" ? nil : parts[1]) : Theme.fontFamily
+            Theme.setFont(family: fam, size: size)
         case "bench":
             // bench N: type N characters at the caret like a fast typist (25 ms apart) and report
             // per-keystroke time (insert + display) and the worst main-thread stall seen meanwhile.

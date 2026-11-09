@@ -34,6 +34,7 @@ enum MainMenu {
             item("About og", #selector(NSApplication.orderFrontStandardAboutPanel(_:)), ""),
             .separator(),
             item("Settings…", #selector(P.ogShowSettings(_:)), ","),
+            item("Setup Assistant…", #selector(AppDelegate.ogShowSetup(_:)), ""),
             .separator(),
             item("Hide og", #selector(NSApplication.hide(_:)), "h"),
             item("Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option]),

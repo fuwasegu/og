@@ -51,7 +51,7 @@ final class GitPanel: NSViewController, NSTableViewDataSource, NSTableViewDelega
     override func loadView() {
         let root = NSView()
         root.wantsLayer = true
-        root.layer?.backgroundColor = Theme.panelBackground.cgColor
+        Theme.paint(root, background: Theme.panelBackground)
 
         split.isVertical = true
         split.dividerStyle = .thin
@@ -233,7 +233,7 @@ final class GitPanel: NSViewController, NSTableViewDataSource, NSTableViewDelega
     private func separator() -> NSView {
         let v = NSView()
         v.wantsLayer = true
-        v.layer?.backgroundColor = Theme.border.cgColor
+        Theme.paint(v, background: Theme.border)
         v.translatesAutoresizingMaskIntoConstraints = false
         v.heightAnchor.constraint(equalToConstant: 1).isActive = true
         return v

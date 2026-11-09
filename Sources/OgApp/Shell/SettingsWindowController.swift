@@ -7,6 +7,9 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     static let shared = SettingsWindowController()
     private let fontSize = NSStepper()
     private let fontLabel = NSTextField(labelWithString: "")
+    private let fontFamily = NSPopUpButton()
+    private let themePopup = NSPopUpButton()
+    private let fontPreview = NSTextField(labelWithString: "")
     private let reopen = NSButton(checkboxWithTitle: "Reopen the last project on launch", target: nil, action: nil)
 
     private let aiEnabled = NSButton(checkboxWithTitle: "Enable inline AI completion (runs a local model server; code never leaves this Mac)", target: nil, action: nil)
@@ -40,6 +43,15 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         fontSize.action = #selector(fontChanged)
         reopen.target = self
         reopen.action = #selector(reopenChanged)
+        for m in ThemeMode.allCases { themePopup.addItem(withTitle: m.title) }
+        themePopup.target = self
+        themePopup.action = #selector(themeChanged)
+        fontFamily.addItem(withTitle: Self.systemMono)
+        fontFamily.menu?.addItem(.separator())
+        for f in Theme.monospacedFamilies() { fontFamily.addItem(withTitle: f) }
+        fontFamily.target = self
+        fontFamily.action = #selector(familyChanged)
+        fontPreview.stringValue = "func main() { fmt.Println(\"0O 1lI {}[]() := != <-\") }"
 
         aiEnabled.target = self
         aiEnabled.action = #selector(enabledChanged)
@@ -84,7 +96,8 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
 
         let statusRow = NSStackView(views: [status, NSView(), actionButton])
         let stack = NSStackView(views: [
-            NSStackView(views: [fontLabel, fontSize]), reopen, NSBox(),
+            row("Theme", themePopup), row("Font", fontFamily), NSStackView(views: [fontLabel, fontSize]), fontPreview,
+            reopen, NSBox(),
             aiEnabled, row("Backend", backend), row("Model", model), customRow, hint, statusRow, logScroll
         ])
         stack.orientation = .vertical
@@ -99,6 +112,9 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     private func load() {
         fontSize.doubleValue = Double(Theme.fontSize)
         fontLabel.stringValue = "Editor font size: \(Int(Theme.fontSize))"
+        themePopup.selectItem(at: ThemeMode.allCases.firstIndex(of: Theme.mode) ?? 0)
+        if let fam = Theme.fontFamily, fontFamily.itemTitles.contains(fam) { fontFamily.selectItem(withTitle: fam) } else { fontFamily.selectItem(at: 0) }
+        fontPreview.font = Theme.editorFont
         reopen.state = ((UserDefaults.standard.object(forKey: "og.reopenLast") as? Bool) ?? true) ? .on : .off
         let m = ModelServerManager.shared
         aiEnabled.state = m.enabled ? .on : .off
@@ -183,11 +199,22 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         }
     }
 
+    static let systemMono = "System Monospaced (SF Mono)"
+
     @objc private func fontChanged() {
-        Theme.fontSize = CGFloat(fontSize.doubleValue)
-        UserDefaults.standard.set(fontSize.doubleValue, forKey: "og.fontSize")
+        Theme.setFont(family: Theme.fontFamily, size: CGFloat(fontSize.doubleValue))
         fontLabel.stringValue = "Editor font size: \(Int(Theme.fontSize))"
-        if let p = AppDelegate.shared?.activeProject { for e in p.editorArea.editors { e.applyFontChange() } }
+        fontPreview.font = Theme.editorFont
+    }
+
+    @objc private func familyChanged() {
+        let title = fontFamily.titleOfSelectedItem
+        Theme.setFont(family: title == Self.systemMono ? nil : title, size: Theme.fontSize)
+        fontPreview.font = Theme.editorFont
+    }
+
+    @objc private func themeChanged() {
+        Theme.mode = ThemeMode.allCases[max(0, themePopup.indexOfSelectedItem)]
     }
 
     @objc private func reopenChanged() {

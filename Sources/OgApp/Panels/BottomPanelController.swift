@@ -59,7 +59,7 @@ final class BottomPanelController: NSViewController {
     override func loadView() {
         let root = NSView()
         root.wantsLayer = true
-        root.layer?.backgroundColor = Theme.panelBackground.cgColor
+        Theme.paint(root, background: Theme.panelBackground)
 
         tabBar.orientation = .horizontal
         tabBar.spacing = 2

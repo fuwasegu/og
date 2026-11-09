@@ -9,7 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppDelegate.shared = self
-        NSApp.appearance = NSAppearance(named: .darkAqua)
+        Theme.start()
         NSApp.mainMenu = MainMenu.build()
         _ = ToolLocator.shared
         let args = CommandLine.arguments.dropFirst().filter { !$0.hasPrefix("-") }
@@ -23,7 +23,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         DebugDriver.startIfRequested()
         ModelServerManager.shared.startIfEnabled()
+        // First launch: setup assistant on top of the welcome window (never during headless self-tests,
+        // unless OG_ONBOARDING=1 asks for it).
+        let forced = ProcessInfo.processInfo.environment["OG_ONBOARDING"] == "1"
+        if forced || (!OnboardingWindowController.isDone && !DebugDriver.isActive) {
+            OnboardingWindowController.shared.present()
+        }
     }
+
+    @objc func ogShowSetup(_ sender: Any?) { OnboardingWindowController.shared.present() }
 
     func applicationWillTerminate(_ notification: Notification) {
         ModelServerManager.shared.shutdownForQuit()

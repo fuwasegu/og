@@ -79,9 +79,9 @@ final class QuickPalette: NSObject, NSTextFieldDelegate, NSTableViewDataSource, 
 
         let root = NSView()
         root.wantsLayer = true
-        root.layer?.backgroundColor = Theme.panelBackground.cgColor
+        Theme.paint(root, background: Theme.panelBackground)
         root.layer?.cornerRadius = 10
-        root.layer?.borderColor = Theme.border.cgColor
+        Theme.paint(root, border: Theme.border)
         root.layer?.borderWidth = 1
         root.layer?.masksToBounds = true
 
@@ -107,7 +107,7 @@ final class QuickPalette: NSObject, NSTextFieldDelegate, NSTableViewDataSource, 
 
         let fieldBox = NSView()
         fieldBox.wantsLayer = true
-        fieldBox.layer?.backgroundColor = Theme.background.cgColor
+        Theme.paint(fieldBox, background: Theme.background)
         fieldBox.layer?.cornerRadius = 6
         let glass = NSImageView(image: NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil) ?? NSImage())
         glass.contentTintColor = Theme.secondaryText
