@@ -44,13 +44,28 @@ extension EditorController {
         completionTask = Task { [weak self] in
             guard let self else { return }
             await self.context.documents.flush(flushDoc)
-            guard let items = await self.context.gopls.completion(uri: uri, position: pos), !Task.isCancelled else { return }
+            guard var items = await self.context.gopls.completion(uri: uri, position: pos), !Task.isCancelled else { return }
             // Spec LSP-2: a response for an older version only refilters; it never applies stale ranges.
             let stale = self.document.version != version
+            if let err = GoErrCheck.suggestion(in: self.document.storage.string as NSString, caret: self.caretOffset) {
+                items.insert(Self.errCheckItem(err), at: 0)
+            }
             if items.isEmpty { self.completion?.close(); return }
             if self.completion == nil { self.completion = CompletionPopup(editor: self) }
             self.completion?.show(items: items, text: self.document.storage.string as NSString, caret: self.caretOffset, staleRanges: stale, explicit: explicit)
         }
+    }
+
+    /// `if err != nil { … }` as the first completion right after an error assignment.
+    static func errCheckItem(_ s: GoErrCheckSuggestion) -> LSPCompletionItem {
+        func esc(_ t: String) -> String {
+            t.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "$", with: "\\$").replacingOccurrences(of: "}", with: "\\}")
+        }
+        let ns = s.text as NSString
+        let snippet = esc(ns.substring(to: s.caretOffset)) + "$0" + esc(ns.substring(from: s.caretOffset))
+        let ret = s.text.components(separatedBy: "\n").dropFirst().first?.trimmingCharacters(in: .whitespaces) ?? ""
+        return LSPCompletionItem(label: "if \(s.variable) != nil { \(ret) }", detail: "error check", snippet: snippet,
+                                 filterText: "if", sortText: "!")
     }
 
     func acceptCompletion(_ item: LSPCompletionItem, staleRanges: Bool) {

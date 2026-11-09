@@ -123,3 +123,8 @@ func sseLine(_ content: String, stop: Bool = false) -> String {
     let data = (try? JSONSerialization.data(withJSONObject: ["content": content, "stop": stop])) ?? Data()
     return "data: " + String(decoding: data, as: UTF8.self)
 }
+
+/// GoErrCheck suggestion with the caret at the end of `src`.
+func errCheckAtEnd(_ src: String) -> GoErrCheckSuggestion? {
+    GoErrCheck.suggestion(in: src as NSString, caret: (src as NSString).length)
+}

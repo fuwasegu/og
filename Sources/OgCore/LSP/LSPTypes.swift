@@ -84,6 +84,20 @@ public struct LSPCompletionItem: Sendable, Hashable {
     public var textEdit: LSPTextEdit?
     public var additionalTextEdits: [LSPTextEdit]
 
+    /// A locally generated item (og's own suggestions).
+    public init(label: String, detail: String?, snippet: String, filterText: String, sortText: String) {
+        self.label = label
+        kind = .snippet
+        self.detail = detail
+        documentation = nil
+        self.sortText = sortText
+        self.filterText = filterText
+        insertText = snippet
+        isSnippet = true
+        textEdit = nil
+        additionalTextEdits = []
+    }
+
     public init(json: JSONValue) {
         label = json["label"]?.stringValue ?? ""
         kind = json["kind"]?.intValue.flatMap(LSPCompletionKind.init(rawValue:))
