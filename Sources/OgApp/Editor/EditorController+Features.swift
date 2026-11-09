@@ -168,26 +168,83 @@ extension EditorController {
 
     // MARK: - Hover / signature / docs
 
-    func showHover(at offset: Int, rect: NSRect) {
+    /// Mouse moved over a glyph. Timing is per identifier, not per character, so moving
+    /// inside one word does not restart the delay. The gopls request starts early (prefetch)
+    /// and the card appears after a short delay, or at once when a card is already open.
+    func hoverMoved(to offset: Int, rect: NSRect) {
         guard document.isGo, completion?.isVisible != true else { return }
+        let word = identifierRange(at: offset) ?? NSRange(location: offset, length: 1)
+        if word == hoverWord { return }
+        hoverWord = word
+        hoverTimer?.invalidate()
+        let switching = info?.isVisible == true && info?.kind == .hover
+        let started = Date()
+        let minDelay: TimeInterval = switching ? 0 : 0.3
+        // Short debounce so sweeping across many words does not flood gopls.
+        hoverTimer = Timer.scheduledTimer(withTimeInterval: switching ? 0.04 : 0.08, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.hoverWord == word else { return }
+                self.showHover(at: word.location, rect: rect, notBefore: started.addingTimeInterval(minDelay), word: word)
+            }
+        }
+    }
+
+    func hoverLeft() {
+        hoverTimer?.invalidate()
+        hoverWord = nil
+    }
+
+    private func identifierRange(at offset: Int) -> NSRange? {
+        let ns = document.storage.string as NSString
+        func isIdent(_ c: unichar) -> Bool {
+            (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c > 127
+        }
+        guard offset < ns.length, isIdent(ns.character(at: offset)) else { return nil }
+        var lo = offset, hi = offset + 1
+        while lo > 0, isIdent(ns.character(at: lo - 1)) { lo -= 1 }
+        while hi < ns.length, isIdent(ns.character(at: hi)) { hi += 1 }
+        return NSRange(location: lo, length: hi - lo)
+    }
+
+    /// gopls hover text, shared by prefetch and display; reset whenever the buffer changes.
+    private func hoverAnswer(at offset: Int) -> Task<String?, Never> {
+        if hoverCacheVersion != document.version {
+            hoverCache.removeAll()
+            hoverCacheVersion = document.version
+        }
+        if let t = hoverCache[offset] { return t }
         let lines = TextLines(nsString: document.storage.string as NSString)
         let pos = lines.position(forOffset: offset)
-        let line = pos.line
+        let uri = document.uri, doc = document, ctx = context
+        let t = Task { @MainActor () -> String? in
+            await ctx.documents.flush(doc)
+            return await ctx.gopls.hover(uri: uri, position: pos)
+        }
+        hoverCache[offset] = t
+        return t
+    }
+
+    func showHover(at offset: Int, rect: NSRect, notBefore: Date? = nil, word: NSRange? = nil) {
+        guard document.isGo, completion?.isVisible != true else { return }
+        let lines = TextLines(nsString: document.storage.string as NSString)
+        let line = lines.position(forOffset: offset).line
+        let span = word ?? NSRange(location: offset, length: 0)
         let diags = diagnostics.filter { d in
             let r = lines.nsRange(for: d.range)
-            return (r.location <= offset && offset <= NSMaxRange(r)) || (r.length == 0 && d.range.start.line == line)
+            return (r.location <= NSMaxRange(span) && offset <= NSMaxRange(r)) || (r.length == 0 && d.range.start.line == line)
         }
-        let uri = document.uri
-        let flushDoc = document
+        let answer = hoverAnswer(at: offset)
         Task { [weak self] in
+            let hover = await answer.value
+            if let notBefore, notBefore.timeIntervalSinceNow > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(notBefore.timeIntervalSinceNow * 1_000_000_000))
+            }
             guard let self else { return }
-            await self.context.documents.flush(flushDoc)
-            let hover = await self.context.gopls.hover(uri: uri, position: pos)
-            var parts: [String] = diags.map { "⚠ " + $0.message }
-            if let h = hover, !h.isEmpty { parts.append(Markdown.plain(h)) }
-            guard !parts.isEmpty else { return }
+            if let word, self.hoverWord != word { return }  // the mouse moved on
+            let card = Markdown.hoverCard(diagnostics: diags.map(\.message), markdown: hover ?? "")
+            guard card.length > 0 else { return }
             if self.info == nil { self.info = InfoPopup(editor: self) }
-            self.info?.show(text: parts.joined(separator: "\n\n"), at: rect, in: self.textView, kind: .hover)
+            self.info?.show(attributed: card, at: rect, in: self.textView, kind: .hover)
         }
     }
 
@@ -513,26 +570,130 @@ extension EditorController {
     }
 }
 
-/// Converts gopls markdown hover to readable plain text.
+/// Renders gopls hover markdown: Go code blocks are syntax highlighted, prose uses the UI font.
+@MainActor
 enum Markdown {
-    static func plain(_ md: String) -> String {
-        var out: [String] = []
-        var inCode = false
-        for line in md.components(separatedBy: "\n") {
-            if line.hasPrefix("```") { inCode.toggle(); continue }
-            var l = line
-            if !inCode {
-                l = l.replacingOccurrences(of: "\\", with: "")
-                // [text](link) -> text
-                while let open = l.range(of: "["), let mid = l.range(of: "](", range: open.upperBound..<l.endIndex),
-                      let close = l.range(of: ")", range: mid.upperBound..<l.endIndex) {
-                    let text = l[open.upperBound..<mid.lowerBound]
-                    l.replaceSubrange(open.lowerBound..<close.upperBound, with: text)
-                }
-                l = l.replacingOccurrences(of: "`", with: "").replacingOccurrences(of: "**", with: "")
-            }
-            out.append(l)
+    static func hoverCard(diagnostics: [String], markdown: String) -> NSAttributedString {
+        let out = NSMutableAttributedString()
+        let size = max(11, Theme.fontSize - 1)
+        let mono = NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
+        let prose = NSFont.systemFont(ofSize: size)
+        func gap() { if out.length > 0 { out.append(NSAttributedString(string: "\n\n", attributes: [.font: NSFont.systemFont(ofSize: 4)])) } }
+        for d in diagnostics {
+            gap()
+            out.append(NSAttributedString(string: "⚠ " + d, attributes: [.font: prose, .foregroundColor: Theme.warning]))
         }
-        return out.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        var code: [String] = []
+        var text: [String] = []
+        var inCode = false
+        func flushText() {
+            let body = text.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            text.removeAll()
+            guard !body.isEmpty else { return }
+            gap()
+            out.append(inline(body, prose: prose, mono: mono))
+        }
+        var indented: [String] = []
+        func flushIndented() {
+            let src = indented.joined(separator: "\n").trimmingCharacters(in: .newlines)
+            indented.removeAll()
+            guard !src.isEmpty else { return }
+            gap()
+            out.append(highlighted(src, font: mono))
+        }
+        for line in markdown.components(separatedBy: "\n") {
+            if line.hasPrefix("```") {
+                if inCode {
+                    let src = code.joined(separator: "\n").trimmingCharacters(in: .newlines)
+                    if !src.isEmpty { gap(); out.append(highlighted(src, font: mono)) }
+                    code.removeAll()
+                } else {
+                    flushText()
+                }
+                inCode.toggle()
+                continue
+            }
+            if inCode { code.append(line); continue }
+            // Indented block (Go doc example code) -> highlighted code.
+            if line.hasPrefix("    ") || line.hasPrefix("\t") {
+                flushText()
+                indented.append(line.hasPrefix("\t") ? String(line.dropFirst()) : String(line.dropFirst(4)))
+                continue
+            }
+            if !indented.isEmpty, line.trimmingCharacters(in: .whitespaces).isEmpty { indented.append(""); continue }
+            flushIndented()
+            if line.hasPrefix("#") {
+                flushText()
+                let title = line.drop { $0 == "#" }.trimmingCharacters(in: .whitespaces)
+                gap()
+                out.append(NSAttributedString(string: title, attributes: [.font: NSFont.boldSystemFont(ofSize: size + 1), .foregroundColor: Theme.text]))
+                continue
+            }
+            if line.trimmingCharacters(in: .whitespaces) == "---" { flushText(); continue }
+            text.append(line)
+        }
+        flushIndented()
+        flushText()
+        return out
+    }
+
+    /// Go source colored with the editor's lexer and theme.
+    static func highlighted(_ src: String, font: NSFont) -> NSAttributedString {
+        let attr = NSMutableAttributedString(string: src, attributes: [.font: font, .foregroundColor: Theme.text])
+        let ns = src as NSString
+        var qualifiedDecl = false
+        for t in GoLexer.tokenize(ns) where NSMaxRange(t.range) <= attr.length {
+            var kind = t.kind
+            // Hover signatures read `func pkg.Name(`: color Name, not pkg.
+            if kind == .funcDecl, NSMaxRange(t.range) < ns.length, ns.character(at: NSMaxRange(t.range)) == 46 {
+                qualifiedDecl = true
+                continue
+            }
+            if qualifiedDecl, kind == .function { kind = .funcDecl }
+            qualifiedDecl = false
+            if let c = Theme.color(for: kind) { attr.addAttribute(.foregroundColor, value: c, range: t.range) }
+        }
+        return attr
+    }
+
+    /// Prose with `code`, **bold**, [links](…) and backslash escapes.
+    static func inline(_ md: String, prose: NSFont, mono: NSFont) -> NSAttributedString {
+        let out = NSMutableAttributedString()
+        let base: [NSAttributedString.Key: Any] = [.font: prose, .foregroundColor: Theme.text]
+        var buf = ""
+        var bold = false
+        func emit(_ s: String, _ extra: [NSAttributedString.Key: Any] = [:]) {
+            var a = base
+            if bold { a[.font] = NSFont.boldSystemFont(ofSize: prose.pointSize) }
+            for (k, v) in extra { a[k] = v }
+            out.append(NSAttributedString(string: s, attributes: a))
+        }
+        func flush() { if !buf.isEmpty { emit(buf); buf = "" } }
+        let chars = Array(md)
+        var i = 0
+        while i < chars.count {
+            let c = chars[i]
+            if c == "\\", i + 1 < chars.count, chars[i + 1].isPunctuation || chars[i + 1].isSymbol {
+                buf.append(chars[i + 1]); i += 2; continue
+            }
+            if c == "`", let end = chars[(i + 1)...].firstIndex(of: "`") {
+                flush()
+                emit(String(chars[(i + 1)..<end]), [.font: mono, .foregroundColor: Theme.type])
+                i = end + 1; continue
+            }
+            if c == "*", i + 1 < chars.count, chars[i + 1] == "*" {
+                flush(); bold.toggle(); i += 2; continue
+            }
+            if c == "[", let mid = chars[(i + 1)...].firstIndex(of: "]"), mid + 1 < chars.count, chars[mid + 1] == "(",
+               let close = chars[(mid + 2)...].firstIndex(of: ")") {
+                flush()
+                let label = String(chars[(i + 1)..<mid]).replacingOccurrences(of: "`", with: "")
+                emit(label, [.foregroundColor: Theme.function])
+                i = close + 1; continue
+            }
+            buf.append(c); i += 1
+        }
+        flush()
+        return out
     }
 }

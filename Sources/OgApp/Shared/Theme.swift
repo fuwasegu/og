@@ -1,4 +1,5 @@
 import AppKit
+import OgCore
 
 /// Dark theme close to JetBrains Fleet / GoLand "Dark".
 @MainActor
@@ -48,4 +49,18 @@ enum Theme {
     static let gitUntracked = NSColor(srgbRed: 0.80, green: 0.45, blue: 0.40, alpha: 1)
     static let breakpoint = NSColor(srgbRed: 0.85, green: 0.25, blue: 0.25, alpha: 1)
     static let debugLine = NSColor(srgbRed: 0.18, green: 0.28, blue: 0.48, alpha: 1)
+
+    /// Foreground color for a lexer token; nil keeps the default text color.
+    static func color(for kind: GoTokenKind) -> NSColor? {
+        switch kind {
+        case .keyword, .constant: return keyword
+        case .type, .typeDecl: return type
+        case .builtin: return builtin
+        case .string: return string
+        case .number: return number
+        case .comment: return comment
+        case .funcDecl: return function
+        case .function: return nil
+        }
+    }
 }

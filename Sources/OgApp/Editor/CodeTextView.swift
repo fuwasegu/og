@@ -11,8 +11,6 @@ final class CodeTextView: NSTextView {
     var ghostLocation: Int = 0
     var currentLineColor: NSColor = Theme.currentLine
     var debugLine: Int? { didSet { needsDisplay = true } }
-    private var hoverTimer: Timer?
-    private var lastHoverOffset = -1
     private var trackingAreaRef: NSTrackingArea?
     private var selectionStack: [NSRange] = []
 
@@ -451,26 +449,16 @@ final class CodeTextView: NSTextView {
         let glyph = lm.glyphIndex(for: local, in: tc, fractionOfDistanceThroughGlyph: &fraction)
         let rect = lm.boundingRect(forGlyphRange: NSRange(location: glyph, length: 1), in: tc)
         guard rect.insetBy(dx: -1, dy: -1).contains(local) else {
-            hoverTimer?.invalidate(); lastHoverOffset = -1; return
+            controller?.hoverLeft(); return
         }
-        let offset = lm.characterIndexForGlyph(at: glyph)
-        if offset == lastHoverOffset { return }
-        lastHoverOffset = offset
-        hoverTimer?.invalidate()
-        hoverTimer = Timer.scheduledTimer(withTimeInterval: 0.6, repeats: false) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let self else { return }
-                var r = rect
-                r.origin.x += self.textContainerOrigin.x
-                r.origin.y += self.textContainerOrigin.y
-                self.controller?.showHover(at: offset, rect: r)
-            }
-        }
+        var r = rect
+        r.origin.x += textContainerOrigin.x
+        r.origin.y += textContainerOrigin.y
+        controller?.hoverMoved(to: lm.characterIndexForGlyph(at: glyph), rect: r)
     }
 
     override func mouseExited(with event: NSEvent) {
-        hoverTimer?.invalidate()
-        lastHoverOffset = -1
+        controller?.hoverLeft()
     }
 
     override func menu(for event: NSEvent) -> NSMenu? {

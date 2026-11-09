@@ -79,6 +79,20 @@ enum DebugDriver {
             let a = arg.split(separator: " ").compactMap { Int($0) }
             guard a.count == 2, let ed = project?.editorArea.current else { return }
             ed.reveal(line: a[0] - 1, column: a[1] - 1, length: 0)
+        case "hover":
+            // hover L C: simulate the mouse resting on line L, column C; prints when the card shows.
+            let a = arg.split(separator: " ").compactMap { Int($0) }
+            guard a.count == 2, let ed = project?.editorArea.current else { return }
+            ed.reveal(line: a[0] - 1, column: a[1] - 1, length: 0)
+            let off = ed.caretOffset
+            let started = Date()
+            ed.hoverMoved(to: off, rect: NSRect(x: 80, y: 200, width: 8, height: 16))
+            Task { @MainActor in
+                while ed.info?.isVisible != true, Date().timeIntervalSince(started) < 5 {
+                    try? await Task.sleep(nanoseconds: 10_000_000)
+                }
+                print(ed.info?.isVisible == true ? "hover shown after \(Int(Date().timeIntervalSince(started) * 1000)) ms" : "hover: nothing")
+            }
         case "snap":
             guard let window = project?.window, let view = window.contentView?.superview ?? window.contentView else { return }
             let bounds = view.bounds

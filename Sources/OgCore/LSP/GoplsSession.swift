@@ -413,7 +413,7 @@ public actor GoplsSession {
         "textDocument": [
             "synchronization": ["didSave": true, "dynamicRegistration": false],
             "completion": ["completionItem": ["snippetSupport": true, "documentationFormat": ["plaintext", "markdown"]], "contextSupport": true],
-            "hover": ["contentFormat": ["plaintext", "markdown"]],
+            "hover": ["contentFormat": ["markdown", "plaintext"]],
             "signatureHelp": ["signatureInformation": ["parameterInformation": ["labelOffsetSupport": true]]],
             "definition": ["linkSupport": true],
             "implementation": ["linkSupport": true],

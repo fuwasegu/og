@@ -16,6 +16,11 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
     private var observers: [NSObjectProtocol] = []
     var completion: CompletionPopup?
     var info: InfoPopup?
+    /// Hover: word under the mouse, pending timer, and per-version cache of gopls answers.
+    var hoverWord: NSRange?
+    var hoverTimer: Timer?
+    var hoverCache: [Int: Task<String?, Never>] = [:]
+    var hoverCacheVersion = -1
     var ghostTask: Task<Void, Never>?
     var ghostTimer: Timer?
     var completionTask: Task<Void, Never>?
@@ -229,20 +234,7 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
         tokens = GoLexer.tokenize(ns)
         lm.removeTemporaryAttribute(.foregroundColor, forCharacterRange: full)
         for t in tokens {
-            let color: NSColor
-            switch t.kind {
-            case .keyword: color = Theme.keyword
-            case .type: color = Theme.type
-            case .builtin: color = Theme.builtin
-            case .string: color = Theme.string
-            case .number: color = Theme.number
-            case .comment: color = Theme.comment
-            case .function: color = Theme.text
-            case .funcDecl: color = Theme.function
-            case .typeDecl: color = Theme.type
-            case .constant: color = Theme.keyword
-            }
-            if t.kind == .function { continue }
+            guard let color = Theme.color(for: t.kind) else { continue }
             lm.addTemporaryAttribute(.foregroundColor, value: color, forCharacterRange: t.range)
         }
     }

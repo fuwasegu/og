@@ -280,6 +280,10 @@ final class InfoPopup {
         present(attr, at: rect, in: view, kind: kind)
     }
 
+    func show(attributed attr: NSAttributedString, at rect: NSRect, in view: NSView, kind: Kind) {
+        present(attr, at: rect, in: view, kind: kind)
+    }
+
     func showSignature(_ sig: LSPSignatureHelp, at rect: NSRect, in view: NSView) {
         let attr = NSMutableAttributedString(string: sig.label, attributes: [
             .font: NSFont.monospacedSystemFont(ofSize: max(11, Theme.fontSize - 1), weight: .regular),
