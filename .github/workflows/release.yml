@@ -81,8 +81,13 @@ jobs:
 
           > 未署名ビルドです。手動導入時の初回起動は **右クリック → 開く**、または `xattr -dr com.apple.quarantine /Applications/og.app`。Homebrew 版は自動で検疫属性を除去します。
           NOTES
-          gh release create "$GITHUB_REF_NAME" og.app.zip \
-            --title "og $GITHUB_REF_NAME" --notes-file notes.md
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" og.app.zip --clobber
+            gh release edit "$GITHUB_REF_NAME" --title "og $GITHUB_REF_NAME" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" og.app.zip \
+              --title "og $GITHUB_REF_NAME" --notes-file notes.md
+          fi
 
   update-cask:
     needs: build

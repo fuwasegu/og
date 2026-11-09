@@ -50,14 +50,14 @@ fi
 # Gate 2: Swift 6 Strict Concurrency Debug Build
 # ---------------------------------------------------------
 echo "▶ [Gate 2/4] Building Debug targets (Swift 6 StrictConcurrency)..."
-swift build --disable-sandbox "${TEST_FLAGS[@]}"
+swift build --disable-sandbox ${TEST_FLAGS[@]+"${TEST_FLAGS[@]}"}
 echo "✅ Gate 2 passed: Debug build clean."
 
 # ---------------------------------------------------------
 # Gate 3: Unit, Deterministic Fuzzing & Performance SLA Suite
 # ---------------------------------------------------------
 echo "▶ [Gate 3/4] Running Unit + Fuzz + Performance SLA tests..."
-swift test --disable-sandbox "${TEST_FLAGS[@]}"
+swift test --disable-sandbox ${TEST_FLAGS[@]+"${TEST_FLAGS[@]}"}
 echo "✅ Gate 3 passed: All unit, fuzz, and performance SLA tests passed."
 
 # ---------------------------------------------------------

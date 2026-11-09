@@ -17,8 +17,8 @@ let package = Package(
         )
     ],
     dependencies: [
-        // Rope data structure for O(log N) text manipulation
-        .package(url: "https://github.com/apple/swift-collections.git", from: "1.1.0"),
+        // Rope data structure for O(log N) text manipulation (1.2.x supports Swift 6.0+ on CI & local)
+        .package(url: "https://github.com/apple/swift-collections.git", "1.1.0"..<"1.3.0"),
         // Incremental AST parsing for 0ms local syntax highlighting & FIM context extraction
         .package(url: "https://github.com/ChimeHQ/SwiftTreeSitter.git", from: "0.8.0"),
         .package(url: "https://github.com/tree-sitter/tree-sitter-go.git", from: "0.21.0")
