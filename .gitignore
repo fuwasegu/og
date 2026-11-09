@@ -31,3 +31,6 @@ coverage.txt
 build/
 *.zip
 notes.md
+
+# Agent worktrees
+.claude/worktrees/

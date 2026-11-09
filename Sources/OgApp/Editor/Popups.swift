@@ -296,8 +296,8 @@ final class InfoPopup {
         self.kind = kind
         text.textStorage?.setAttributedString(attr)
         let maxWidth: CGFloat = 640
-        let bounding = attr.boundingRect(with: NSSize(width: maxWidth - 20, height: 10_000), options: [.usesLineFragmentOrigin, .usesFontLeading])
-        let size = NSSize(width: min(maxWidth, max(160, bounding.width + 24)), height: min(320, bounding.height + 16))
+        let bounding = attr.boundingRect(with: NSSize(width: maxWidth - 40, height: 10_000), options: [.usesLineFragmentOrigin, .usesFontLeading])
+        let size = NSSize(width: min(maxWidth, max(160, ceil(bounding.width) + 40)), height: min(360, ceil(bounding.height) + 28))
         let screenRect = window.convertToScreen(view.convert(rect, to: nil))
         let y = above ? screenRect.maxY + 4 : screenRect.minY - size.height - 4
         panel.setFrame(NSRect(x: screenRect.minX, y: y, width: size.width, height: size.height), display: true)

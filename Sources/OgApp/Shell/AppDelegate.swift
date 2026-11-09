@@ -21,6 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             showWelcome()
         }
+        DebugDriver.startIfRequested()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
@@ -78,7 +79,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let context = ProjectContext(root: root)
         let controller = ProjectWindowController(context: context)
         projects.append(controller)
-        controller.showWindow(nil)
+        if DebugDriver.isActive, let w = controller.window {
+            // Headless self-test: render normally but stay invisible and out of the user's way.
+            w.alphaValue = 0
+            w.ignoresMouseEvents = true
+            w.orderBack(nil)
+        } else {
+            controller.showWindow(nil)
+        }
         context.start()
         controller.editorArea.restoreSession()
         if let f = fileToOpen { context.open(f) }
@@ -90,6 +98,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         projects.removeAll { $0 === controller }
         if projects.isEmpty { showWelcome() }
     }
+
+    var anyProject: ProjectWindowController? { projects.first }
 
     var activeProject: ProjectWindowController? {
         projects.first { $0.window?.isKeyWindow == true } ?? projects.first { $0.window?.isMainWindow == true }

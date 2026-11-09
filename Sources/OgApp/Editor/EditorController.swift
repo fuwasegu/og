@@ -32,7 +32,7 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
         // TextKit 1 chain for line-fragment queries and temporary attributes.
         let layout = NSLayoutManager()
         layout.allowsNonContiguousLayout = true
-        let container = NSTextContainer(size: NSSize(width: 1_000_000, height: CGFloat.greatestFiniteMagnitude))
+        let container = NSTextContainer(size: NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude))
         container.widthTracksTextView = false
         layout.addTextContainer(container)
         document.storage.addLayoutManager(layout)
@@ -320,13 +320,32 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
         textView.layoutManager?.ensureLayout(forCharacterRange: NSRange(location: 0, length: min(document.storage.length, NSMaxRange(r) + 2000)))
         if let rect = textView.lineRect(forLine: line) {
             let visible = scrollView.contentView.bounds
-            if !visible.contains(rect) {
+            if rect.minY < visible.minY || rect.maxY > visible.maxY {
                 let y = max(0, rect.midY - visible.height / 3)
-                scrollView.contentView.scroll(to: NSPoint(x: 0, y: y))
+                scrollView.contentView.scroll(to: NSPoint(x: leftEdge, y: y))
                 scrollView.reflectScrolledClipView(scrollView.contentView)
             }
         }
         textView.scrollRangeToVisible(r)
+        clampHorizontalScroll()
+    }
+
+    /// Avoid sideways jumps: keep x at 0 whenever the caret fits in the viewport.
+    /// Smallest x the clip view allows (negative when the gutter ruler is shown).
+    var leftEdge: CGFloat {
+        let clip = scrollView.contentView
+        return clip.constrainBoundsRect(NSRect(x: -100_000, y: clip.bounds.origin.y, width: clip.bounds.width, height: clip.bounds.height)).origin.x
+    }
+
+    func clampHorizontalScroll() {
+        let clip = scrollView.contentView
+        let edge = leftEdge
+        guard clip.bounds.origin.x > edge + 0.5 else { return }
+        let caret = caretScreenRect()
+        if caret.maxX + 40 < clip.bounds.width + edge {
+            clip.scroll(to: NSPoint(x: edge, y: clip.bounds.origin.y))
+            scrollView.reflectScrolledClipView(clip)
+        }
     }
 
     var caretOffset: Int { textView.selectedRange().location }
@@ -339,6 +358,7 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
         let lines = TextLines(nsString: document.storage.string as NSString)
         let p = lines.position(forOffset: caretOffset)
         context.window?.statusBar.setPosition(line: p.line + 1, column: p.character + 1, selection: textView.selectedRange().length)
+        clampHorizontalScroll()
         if textView.ghostText != nil && caretOffset != textView.ghostLocation { dismissGhost() }
         completion?.caretMoved(to: caretOffset)
     }

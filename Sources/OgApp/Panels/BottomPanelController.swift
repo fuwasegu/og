@@ -67,8 +67,7 @@ final class BottomPanelController: NSViewController {
         for tab in BottomTab.allCases {
             let b = NSButton(title: tab.title, target: self, action: #selector(tabClicked(_:)))
             b.tag = tab.rawValue
-            b.bezelStyle = .recessed
-            b.setButtonType(.pushOnPushOff)
+            b.isBordered = false
             b.font = Theme.smallFont
             b.focusRingType = .none
             buttons[tab] = b
@@ -120,7 +119,15 @@ final class BottomPanelController: NSViewController {
             v.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             v.bottomAnchor.constraint(equalTo: container.bottomAnchor)
         ])
-        for (t, b) in buttons { b.state = t == tab ? .on : .off }
+        for (t, b) in buttons {
+            let on = t == tab
+            b.attributedTitle = NSAttributedString(string: "  \(t.title)  ", attributes: [
+                .font: on ? NSFont.systemFont(ofSize: 11, weight: .semibold) : Theme.smallFont,
+                .foregroundColor: on ? Theme.text : Theme.secondaryText,
+                .underlineStyle: on ? NSUnderlineStyle.thick.rawValue : 0,
+                .underlineColor: Theme.accent
+            ])
+        }
         window?.ensureBottomPanelVisible()
     }
 

@@ -131,7 +131,15 @@ final class DocumentStore {
         }
     }
 
-    /// Flushes a pending didChange immediately (before an LSP request).
+    /// Sends the current version and waits until gopls has it queued (call before a request).
+    func flush(_ doc: Document) async {
+        syncTimers[doc.url]?.invalidate()
+        syncTimers[doc.url] = nil
+        guard doc.isGo, let ctx = context else { return }
+        await ctx.gopls.change(uri: doc.uri, text: doc.text, version: doc.version)
+    }
+
+    /// Fire-and-forget didChange (timers, after programmatic edits).
     func syncToGopls(_ doc: Document) {
         syncTimers[doc.url]?.invalidate()
         syncTimers[doc.url] = nil
@@ -188,15 +196,15 @@ final class DocumentStore {
     /// Cmd-S: organize imports + gofmt via gopls, then save.
     func saveWithFormatting(_ doc: Document, editor: EditorController?) {
         guard doc.isGo, let ctx = context else { save(doc); return }
-        syncToGopls(doc)
         let uri = doc.uri
-        let versionBefore = doc.version
         Task { @MainActor in
+            await self.flush(doc)
+            let versionBefore = doc.version
             let imports = await ctx.gopls.organizeImports(uri: uri)
             if doc.version == versionBefore, !imports.isEmpty {
                 editor?.applyTextEdits(imports, undoName: "Organize Imports")
-                self.syncToGopls(doc)
             }
+            await self.flush(doc)
             let v2 = doc.version
             if let fmt = await ctx.gopls.formatting(uri: uri), doc.version == v2, !fmt.isEmpty {
                 editor?.applyTextEdits(fmt, undoName: "Format")

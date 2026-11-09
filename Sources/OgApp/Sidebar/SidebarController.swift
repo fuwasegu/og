@@ -512,10 +512,11 @@ final class StructureController: NSViewController, NSOutlineViewDataSource, NSOu
     func reload() {
         guard let editor, editor.document.isGo else { symbols = []; if isViewLoaded { outline.reloadData() }; return }
         let uri = editor.document.uri
-        context.documents.syncToGopls(editor.document)
+        let flushDoc = editor.document
         task?.cancel()
         task = Task { [weak self] in
             guard let self else { return }
+            await self.context.documents.flush(flushDoc)
             let syms = await self.context.gopls.documentSymbols(uri: uri)
             guard !Task.isCancelled else { return }
             self.symbols = syms.map(SymbolNode.init)

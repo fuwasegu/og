@@ -271,6 +271,7 @@ final class TabBarView: NSView {
         stack.spacing = 0
         stack.alignment = .centerY
         let doc = FlippedView()
+        doc.translatesAutoresizingMaskIntoConstraints = false
         doc.addSubview(stack)
         stack.translatesAutoresizingMaskIntoConstraints = false
         scroll.documentView = doc
@@ -291,6 +292,8 @@ final class TabBarView: NSView {
             stack.topAnchor.constraint(equalTo: doc.topAnchor),
             stack.bottomAnchor.constraint(equalTo: doc.bottomAnchor),
             doc.heightAnchor.constraint(equalTo: scroll.heightAnchor),
+            doc.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            doc.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
             doc.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
             line.leadingAnchor.constraint(equalTo: leadingAnchor),
             line.trailingAnchor.constraint(equalTo: trailingAnchor),

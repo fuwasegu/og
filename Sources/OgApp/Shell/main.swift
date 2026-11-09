@@ -5,6 +5,6 @@ MainActor.assumeIsolated {
     let delegate = AppDelegate()
     app.delegate = delegate
     app.setActivationPolicy(.regular)
-    app.activate(ignoringOtherApps: true)
+    if ProcessInfo.processInfo.environment["OG_DEBUG_SCRIPT"] == nil { app.activate(ignoringOtherApps: true) }
     withExtendedLifetime(delegate) { app.run() }
 }

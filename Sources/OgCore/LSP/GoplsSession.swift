@@ -224,7 +224,8 @@ public actor GoplsSession {
     }
 
     public func change(uri: String, text: String, version: Int) async {
-        guard docs[uri] != nil else { return }
+        // Never let a late, older version overwrite a newer one (lsp.fsl NeverAhead / ordered stream).
+        guard let current = docs[uri], version > current.version else { return }
         docs[uri] = (version, text)
         guard phase == .ready, let rpc else { return }
         try? await rpc.notify("textDocument/didChange", [
@@ -393,7 +394,7 @@ public actor GoplsSession {
     // MARK: - Static configuration
 
     static let settings: JSONValue = [
-        "usePlaceholders": true,
+        "usePlaceholders": false,
         "completeUnimported": true,
         "staticcheck": false,
         "semanticTokens": false,

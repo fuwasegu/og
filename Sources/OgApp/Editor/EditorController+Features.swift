@@ -36,13 +36,14 @@ extension EditorController {
 
     func requestCompletion(explicit: Bool) {
         guard document.isGo else { return }
-        context.documents.syncToGopls(document)
+        let flushDoc = document
         let uri = document.uri
         let pos = caretPosition
         let version = document.version
         completionTask?.cancel()
         completionTask = Task { [weak self] in
             guard let self else { return }
+            await self.context.documents.flush(flushDoc)
             guard let items = await self.context.gopls.completion(uri: uri, position: pos), !Task.isCancelled else { return }
             // Spec LSP-2: a response for an older version only refilters; it never applies stale ranges.
             let stale = self.document.version != version
@@ -183,9 +184,10 @@ extension EditorController {
             return (r.location <= offset && offset <= NSMaxRange(r)) || (r.length == 0 && d.range.start.line == line)
         }
         let uri = document.uri
-        context.documents.syncToGopls(document)
+        let flushDoc = document
         Task { [weak self] in
             guard let self else { return }
+            await self.context.documents.flush(flushDoc)
             let hover = await self.context.gopls.hover(uri: uri, position: pos)
             var parts: [String] = diags.map { "⚠ " + $0.message }
             if let h = hover, !h.isEmpty { parts.append(Markdown.plain(h)) }
@@ -207,12 +209,14 @@ extension EditorController {
 
     func showSignatureHelp() {
         guard document.isGo else { return }
-        context.documents.syncToGopls(document)
+        let flushDoc = document
         let uri = document.uri
         let pos = caretPosition
         let offset = caretOffset
         Task { [weak self] in
-            guard let self, let sig = await self.context.gopls.signatureHelp(uri: uri, position: pos) else { return }
+            guard let self else { return }
+            await self.context.documents.flush(flushDoc)
+            guard let sig = await self.context.gopls.signatureHelp(uri: uri, position: pos) else { return }
             guard let lm = self.textView.layoutManager, let tc = self.textView.textContainer, self.document.storage.length > 0 else { return }
             let glyph = lm.glyphIndexForCharacter(at: min(offset, self.document.storage.length - 1))
             var rect = lm.boundingRect(forGlyphRange: NSRange(location: glyph, length: 1), in: tc)
@@ -227,10 +231,11 @@ extension EditorController {
 
     func gotoDeclaration() {
         guard document.isGo else { return }
-        context.documents.syncToGopls(document)
+        let flushDoc = document
         let uri = document.uri, pos = caretPosition
         Task { [weak self] in
             guard let self else { return }
+            await self.context.documents.flush(flushDoc)
             let locs = await self.context.gopls.definition(uri: uri, position: pos)
             if let first = locs.first {
                 // On the declaration itself → show usages (GoLand behavior).
@@ -248,20 +253,23 @@ extension EditorController {
     }
 
     func gotoTypeDeclaration() {
-        context.documents.syncToGopls(document)
+        let flushDoc = document
         let uri = document.uri, pos = caretPosition
         Task { [weak self] in
-            guard let self, let first = await self.context.gopls.typeDefinition(uri: uri, position: pos).first else { return }
+            guard let self else { return }
+            await self.context.documents.flush(flushDoc)
+            guard let first = await self.context.gopls.typeDefinition(uri: uri, position: pos).first else { return }
             self.context.window?.editorArea.pushHistory()
             self.context.open(first)
         }
     }
 
     func gotoImplementation() {
-        context.documents.syncToGopls(document)
+        let flushDoc = document
         let uri = document.uri, pos = caretPosition
         Task { [weak self] in
             guard let self else { return }
+            await self.context.documents.flush(flushDoc)
             let locs = await self.context.gopls.implementation(uri: uri, position: pos)
             if locs.count == 1 {
                 self.context.window?.editorArea.pushHistory()
@@ -275,11 +283,12 @@ extension EditorController {
     }
 
     func findUsages() {
-        context.documents.syncToGopls(document)
+        let flushDoc = document
         let uri = document.uri, pos = caretPosition
         let word = wordAtCaret() ?? "symbol"
         Task { [weak self] in
             guard let self else { return }
+            await self.context.documents.flush(flushDoc)
             let locs = await self.context.gopls.references(uri: uri, position: pos)
             if locs.isEmpty { self.context.setStatus("No usages of \(word)"); return }
             self.context.window?.bottomPanel.findPanel.showResults(title: "Usages of \(word)", locations: locs)
@@ -340,7 +349,7 @@ extension EditorController {
 
     func showCodeActions() {
         guard document.isGo else { return }
-        context.documents.syncToGopls(document)
+        let flushDoc = document
         let uri = document.uri
         let lines = TextLines(nsString: document.storage.string as NSString)
         let sel = textView.selectedRange()
@@ -349,6 +358,7 @@ extension EditorController {
         let version = document.version
         Task { [weak self] in
             guard let self else { return }
+            await self.context.documents.flush(flushDoc)
             var actions = await self.context.gopls.codeActions(uri: uri, range: range, diagnostics: diags)
             actions.sort { ($0.isPreferred ? 0 : 1, $0.kind == "quickfix" ? 0 : 1) < ($1.isPreferred ? 0 : 1, $1.kind == "quickfix" ? 0 : 1) }
             let menu = NSMenu(title: "Actions")
@@ -401,22 +411,25 @@ extension EditorController {
     // MARK: - Format / imports
 
     func reformat() {
-        context.documents.syncToGopls(document)
+        let flushDoc = document
         let uri = document.uri
         let v = document.version
         Task { [weak self] in
-            guard let self, let edits = await self.context.gopls.formatting(uri: uri), self.document.version == v else { return }
+            guard let self else { return }
+            await self.context.documents.flush(flushDoc)
+            guard let edits = await self.context.gopls.formatting(uri: uri), self.document.version == v else { return }
             if edits.isEmpty { self.context.setStatus("Already formatted"); return }
             self.applyTextEdits(edits, undoName: "Reformat Code")
         }
     }
 
     func organizeImports() {
-        context.documents.syncToGopls(document)
+        let flushDoc = document
         let uri = document.uri
         let v = document.version
         Task { [weak self] in
             guard let self else { return }
+            await self.context.documents.flush(flushDoc)
             let edits = await self.context.gopls.organizeImports(uri: uri)
             guard self.document.version == v else { return }
             if edits.isEmpty { self.context.setStatus("Imports are already optimized"); return }
@@ -478,10 +491,11 @@ extension EditorController {
     func startRename() {
         guard document.isGo else { return }
         guard context.saveAll() else { context.setStatus("Save all files before renaming"); return }
-        context.documents.syncToGopls(document)
+        let flushDoc = document
         let uri = document.uri, pos = caretPosition
         Task { [weak self] in
             guard let self else { return }
+            await self.context.documents.flush(flushDoc)
             guard let prep = await self.context.gopls.prepareRename(uri: uri, position: pos) else {
                 self.context.setStatus("This element can't be renamed")
                 return
