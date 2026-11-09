@@ -66,6 +66,7 @@ final class ProjectContext {
     func shutdown() {
         documents.autosaveAll()
         window?.bottomPanel.debugPanel.stop()
+        window?.bottomPanel.terminalPanel.terminateAll()
         watcher?.stop()
         let gopls = self.gopls
         Task { await gopls.stop() }
@@ -110,8 +111,8 @@ final class ProjectContext {
     }
 
     func relativePath(_ url: URL) -> String {
-        let p = url.standardizedFileURL.path
-        let r = root.path
+        let p = url.standardizedFileURL.resolvingSymlinksInPath().path
+        let r = root.resolvingSymlinksInPath().path
         return p.hasPrefix(r + "/") ? String(p.dropFirst(r.count + 1)) : p
     }
 

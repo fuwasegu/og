@@ -73,7 +73,7 @@ extension ProjectWindowController: NSMenuItemValidation {
             editor?.focus()
         } else {
             bottomPanel.show(.terminal)
-            if let v = bottomPanel.terminalPanel.view.subviews.first { window?.makeFirstResponder(v) }
+            bottomPanel.terminalPanel.focus()
         }
     }
 

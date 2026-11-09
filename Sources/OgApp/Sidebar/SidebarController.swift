@@ -426,8 +426,7 @@ final class FileTreeController: NSViewController, NSOutlineViewDataSource, NSOut
 
     @objc private func openInTerminal() {
         let panel = context.window?.bottomPanel.terminalPanel
-        panel?.newTab()
-        panel?.run(command: "cd " + Self.shellQuote(selectedDirectory.path))
+        panel?.newTab(in: selectedDirectory)
         context.showPanel(.terminal)
     }
 
