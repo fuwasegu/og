@@ -155,7 +155,9 @@ public actor JSONRPCConnection {
         case "response":
             guard let id = msg["request_seq"]?.intValue, let cont = pending.removeValue(forKey: id) else { return }
             if msg["success"]?.boolValue == false {
-                cont.resume(throwing: RPCError.server(code: 0, message: msg["message"]?.stringValue ?? "request failed"))
+                let detail = msg["body"]?["error"]?["format"]?.stringValue
+                let message = [msg["message"]?.stringValue, detail].compactMap { $0 }.joined(separator: ": ")
+                cont.resume(throwing: RPCError.server(code: 0, message: message.isEmpty ? "request failed" : message))
             } else {
                 cont.resume(returning: msg["body"] ?? .null)
             }

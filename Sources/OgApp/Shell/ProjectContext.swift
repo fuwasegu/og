@@ -65,6 +65,7 @@ final class ProjectContext {
 
     func shutdown() {
         documents.autosaveAll()
+        window?.bottomPanel.debugPanel.stop()
         watcher?.stop()
         let gopls = self.gopls
         Task { await gopls.stop() }
