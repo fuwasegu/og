@@ -181,7 +181,7 @@ extension EditorController {
         let started = Date()
         let minDelay: TimeInterval = switching ? 0 : 0.3
         // Short debounce so sweeping across many words does not flood gopls.
-        hoverTimer = Timer.scheduledTimer(withTimeInterval: switching ? 0.04 : 0.08, repeats: false) { [weak self] _ in
+        hoverTimer = Timer.scheduledTimer(withTimeInterval: switching ? 0.15 : 0.08, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self, self.hoverWord == word else { return }
                 self.showHover(at: word.location, rect: rect, notBefore: started.addingTimeInterval(minDelay), word: word)
@@ -687,7 +687,7 @@ enum Markdown {
             if c == "[", let mid = chars[(i + 1)...].firstIndex(of: "]"), mid + 1 < chars.count, chars[mid + 1] == "(",
                let close = chars[(mid + 2)...].firstIndex(of: ")") {
                 flush()
-                let label = String(chars[(i + 1)..<mid]).replacingOccurrences(of: "`", with: "")
+                let label = String(chars[(i + 1)..<mid]).replacingOccurrences(of: "`", with: "").replacingOccurrences(of: "\\", with: "")
                 var extra: [NSAttributedString.Key: Any] = [.foregroundColor: Theme.function]
                 if let url = URL(string: String(chars[(mid + 2)..<close])), url.scheme == "https" || url.scheme == "http" {
                     extra[.link] = url

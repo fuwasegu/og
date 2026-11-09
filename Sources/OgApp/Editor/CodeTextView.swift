@@ -442,6 +442,8 @@ final class CodeTextView: NSTextView {
 
     override func mouseMoved(with event: NSEvent) {
         super.mouseMoved(with: event)
+        // Moving over an open card must not retarget it to the code underneath.
+        if controller?.info?.containsMouse == true { controller?.hoverLeft(); return }
         let p = convert(event.locationInWindow, from: nil)
         guard let lm = layoutManager, let tc = textContainer else { return }
         let local = NSPoint(x: p.x - textContainerOrigin.x, y: p.y - textContainerOrigin.y)

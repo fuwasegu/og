@@ -238,6 +238,8 @@ final class InfoPopup {
     private var monitor: Any?
     private let linkOpener = LinkOpener()
     var isVisible: Bool { panel.isVisible }
+    /// The pointer is over the card (scrolling it, selecting, clicking links).
+    var containsMouse: Bool { panel.isVisible && panel.frame.contains(NSEvent.mouseLocation) }
 
     init(editor: EditorController) {
         self.editor = editor
@@ -316,7 +318,7 @@ final class InfoPopup {
             monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .scrollWheel]) { [weak self] event in
                 MainActor.assumeIsolated {
                     // Clicks and scrolls inside the card (links, text selection) keep it open.
-                    if let self, event.window !== self.panel, self.kind == .hover || event.type != .keyDown { self.close() }
+                    if let self, event.window !== self.panel, !self.containsMouse, self.kind == .hover || event.type != .keyDown { self.close() }
                 }
                 return event
             }
