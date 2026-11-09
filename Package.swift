@@ -1,51 +1,39 @@
 // swift-tools-version: 6.0
 import PackageDescription
 
+let strict: [SwiftSetting] = [
+    .enableExperimentalFeature("StrictConcurrency")
+]
+
 let package = Package(
     name: "og",
     platforms: [
         .macOS(.v14)
     ],
     products: [
-        .library(
-            name: "GoEditorCore",
-            targets: ["GoEditorCore"]
-        ),
-        .executable(
-            name: "og",
-            targets: ["GoEditorApp"]
-        )
+        .library(name: "OgCore", targets: ["OgCore"]),
+        .executable(name: "og", targets: ["OgApp"])
     ],
     dependencies: [
-        // Rope data structure for O(log N) text manipulation (1.2.x supports Swift 6.0+ on CI & local)
-        .package(url: "https://github.com/apple/swift-collections.git", "1.1.0"..<"1.3.0"),
-        // Incremental AST parsing for 0ms local syntax highlighting & FIM context extraction
-        .package(url: "https://github.com/ChimeHQ/SwiftTreeSitter.git", from: "0.8.0"),
-        .package(url: "https://github.com/tree-sitter/tree-sitter-go.git", from: "0.21.0")
+        // Native AppKit xterm emulator (no WebView). Pinned: tools-version 6.0 keeps CI on Swift 6.1 working.
+        .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", exact: "1.20.0")
     ],
     targets: [
         .target(
-            name: "GoEditorCore",
-            dependencies: [
-                .product(name: "_RopeModule", package: "swift-collections"),
-                .product(name: "Collections", package: "swift-collections"),
-                .product(name: "SwiftTreeSitter", package: "SwiftTreeSitter"),
-                .product(name: "TreeSitterGo", package: "tree-sitter-go")
-            ],
-            swiftSettings: [
-                .enableExperimentalFeature("StrictConcurrency")
-            ]
+            name: "OgCore",
+            swiftSettings: strict
         ),
         .executableTarget(
-            name: "GoEditorApp",
-            dependencies: ["GoEditorCore"],
-            swiftSettings: [
-                .enableExperimentalFeature("StrictConcurrency")
-            ]
+            name: "OgApp",
+            dependencies: [
+                "OgCore",
+                .product(name: "SwiftTerm", package: "SwiftTerm")
+            ],
+            swiftSettings: strict
         ),
         .testTarget(
-            name: "GoEditorCoreTests",
-            dependencies: ["GoEditorCore"]
+            name: "OgCoreTests",
+            dependencies: ["OgCore"]
         )
     ]
 )
