@@ -9,9 +9,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppDelegate.shared = self
+        // Capturing the shell PATH runs an interactive login shell (~0.5 s): start it off the main
+        // thread so it overlaps with building the windows.
+        Task.detached(priority: .userInitiated) { _ = ToolLocator.shared }
         Theme.start()
         NSApp.mainMenu = MainMenu.build()
-        _ = ToolLocator.shared
         let args = CommandLine.arguments.dropFirst().filter { !$0.hasPrefix("-") }
         if let path = args.first {
             openProject(URL(fileURLWithPath: path))
