@@ -115,6 +115,9 @@ final class CodeTextView: NSTextView {
     // MARK: - Keys
 
     override func keyDown(with event: NSEvent) {
+        // While the IME is composing (Japanese, Chinese, ...), every key belongs to it:
+        // Return commits, arrows pick candidates, Esc cancels, Tab moves between clauses.
+        if hasMarkedText() { super.keyDown(with: event); return }
         if controller?.handlePopupKey(event) == true { return }
         let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if event.keyCode == 53 { // Esc
@@ -127,9 +130,19 @@ final class CodeTextView: NSTextView {
         super.keyDown(with: event)
     }
 
+    override func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        // Composition started: popups and ghost text would fight the IME for keys and caret.
+        if !hasMarkedText() { controller?.imeCompositionStarted() }
+        super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
+    }
+
     override func insertText(_ insertString: Any, replacementRange: NSRange) {
-        guard let s = insertString as? String, !hasMarkedText() else {
+        let composing = hasMarkedText()
+        let plain = (insertString as? String) ?? (insertString as? NSAttributedString)?.string
+        guard let s = plain, !composing else {
             super.insertText(insertString, replacementRange: replacementRange)
+            // Committed IME text: the usual typing hooks (completion is skipped for non-ASCII words).
+            if composing, let plain { controller?.textTyped(plain) }
             return
         }
         let ns = string as NSString

@@ -118,12 +118,47 @@ final class ProjectContext {
 
     // MARK: - Events
 
+    private var staleBuildRecovery: [String: Date] = [:]
+
     private func setDiagnostics(uri: String, _ items: [LSPDiagnostic]) {
         // gopls can report the same finding twice (type checker + analyzer); keep one.
         var seen = Set<String>()
         let unique = items.filter { seen.insert("\($0.range.start.line):\($0.range.start.character)-\($0.range.end.line):\($0.range.end.character) \($0.message)").inserted }
-        diagnostics[uri] = unique.isEmpty ? nil : unique
+        // "No active builds contain …" right after a new package or a go.mod change is gopls lagging
+        // behind the disk, not a problem in the code: hide it and make gopls reload.
+        let stale = unique.filter { Self.isStaleBuildDiagnostic($0) }
+        let shown = unique.filter { !Self.isStaleBuildDiagnostic($0) }
+        if !stale.isEmpty { recoverStaleBuild(uri: uri) }
+        diagnostics[uri] = shown.isEmpty ? nil : shown
         NotificationCenter.default.post(name: .ogDiagnosticsChanged, object: self, userInfo: ["uri": uri])
+    }
+
+    nonisolated static func isStaleBuildDiagnostic(_ d: LSPDiagnostic) -> Bool {
+        d.message.hasPrefix("No active builds contain") || d.message.hasPrefix("No packages found for open file")
+    }
+
+    /// Tells gopls the module files changed and reopens the file, at most once per file every 10 s.
+    private func recoverStaleBuild(uri: String) {
+        let now = Date()
+        if let last = staleBuildRecovery[uri], now.timeIntervalSince(last) < 10 { return }
+        staleBuildRecovery[uri] = now
+        guard let file = URL(string: uri) else { return }
+        var changes: [GoplsSession.WatchedFileChange] = [.init(uri: uri, kind: .created)]
+        // Module files from the file's directory up to the project root.
+        var dir = file.deletingLastPathComponent().standardizedFileURL
+        let top = root.deletingLastPathComponent().standardizedFileURL.path
+        while dir.path.count > top.count {
+            for name in ["go.mod", "go.sum", "go.work"] {
+                let f = dir.appendingPathComponent(name)
+                if FileManager.default.fileExists(atPath: f.path) { changes.append(.init(uri: f.lspURI, kind: .changed)) }
+            }
+            dir = dir.deletingLastPathComponent()
+        }
+        let gopls = self.gopls
+        Task {
+            await gopls.didChangeWatchedFiles(changes)
+            await gopls.reopen(uri: uri)
+        }
     }
 
     private func setGoplsStatus(_ status: GoplsStatus) {

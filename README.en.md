@@ -41,7 +41,7 @@ Requires macOS 14 or later. On first launch a setup assistant walks through them
 - **Style guidance:** naming (initialisms, getters, stutter, `ErrX` / `XError`, `-er` interfaces, `this` / `self`), `ctx` first, no `else` after `return`, doc comments, and gopls staticcheck; each warning links to its guide section
 - **Refactoring:** rename with a diff preview, all-or-nothing apply with rollback, one-step undo
 - **Run & debug:** gutter ▶ for `go run`, tests and benchmarks with a test tree; delve breakpoints, stepping, variables, evaluate
-- **Git, search, terminal:** tree and gutter status, commit, branches, stash; go to file / symbol, find and replace in files; a tabbed xterm-compatible terminal
+- **Git, search, terminal:** tree and gutter status, commit, branches, stash; go to file / symbol, find and replace in files; a tabbed xterm-compatible terminal that hints common Go commands and your project's history in faint text (→ accepts)
 - **Look:** dark, light, or follow the system; any installed monospaced font
 - **Local AI completion (opt-in):** og starts, supervises and stops llama.cpp (`llama-server`) or MLX (`mlx_lm.server`) itself, bound to 127.0.0.1; pick the model in Settings
 

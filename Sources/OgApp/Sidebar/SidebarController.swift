@@ -351,15 +351,27 @@ final class FileTreeController: NSViewController, NSOutlineViewDataSource, NSOut
     @objc func newFile() {
         let dir = selectedDirectory
         guard let name = prompt("New Go file", placeholder: "name.go") else { return }
+        createFile(named: name, in: dir)
+    }
+
+    func createFile(named name: String, in dir: URL) {
         let fileName = name.contains(".") ? name : name + ".go"
-        let url = dir.appendingPathComponent(fileName)
+        let url = dir.appendingPathComponent(fileName).standardizedFileURL
         guard !FileManager.default.fileExists(atPath: url.path) else { context.setStatus("\(fileName) already exists"); return }
         let pkg = Self.packageName(for: dir)
         let content = fileName.hasSuffix(".go") ? "package \(pkg)\n\n" : ""
         do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             try Data(content.utf8).write(to: url, options: .atomic)
-            context.open(url, line: 2, column: 0)
             filesChanged([url.path])
+            guard fileName.hasSuffix(".go") else { context.open(url, line: 2, column: 0); return }
+            // gopls must learn the file exists before it is opened, or it never puts it in a package
+            // ("No active builds contain …") and completion stays dead in it.
+            let ctx = context
+            Task { @MainActor in
+                await ctx.gopls.didChangeWatchedFiles([.init(uri: url.lspURI, kind: .created)])
+                ctx.open(url, line: 2, column: 0)
+            }
         } catch {
             context.setStatus(error.localizedDescription)
         }

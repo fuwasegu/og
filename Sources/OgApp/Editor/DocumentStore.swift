@@ -50,9 +50,21 @@ final class Document {
         storage.length != knownNS.length || !(storage.string as NSString).isEqual(knownNS)
     }
 
+    /// `editGeneration` as of the last version bump.
+    private var versionedGeneration = 0
+
+    /// Bumps the version if the storage changed since the last bump. The storage delegate defers this
+    /// to the next runloop turn; `DocumentStore.flush` calls it first so gopls never gets new text
+    /// under an old version (which it would drop, then answer requests on the old text).
+    func markEditedIfNeeded() {
+        guard editGeneration != versionedGeneration else { return }
+        markEdited()
+    }
+
     func markEdited() {
         linesCache = nil
         editGeneration &+= 1
+        versionedGeneration = editGeneration
         version += 1
         let wasDirty = dirty
         dirty = differsFromDisk
@@ -157,6 +169,7 @@ final class DocumentStore {
 
     /// Sends the current version and waits until gopls has it queued (call before a request).
     func flush(_ doc: Document) async {
+        doc.markEditedIfNeeded()
         syncTimers[doc.url]?.invalidate()
         syncTimers[doc.url] = nil
         guard doc.isGo, let ctx = context else { return }
@@ -231,28 +244,46 @@ final class DocumentStore {
             }
             await self.flush(doc)
             let v2 = doc.version
-            if let fmt = await ctx.gopls.formatting(uri: uri), doc.version == v2, !fmt.isEmpty {
+            switch await ctx.gopls.formatting(uri: uri) {
+            case .some(let fmt) where doc.version == v2 && !fmt.isEmpty:
                 editor?.applyTextEdits(fmt, undoName: "Format")
+            case .none:
+                // gofmt refuses files that do not parse; say so instead of saving silently unformatted.
+                ctx.setStatus("Saved without formatting: gopls could not format \(doc.url.lastPathComponent) (syntax error?)")
+            default:
+                break
             }
+            // The edits above bump the version on the next runloop turn; save the formatted text now.
+            doc.markEditedIfNeeded()
             self.save(doc)
         }
     }
 
     // MARK: - External changes (FSEvents)
 
+    /// Files gopls must hear about when they change on disk.
+    nonisolated static func isGoplsWatched(_ url: URL) -> Bool {
+        url.pathExtension == "go" || ["go.mod", "go.sum", "go.work", "go.work.sum"].contains(url.lastPathComponent)
+    }
+
     func filesChanged(_ paths: [String]) {
-        var changedURIs: [String] = []
+        var changes: [GoplsSession.WatchedFileChange] = []
         for path in paths {
             let url = URL(fileURLWithPath: path).standardizedFileURL
-            if url.pathExtension == "go" { changedURIs.append(url.lspURI) }
+            if Self.isGoplsWatched(url) {
+                let exists = FileManager.default.fileExists(atPath: url.path)
+                // A .go file gopls may not know yet counts as created: that makes it re-read the package.
+                let kind: GoplsSession.WatchedFileChange.Kind = !exists ? .deleted : (url.pathExtension == "go" && documents[url] == nil ? .created : .changed)
+                changes.append(.init(uri: url.lspURI, kind: kind))
+            }
             guard let doc = documents[url] else { continue }
             guard let data = try? Data(contentsOf: url) else { continue }
             if data == Data(doc.known.utf8) { continue } // DES-3 echo of our own write
             guard let disk = String(data: data, encoding: .utf8) else { continue }
             externalChange(doc, disk: disk)
         }
-        if let ctx = context, !changedURIs.isEmpty {
-            Task { await ctx.gopls.didChangeWatchedFiles(changedURIs) }
+        if let ctx = context, !changes.isEmpty {
+            Task { await ctx.gopls.didChangeWatchedFiles(changes) }
         }
     }
 

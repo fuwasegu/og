@@ -199,8 +199,12 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
     func textStorage(_ textStorage: NSTextStorage, didProcessEditing editedMask: NSTextStorageEditActions, range editedRange: NSRange, changeInLength delta: Int) {
         guard editedMask.contains(.editedCharacters) else { return }
         document.storageDidChange()
-        // Keep base attributes on inserted text.
-        textStorage.addAttributes([.font: Theme.editorFont, .foregroundColor: Theme.text], range: editedRange)
+        // Keep base attributes on inserted text, but leave the IME's marked text styled as the IME wants.
+        if !textView.hasMarkedText() {
+            textStorage.addAttributes([.font: Theme.editorFont, .foregroundColor: Theme.text], range: editedRange)
+        } else {
+            textStorage.addAttribute(.font, value: Theme.editorFont, range: editedRange)
+        }
         // Keep breakpoints attached to their lines.
         let ns = textStorage.string as NSString
         let inserted = ns.substring(with: editedRange).reduce(0) { $1 == "\n" ? $0 + 1 : $0 }
@@ -213,7 +217,7 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
         DispatchQueue.main.async { [weak self] in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                self.document.markEdited()
+                self.document.markEditedIfNeeded()
                 self.scheduleHighlight()
                 self.scheduleStyleCheck()
                 self.gutter.needsDisplay = true
@@ -408,6 +412,14 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
 
     var caretPosition: LSPPosition {
         document.lines.position(forOffset: caretOffset)
+    }
+
+    /// The IME began composing: close what would steal its keys.
+    func imeCompositionStarted() {
+        completionTimer?.invalidate()
+        completionTask?.cancel()
+        completion?.close()
+        dismissGhost()
     }
 
     func selectionDidChange() {

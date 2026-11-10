@@ -57,6 +57,28 @@ enum DebugDriver {
                 if ch == "\n" { tv.insertNewline(nil) } else { tv.insertText(String(ch), replacementRange: NSRange(location: NSNotFound, length: 0)) }
                 try? await Task.sleep(nanoseconds: 15_000_000)
             }
+        case "newfile":
+            // newfile DIR/NAME.go: the sidebar's New Go File.
+            guard let p = project else { return }
+            let url = p.context.root.appendingPathComponent(arg)
+            p.sidebar.tree.createFile(named: url.lastPathComponent, in: url.deletingLastPathComponent())
+        case "term":
+            // term TEXT: type into the terminal (\\r = Return, \\e = Esc); prints the line and the faint hint.
+            guard let tp = project?.bottomPanel.terminalPanel else { return }
+            tp.debugType(unescape(arg).replacingOccurrences(of: "\\e", with: "\u{1b}").replacingOccurrences(of: "\\r", with: "\r"))
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            print("term: line=\(tp.debugLine) ghost=\(tp.debugGhost ?? "-")")
+        case "mark":
+            // mark TEXT: IME composition (marked text), as an input method would send it.
+            guard let tv = project?.editorArea.current?.textView else { return }
+            let t = unescape(arg)
+            tv.setMarkedText(t, selectedRange: NSRange(location: (t as NSString).length, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+            print("mark: marked=\(tv.hasMarkedText()) popup=\(project?.editorArea.current?.completion?.isVisible == true)")
+        case "commit":
+            // commit TEXT: the IME commits its composition.
+            guard let tv = project?.editorArea.current?.textView else { return }
+            tv.insertText(unescape(arg), replacementRange: NSRange(location: NSNotFound, length: 0))
+            print("commit: marked=\(tv.hasMarkedText())")
         case "key":
             guard let tv = project?.editorArea.current?.textView else { return }
             let codes: [String: (UInt16, String)] = ["tab": (48, "\t"), "enter": (36, "\r"), "esc": (53, "\u{1b}"), "backspace": (51, "\u{7f}"),
