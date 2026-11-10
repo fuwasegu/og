@@ -19,8 +19,12 @@ public final class ToolLocator: Sendable {
         dirs.append(contentsOf: (env["PATH"] ?? "").split(separator: ":").map(String.init))
         let home = NSHomeDirectory()
         let gopath = env["GOPATH"] ?? "\(home)/go"
+        // Version managers: their shims pick the project's version from the working directory.
+        let miseData = env["MISE_DATA_DIR"] ?? "\(home)/.local/share/mise"
         dirs.append(contentsOf: [
+            "\(miseData)/shims", "\(home)/.asdf/shims", "\(home)/.goenv/shims", "\(home)/.local/bin",
             "\(gopath)/bin", "/opt/homebrew/bin", "/usr/local/bin", "/usr/local/go/bin",
+            "\(home)/.nix-profile/bin", "/nix/var/nix/profiles/default/bin",
             "/usr/bin", "/bin", "/usr/sbin", "/sbin"
         ])
         var seen = Set<String>()
@@ -46,7 +50,10 @@ public final class ToolLocator: Sendable {
         let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: shell)
-        proc.arguments = ["-l", "-c", "printf '%s' \"$PATH\""]
+        // Interactive + login, so ~/.zshrc runs too: mise / asdf / nvm-style tools usually
+        // put themselves on PATH there (`eval "$(mise activate zsh)"`), not in ~/.zprofile.
+        // rc files may print banners, so the value is fenced with markers.
+        proc.arguments = ["-l", "-i", "-c", "printf '\\n__OG_PATH__%s__OG_END__\\n' \"$PATH\""]
         let out = Pipe()
         proc.standardOutput = out
         proc.standardError = FileHandle.nullDevice
@@ -60,7 +67,10 @@ public final class ToolLocator: Sendable {
         while proc.isRunning && Date() < deadline { usleep(20_000) }
         if proc.isRunning { proc.terminate(); return nil }
         let data = out.fileHandleForReading.readDataToEndOfFile()
-        let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return (path?.isEmpty ?? true) ? nil : path
+        guard let text = String(data: data, encoding: .utf8),
+              let start = text.range(of: "__OG_PATH__", options: .backwards),
+              let end = text.range(of: "__OG_END__", range: start.upperBound..<text.endIndex) else { return nil }
+        let path = String(text[start.upperBound..<end.lowerBound])
+        return path.isEmpty ? nil : path
     }
 }

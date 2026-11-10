@@ -254,7 +254,7 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
             ("gopls", "Language server: completion, navigation, refactoring", "brew install gopls"),
             ("dlv", "Delve debugger", "brew install delve")
         ]
-        var rows: [NSView] = [title("Go tools"), body("og uses the standard Go tools from your PATH or Homebrew.")]
+        var rows: [NSView] = [title("Go tools"), body("og uses the Go tools from your shell's PATH (including mise, asdf and goenv) or Homebrew.")]
         var missing: [String] = []
         for (bin, what, install) in tools {
             let found = ToolLocator.shared.find(bin)
@@ -277,7 +277,13 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
             rows.append(body("All set."))
         } else {
             let cmd = missing.map { $0.replacingOccurrences(of: "brew install ", with: "") }.joined(separator: " ")
-            let text = "brew install \(cmd)"
+            // With mise, Go itself should come from mise; gopls / delve still come from Homebrew.
+            let usesMise = ToolLocator.shared.find("mise") != nil
+            var parts: [String] = []
+            if usesMise, cmd.split(separator: " ").contains("go") { parts.append("mise use -g go@latest") }
+            let brewList = cmd.split(separator: " ").filter { !(usesMise && $0 == "go") }.joined(separator: " ")
+            if !brewList.isEmpty { parts.append("brew install \(brewList)") }
+            let text = parts.joined(separator: " && ")
             let field = NSTextField(labelWithString: text)
             field.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
             field.textColor = Theme.text
