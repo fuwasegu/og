@@ -18,6 +18,13 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
     private(set) var tokens: [GoToken] = []
     private var observers: [NSObjectProtocol] = []
     var completion: CompletionPopup?
+    /// Markdown files: live preview beside the editor (⇧⌘V toggles it).
+    var markdownPreview: MarkdownPreviewController?
+    private var markdownSplit: NSSplitView?
+    /// Editor share of the Markdown split; follows the user's drags.
+    private var markdownSplitRatio: CGFloat = 0.5
+    private var markdownSplitWidth: CGFloat = 0
+    private var markdownSplitApplying = false
     var info: InfoPopup?
     /// Hover: word under the mouse, pending timer, and per-version cache of gopls answers.
     var hoverWord: NSRange?
@@ -74,19 +81,47 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
         scrollView.rulersVisible = true
 
         banner.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(banner)
-        root.addSubview(scrollView)
+        // Markdown: editor | preview. Everything else: the editor alone.
+        let content: NSView
+        if document.isMarkdown {
+            let split = NSSplitView()
+            split.isVertical = true
+            split.dividerStyle = .thin
+            let preview = MarkdownPreviewController(document: document)
+            preview.openFile = { [weak self] url in self?.context.open(url) }
+            split.addArrangedSubview(scrollView)
+            split.addArrangedSubview(preview.view)
+            split.setHoldingPriority(.defaultLow - 1, forSubviewAt: 0)
+            split.setHoldingPriority(.defaultLow - 1, forSubviewAt: 1)
+            for v in [scrollView, preview.view] {
+                v.widthAnchor.constraint(greaterThanOrEqualToConstant: 160).isActive = true
+            }
+            markdownPreview = preview
+            markdownSplit = split
+            observers.append(NotificationCenter.default.addObserver(forName: NSSplitView.didResizeSubviewsNotification, object: split, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    // Only the user's drag of the divider changes the share, not layout or window resizes.
+                    let t = NSApp.currentEvent?.type
+                    if t == .leftMouseDragged || t == .leftMouseUp { self?.markdownSplitResized() }
+                }
+            })
+            content = split
+        } else {
+            content = scrollView
+        }
+        content.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(content)
         bannerHeight = banner.heightAnchor.constraint(equalToConstant: 0)
         NSLayoutConstraint.activate([
             banner.topAnchor.constraint(equalTo: root.topAnchor),
             banner.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             banner.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             bannerHeight,
-            scrollView.topAnchor.constraint(equalTo: banner.bottomAnchor),
-            scrollView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: root.bottomAnchor)
+            content.topAnchor.constraint(equalTo: banner.bottomAnchor),
+            content.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            content.bottomAnchor.constraint(equalTo: root.bottomAnchor)
         ])
         view = root
         banner.onAction = { [weak self] action in self?.bannerAction(action) }
@@ -167,7 +202,10 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
         })
         scrollView.contentView.postsBoundsChangedNotifications = true
         observers.append(nc.addObserver(forName: NSView.boundsDidChangeNotification, object: scrollView.contentView, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.highlightVisibleIfNeeded() }
+            MainActor.assumeIsolated {
+                self?.highlightVisibleIfNeeded()
+                self?.syncMarkdownPreview()
+            }
         })
         observers.append(nc.addObserver(forName: .ogDiagnosticsChanged, object: context, queue: .main) { [weak self] n in
             let info = n.userInfo as? [String: any Sendable] ?? [:]
@@ -420,6 +458,57 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
         completionTask?.cancel()
         completion?.close()
         dismissGhost()
+    }
+
+    // MARK: - Markdown preview
+
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        // Editor and preview keep their share (half and half at first) as the window resizes.
+        guard let split = markdownSplit, split.bounds.width > 400, abs(split.bounds.width - markdownSplitWidth) > 0.5 else { return }
+        markdownSplitWidth = split.bounds.width
+        // After this layout pass: a divider set inside it is undone by the split's own layout.
+        DispatchQueue.main.async { [weak self] in
+            MainActor.assumeIsolated { self?.applyMarkdownSplitRatio() }
+        }
+    }
+
+    private func applyMarkdownSplitRatio() {
+        guard let split = markdownSplit, let preview = markdownPreview, !preview.view.isHidden else { return }
+        markdownSplitApplying = true
+        split.setPosition((split.bounds.width * markdownSplitRatio).rounded(), ofDividerAt: 0)
+        markdownSplitApplying = false
+        preview.update()
+    }
+
+    /// The user dragged the divider: remember the new share.
+    func markdownSplitResized() {
+        guard !markdownSplitApplying, let split = markdownSplit, let preview = markdownPreview, !preview.view.isHidden,
+              split.bounds.width > 400 else { return }
+        markdownSplitRatio = min(0.85, max(0.15, scrollView.frame.width / split.bounds.width))
+    }
+
+    func toggleMarkdownPreview() {
+        guard let preview = markdownPreview, let split = markdownSplit else {
+            context.setStatus("Markdown preview is for .md files")
+            return
+        }
+        preview.view.isHidden.toggle()
+        split.adjustSubviews()
+        if !preview.view.isHidden {
+            applyMarkdownSplitRatio()
+            syncMarkdownPreview()
+        }
+    }
+
+    /// Keeps the preview's top block on the editor's top line.
+    func syncMarkdownPreview() {
+        guard let preview = markdownPreview, !preview.view.isHidden, let lm = textView.layoutManager, let tc = textView.textContainer else { return }
+        var visible = scrollView.contentView.bounds
+        visible.origin.y -= textView.textContainerOrigin.y
+        let glyph = lm.glyphIndex(for: NSPoint(x: 0, y: max(0, visible.minY)), in: tc)
+        let offset = lm.characterIndexForGlyph(at: glyph)
+        preview.syncScroll(toEditorLine: document.lines.line(forOffset: min(offset, document.storage.length)))
     }
 
     func selectionDidChange() {

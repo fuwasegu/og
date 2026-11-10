@@ -20,6 +20,7 @@ final class Document {
     var saveError: String?
     let undoManager = UndoManager()
     var isGo: Bool { url.pathExtension == "go" }
+    var isMarkdown: Bool { ["md", "markdown", "mdown", "mkd"].contains(url.pathExtension.lowercased()) }
     var uri: String { url.lspURI }
     var text: String { storage.string }
     /// Called after every content change (by edits, reloads, or programmatic replace).

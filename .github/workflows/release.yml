@@ -135,7 +135,7 @@ jobs:
 
             url "https://github.com/fuwasegu/og/releases/download/v#{version}/og.app.zip"
             name "og"
-            desc "120fps native macOS Go editor with CoreText, Tree-sitter, and PTY terminal"
+            desc "Native macOS IDE for writing Go by hand, GoLand-style"
             homepage "https://github.com/fuwasegu/og"
 
             depends_on macos: :sonoma
@@ -143,11 +143,8 @@ jobs:
             app "og.app"
 
             # 未署名ビルドの Gatekeeper 回避。quarantine のみ剥がす。
-            postflight do
-              system_command "/usr/bin/xattr",
-                             args:         ["-dr", "com.apple.quarantine", "#{appdir}/og.app"],
-                             sudo:         false,
-                             must_succeed: false
+            postflight_steps do
+              run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{appdir}}/og.app"], must_succeed: false
             end
 
             zap trash: "~/Library/Preferences/dev.fuwasegu.og.plist"

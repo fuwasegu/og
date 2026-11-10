@@ -23,10 +23,13 @@ let package = Package(
             name: "OgCore",
             swiftSettings: strict
         ),
+        // merman's native C ABI (headers only; the library is loaded at run time).
+        .target(name: "CMerman"),
         .executableTarget(
             name: "OgApp",
             dependencies: [
                 "OgCore",
+                "CMerman",
                 .product(name: "SwiftTerm", package: "SwiftTerm")
             ],
             swiftSettings: strict

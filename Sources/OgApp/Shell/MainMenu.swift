@@ -91,6 +91,7 @@ enum MainMenu {
             item("Commit", #selector(P.ogShowCommit(_:)), "0"),
             item("Terminal", #selector(P.ogShowTerminal(_:)), fkey(12), [.option]),
             item("Hide Bottom Panel", #selector(P.ogToggleBottomPanel(_:)), "j"),
+            item("Markdown Preview", #selector(P.ogToggleMarkdownPreview(_:)), "v", [.command, .shift]),
             .separator(),
             item("Increase Font Size", #selector(P.ogZoomIn(_:)), "+"),
             item("Decrease Font Size", #selector(P.ogZoomOut(_:)), "-"),

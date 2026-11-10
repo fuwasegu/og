@@ -49,7 +49,7 @@ Key types: `ProjectContext` (one per window, the contract for panels), `Document
 
 ## 4. Invariants (non-negotiable)
 
-1. **Native only.** No `WebKit` / `WKWebView`, no Electron-style embedding. The editor is `NSTextView` on TextKit 1; the terminal is SwiftTerm (AppKit).
+1. **Native only.** No `WebKit` / `WKWebView`, no Electron-style embedding. The editor is `NSTextView` on TextKit 1; the terminal is SwiftTerm (AppKit). The Markdown preview is TextKit 1 too; Mermaid diagrams come from merman's native library (`scripts/fetch-merman.sh`, loaded with `dlopen` by `MermaidRenderer`), never from a JS engine.
 2. **UTF-16 everywhere.** `NSRange` and LSP positions are UTF-16. Convert through `TextLines` (`offset(for:)`, `position(forOffset:)`, `nsRange(for:)`). Never feed character counts into `NSRange`.
 3. **No silent data loss** (`spec/req/workspace.fsl`). Autosave never overwrites a file that changed on disk unseen; a dirty buffer with an external change becomes a conflict; a failed save keeps the tab dirty and blocks closing.
 4. **Version-safe LSP** (`spec/req/lsp.fsl`). Await `DocumentStore.flush(_:)` before a request. Apply server edits only if the document version is unchanged. Responses from an older gopls process are dropped.
