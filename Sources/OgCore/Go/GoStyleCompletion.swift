@@ -27,10 +27,11 @@ public enum GoStyleCompletions {
     /// All templates that apply at the caret. `packageSources` are the other files of the package
     /// (receivers, constructors); `candidates` are the gopls items (sentinel errors for `errors.Is`).
     public static func items(in ns: NSString, caret: Int, fileName: String = "",
-                             packageSources: [String] = [], candidates: [GoCompletionCandidate] = []) -> [GoStyleCompletion] {
+                             packageSources: [String] = [], candidates: [GoCompletionCandidate] = [],
+                             externalZeros: [String: String] = [:]) -> [GoStyleCompletion] {
         guard caret >= 0, caret <= ns.length, !GoScanner.isInsideStringOrComment(ns, offset: lineStart(ns, caret)) else { return [] }
         var out: [GoStyleCompletion] = []
-        if let w = errorWrap(in: ns, caret: caret) { out.append(w) }
+        if let w = errorWrap(in: ns, caret: caret, externalZeros: externalZeros) { out.append(w) }
         out += errorsIs(in: ns, caret: caret, candidates: candidates)
         if let d = docComment(in: ns, caret: caret) { out.append(d) }
         out += receivers(in: ns, caret: caret, fileName: fileName, packageSources: packageSources)
@@ -85,15 +86,15 @@ public enum GoStyleCompletions {
     // MARK: - Error wrapping
 
     /// Next to `if err != nil { return …, err }`: the same check returning `fmt.Errorf("<call>: %w", err)`.
-    static func errorWrap(in ns: NSString, caret: Int) -> GoStyleCompletion? {
-        guard let base = GoErrCheck.suggestion(in: ns, caret: caret) else { return nil }
+    static func errorWrap(in ns: NSString, caret: Int, externalZeros: [String: String] = [:]) -> GoStyleCompletion? {
+        guard let base = GoErrCheck.suggestion(in: ns, caret: caret, externalZeros: externalZeros) else { return nil }
         let start = lineStart(ns, caret)
         let indent = indentOf(lineBefore(ns, caret))
         guard let stmt = GoErrCheck.previousStatement(ns, beforeLineAt: start) else { return nil }
         let msg = calleePhrase(stmt) ?? ""
         let v = base.variable
         let errExpr = "fmt.Errorf(\"\(msg): %w\", \(v))"
-        let ret = GoPostfixEngine.errorReturn(ns, before: start, errExpr: errExpr)
+        let ret = GoPostfixEngine.errorReturn(ns, before: start, errExpr: errExpr, externalZeros: externalZeros)
         guard ret.hasPrefix("return "), ret.hasSuffix(errExpr) else { return nil }
         let text = "if \(v) != nil {\n\(indent)\t\(ret)\n\(indent)}"
         let t = text as NSString
@@ -119,8 +120,24 @@ public enum GoStyleCompletions {
         for i in r..<toks.count {
             let t = toks[i]
             if t.isOp("(") {
-                guard depth == 0, i > r, toks[i - 1].kind == .ident else { return nil }
-                return words(toks[i - 1].text)
+                guard depth == 0, i > r else { return nil }
+                var j = i - 1
+                // Generic instantiation `For[T](…)`: step back over the type arguments.
+                if toks[j].isOp("]") {
+                    var d = 0
+                    while j > r {
+                        if toks[j].isOp("]") { d += 1 } else if toks[j].isOp("[") { d -= 1; if d == 0 { break } }
+                        j -= 1
+                    }
+                    j -= 1
+                }
+                guard j >= r, toks[j].kind == .ident else { return nil }
+                let name = words(toks[j].text)
+                // `jsonschema.For`, `http.Get`, `c.Do`: a bare short verb says little; keep the qualifier.
+                if !name.contains(" "), name.count <= 3, j - 2 >= r, toks[j - 1].isOp("."), toks[j - 2].kind == .ident {
+                    return words(toks[j - 2].text) + " " + name
+                }
+                return name
             }
             if t.isOp("[") || t.isOp("{") { depth += 1 }
             if t.isOp("]") || t.isOp("}") { depth -= 1 }

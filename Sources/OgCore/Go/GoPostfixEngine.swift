@@ -247,7 +247,7 @@ enum GoPostfixEngine {
     // MARK: - err template: what to return
 
     /// `return <zero values>, err` for the innermost enclosing function, or `t.Fatal(err)` in tests.
-    static func errorReturn(_ ns: NSString, before offset: Int, errExpr: String) -> String {
+    static func errorReturn(_ ns: NSString, before offset: Int, errExpr: String, externalZeros: [String: String] = [:]) -> String {
         let all = GoScanner.tokenize(ns, range: NSRange(location: 0, length: offset)).filter(\.isCode)
         // Stack of open braces enclosing `offset`.
         var stack: [Int] = []
@@ -272,7 +272,7 @@ enum GoPostfixEngine {
                 if idx == sig.results.count - 1 && lastIsError {
                     vals.append(errExpr)
                 } else {
-                    vals.append(GoTypes.zeroValue(r.typeText, decls: decls, typeParams: tparams))
+                    vals.append(GoTypes.zeroValue(r.typeText, decls: decls, typeParams: tparams, external: externalZeros))
                 }
             }
             if !lastIsError { return "return \(errExpr)" }

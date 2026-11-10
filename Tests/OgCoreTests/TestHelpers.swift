@@ -125,8 +125,8 @@ func sseLine(_ content: String, stop: Bool = false) -> String {
 }
 
 /// GoErrCheck suggestion with the caret at the end of `src`.
-func errCheckAtEnd(_ src: String) -> GoErrCheckSuggestion? {
-    GoErrCheck.suggestion(in: src as NSString, caret: (src as NSString).length)
+func errCheckAtEnd(_ src: String, zeros: [String: String] = [:]) -> GoErrCheckSuggestion? {
+    GoErrCheck.suggestion(in: src as NSString, caret: (src as NSString).length, externalZeros: zeros)
 }
 
 // MARK: - Go style (GoStyleTests)
