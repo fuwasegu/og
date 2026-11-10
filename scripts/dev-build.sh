@@ -81,8 +81,11 @@ EOF
   exit $?
 fi
 
+# Mermaid renderer for the Markdown preview (loaded at run time; optional when offline).
+bash scripts/fetch-merman.sh || echo "⚠︎ merman unavailable: Mermaid diagrams show as code"
+
 echo "▶ og app"
 find Sources/OgApp -name '*.swift' > "$OUT/ogapp.files"
-swiftc "${COMMON[@]}" -swift-version 6 -module-name OgApp -I "$OUT" -L "$OUT" -lOgCore -lSwiftTerm \
+swiftc "${COMMON[@]}" -swift-version 6 -module-name OgApp -I "$OUT" -I Sources/CMerman/include -L "$OUT" -lOgCore -lSwiftTerm \
   -o "$OUT/og" @"$OUT/ogapp.files"
 echo "✅ $OUT/og"

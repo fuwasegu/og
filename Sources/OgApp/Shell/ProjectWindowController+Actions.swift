@@ -19,6 +19,10 @@ extension ProjectWindowController: NSMenuItemValidation {
         let debugActions: Set<Selector> = [#selector(ogResume(_:)), #selector(ogStepOver(_:)), #selector(ogStepInto(_:)), #selector(ogStepOut(_:))]
         if let action = menuItem.action, debugActions.contains(action) { return bottomPanel.debugPanel.isDebugging }
         if menuItem.action == #selector(ogUndoRename(_:)) { return RenameSheet.lastRecord != nil }
+        if menuItem.action == #selector(ogToggleMarkdownPreview(_:)) {
+            menuItem.state = editor?.markdownPreview?.view.isHidden == false ? .on : .off
+            return editor?.markdownPreview != nil
+        }
         return true
     }
 
@@ -32,6 +36,8 @@ extension ProjectWindowController: NSMenuItemValidation {
         guard let editor else { return }
         context.documents.saveWithFormatting(editor.document, editor: editor)
     }
+
+    @objc func ogToggleMarkdownPreview(_ sender: Any?) { editor?.toggleMarkdownPreview() }
 
     @objc func ogSaveAll(_ sender: Any?) {
         if !context.saveAll() { context.setStatus("Some files could not be saved") }

@@ -247,6 +247,11 @@ enum DebugDriver {
                 try? png.write(to: URL(fileURLWithPath: arg))
                 print("snap \(arg)")
             }
+        case "mdpreview":
+            // mdpreview [toggle]: state of the current editor's Markdown preview.
+            guard let ed = project?.editorArea.current else { return }
+            if arg == "toggle" { ed.toggleMarkdownPreview() }
+            print("mdpreview: \(ed.markdownPreview.map { ($0.view.isHidden ? "hidden " : "") + $0.debugSummary + " width=\(Int($0.view.frame.width))/\(Int(ed.view.frame.width))" } ?? "none")")
         case "geom":
             guard let ed = project?.editorArea.current else { return }
             print("clip=\(ed.scrollView.contentView.bounds) tv=\(ed.textView.frame) doc=\(ed.scrollView.documentVisibleRect) caret=\(ed.caretScreenRect())")

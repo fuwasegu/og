@@ -77,4 +77,10 @@ EOF
 
 printf "APPL????" > "$CONTENTS_DIR/PkgInfo"
 
+# Mermaid renderer for the Markdown preview (merman, prebuilt and pinned), with its licenses.
+bash scripts/fetch-merman.sh
+mkdir -p "$CONTENTS_DIR/Frameworks" "$RESOURCES_DIR/merman"
+cp .build/deps/merman/lib/libmerman_ffi.dylib "$CONTENTS_DIR/Frameworks/"
+cp -R .build/deps/merman/licenses/. "$RESOURCES_DIR/merman/"
+
 echo "✅ Packaged $APP_DIR (v${VERSION})"

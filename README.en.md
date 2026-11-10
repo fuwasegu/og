@@ -42,10 +42,15 @@ Requires macOS 14 or later. On first launch a setup assistant walks through them
 - **Refactoring:** rename with a diff preview, all-or-nothing apply with rollback, one-step undo
 - **Run & debug:** gutter ▶ for `go run`, tests and benchmarks with a test tree; delve breakpoints, stepping, variables, evaluate
 - **Git, search, terminal:** tree and gutter status, commit, branches, stash; go to file / symbol, find and replace in files; a tabbed xterm-compatible terminal that hints common Go commands and your project's history in faint text (→ accepts)
+- **Markdown preview:** live, beside the editor (`⇧⌘V`); only changed blocks are re-laid out, so long documents stay at a few ms per keystroke. Mermaid diagrams are rendered in-process by [merman](https://github.com/Latias94/merman) (native Rust, no browser or Node.js), themed for dark and light. Tables, task lists, highlighted Go code, quotes, local images, links, and scroll sync with the editor
 - **Look:** dark, light, or follow the system; any installed monospaced font
 - **Local AI completion (opt-in):** og starts, supervises and stops llama.cpp (`llama-server`) or MLX (`mlx_lm.server`) itself, bound to 127.0.0.1; pick the model in Settings
 
 The first debug session triggers macOS's "Developer Tools Access" prompt; `sudo DevToolsSecurity -enable` removes it.
+
+## Bundled components
+
+Mermaid rendering uses the prebuilt merman 0.9.3 library (MIT / Apache-2.0); its licenses and third-party notices are in `og.app/Contents/Resources/merman/`.
 
 ## Icon
 

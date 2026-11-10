@@ -1,0 +1,4 @@
+module CMerman {
+    header "merman.h"
+    export *
+}
