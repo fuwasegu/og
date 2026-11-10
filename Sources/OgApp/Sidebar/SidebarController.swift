@@ -341,6 +341,9 @@ final class FileTreeController: NSViewController, NSOutlineViewDataSource, NSOut
         add("Delete", #selector(deleteItem))
         menu.addItem(.separator())
         add("Run Tests in Directory", #selector(runTests))
+        if let node = clickedNode, Self.opensInBrowser(node.url) {
+            add("Open in Default Browser", #selector(openInBrowser))
+        }
         add("Open in Terminal", #selector(openInTerminal))
         add("Reveal in Finder", #selector(revealInFinder))
         add("Copy Path", #selector(copyPath))
@@ -443,6 +446,24 @@ final class FileTreeController: NSViewController, NSOutlineViewDataSource, NSOut
     }
 
     static func shellQuote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+
+    nonisolated static func opensInBrowser(_ url: URL) -> Bool {
+        ["html", "htm", "xhtml", "svg"].contains(url.pathExtension.lowercased())
+    }
+
+    /// The browser that opens web links, not whatever app owns `.html` (often an editor).
+    @objc private func openInBrowser() {
+        guard let url = clickedNode?.url else { return }
+        guard let probe = URL(string: "https://example.com"),
+              let browser = NSWorkspace.shared.urlForApplication(toOpen: probe) else {
+            NSWorkspace.shared.open(url)
+            return
+        }
+        NSWorkspace.shared.open([url], withApplicationAt: browser, configuration: NSWorkspace.OpenConfiguration()) { [weak self] _, error in
+            guard let error else { return }
+            Task { @MainActor in self?.context.setStatus("Could not open \(url.lastPathComponent): \(error.localizedDescription)") }
+        }
+    }
 
     @objc private func revealInFinder() {
         let url = clickedNode?.url ?? context.root
