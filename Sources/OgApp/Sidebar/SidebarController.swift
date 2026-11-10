@@ -459,10 +459,16 @@ final class FileTreeController: NSViewController, NSOutlineViewDataSource, NSOut
             NSWorkspace.shared.open(url)
             return
         }
-        NSWorkspace.shared.open([url], withApplicationAt: browser, configuration: NSWorkspace.OpenConfiguration()) { [weak self] _, error in
+        // LaunchServices calls back on its own queue: the handler must not be main-actor isolated
+        // (Swift would trap on the isolation check), so hop explicitly.
+        let ctx = context
+        let name = url.lastPathComponent
+        let done: @Sendable (NSRunningApplication?, (any Error)?) -> Void = { _, error in
             guard let error else { return }
-            Task { @MainActor in self?.context.setStatus("Could not open \(url.lastPathComponent): \(error.localizedDescription)") }
+            let message = error.localizedDescription
+            Task { @MainActor in ctx.setStatus("Could not open \(name): \(message)") }
         }
+        NSWorkspace.shared.open([url], withApplicationAt: browser, configuration: NSWorkspace.OpenConfiguration(), completionHandler: done)
     }
 
     @objc private func revealInFinder() {
