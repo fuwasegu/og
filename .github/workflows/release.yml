@@ -138,7 +138,7 @@ jobs:
             desc "120fps native macOS Go editor with CoreText, Tree-sitter, and PTY terminal"
             homepage "https://github.com/fuwasegu/og"
 
-            depends_on macos: ">= :sonoma"
+            depends_on macos: :sonoma
 
             app "og.app"
 
