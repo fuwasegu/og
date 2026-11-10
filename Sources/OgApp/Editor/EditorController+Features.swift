@@ -54,9 +54,10 @@ extension EditorController {
             guard !Task.isCancelled else { return }
             // Spec LSP-2: a response for an older version only refilters; it never applies stale ranges.
             let stale = self.document.version != version
-            let local = await self.styleCompletionItems(gopls: items)
+            let zeros = await self.externalZeroValues()
+            let local = await self.styleCompletionItems(gopls: items, externalZeros: zeros)
             guard !Task.isCancelled else { return }
-            if let err = GoErrCheck.suggestion(in: self.document.storage.string as NSString, caret: self.caretOffset) {
+            if let err = GoErrCheck.suggestion(in: self.document.storage.string as NSString, caret: self.caretOffset, externalZeros: zeros) {
                 items.insert(Self.errCheckItem(err), at: 0)
             }
             if local.inComment { items = [] }
@@ -312,9 +313,13 @@ extension EditorController {
         let lines = TextLines(nsString: document.storage.string as NSString)
         let pos = lines.position(forOffset: offset)
         let uri = document.uri, doc = document, ctx = context
-        let t = Task { @MainActor () -> HoverInfo in
+        let version = document.version
+        let t = Task { @MainActor [weak self] () -> HoverInfo in
             await ctx.documents.flush(doc)
             let md = await ctx.gopls.hover(uri: uri, position: pos)
+            // No answer (gopls still loading, restarting, or timed out): don't keep it, or the
+            // card would stay empty for this symbol until the next edit.
+            if md == nil, let self, self.hoverCacheVersion == version { self.hoverCache[offset] = nil }
             var info = HoverInfo(markdown: md)
             // Enum-like type: list its constants from the declaring package.
             if let md, let name = HoverInfo.declaredTypeName(md),

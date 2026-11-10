@@ -24,4 +24,24 @@ import Testing
         #expect(suggest("func f() {\n\tif err == nil {\n\t}\n\tif") == nil)
         #expect(suggest("func f() {\n\tv, err := g()\n\tfor") == nil)
     }
+
+    @Test func zeroValueFromHover() {
+        #expect(GoErrCheck.zeroValue(fromHover: "```go\ntype Tool interface { Name() string }\n```", type: "tool.Tool") == "nil")
+        #expect(GoErrCheck.zeroValue(fromHover: "```go\ntype Buffer struct {\n```", type: "bytes.Buffer") == "bytes.Buffer{}")
+        #expect(GoErrCheck.zeroValue(fromHover: "```go\ntype Duration int64 // size=8\n```", type: "time.Duration") == "0")
+        #expect(GoErrCheck.zeroValue(fromHover: "```go\ntype Kind string\n```", type: "x.Kind") == "\"\"")
+    }
+
+    @Test func externalZerosReplaceNew() {
+        let src = "func f() (tool.Tool, error) {\n\tv, err := g()\n\tif"
+        #expect(errCheckAtEnd(src)?.text.contains("*new(tool.Tool)") == true)
+        #expect(errCheckAtEnd(src, zeros: ["tool.Tool": "nil"])?.text == "if err != nil {\n\t\treturn nil, err\n\t}")
+    }
+
+    @Test func wrapMessageFromCallee() {
+        #expect(GoStyleCompletions.calleePhrase("schema, err := jsonschema.For[getNowInput](nil)") == "jsonschema for")
+        #expect(GoStyleCompletions.calleePhrase("x, err := parse[int](s)") == "parse")
+        #expect(GoStyleCompletions.calleePhrase("resp, err := http.Get(u)") == "http get")
+        #expect(GoStyleCompletions.calleePhrase("v, err := strconv.Atoi(s)") == "atoi")
+    }
 }

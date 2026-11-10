@@ -110,7 +110,31 @@ extension EditorController {
     }
 
     /// og's style templates for the caret, as completion items placed above gopls' list.
-    func styleCompletionItems(gopls: [LSPCompletionItem]) async -> (items: [LSPCompletionItem], inComment: Bool) {
+    /// Zero values for result types declared in other packages (`tool.Tool` -> `nil`), asked from gopls
+    /// via hover on the type in the enclosing signature. Only runs where an error-check template applies.
+    func externalZeroValues() async -> [String: String] {
+        let ns = document.storage.string as NSString
+        let caret = caretOffset
+        guard GoErrCheck.suggestion(in: ns, caret: caret) != nil else { return [:] }
+        let types = GoErrCheck.unresolvedResultTypes(in: ns, caret: caret)
+        var out: [String: String] = [:]
+        let lines = document.lines
+        let uri = document.uri
+        for t in types {
+            if let z = ExternalZeroCache.values[t] { out[t] = z; continue }
+            // The type as written in the signature above the caret.
+            let found = ns.range(of: t, options: .backwards, range: NSRange(location: 0, length: min(caret, ns.length)))
+            guard found.location != NSNotFound else { continue }
+            let pos = lines.position(forOffset: NSMaxRange(found) - 1)
+            guard let md = await context.gopls.hover(uri: uri, position: pos),
+                  let z = GoErrCheck.zeroValue(fromHover: md, type: t) else { continue }
+            ExternalZeroCache.values[t] = z
+            out[t] = z
+        }
+        return out
+    }
+
+    func styleCompletionItems(gopls: [LSPCompletionItem], externalZeros: [String: String] = [:]) async -> (items: [LSPCompletionItem], inComment: Bool) {
         guard document.isGo else { return ([], false) }
         let caret = caretOffset
         let version = document.version
@@ -129,7 +153,8 @@ extension EditorController {
         let fileName = document.url.lastPathComponent
         let pkg = sources
         let (found, inComment) = await Task.detached(priority: .userInitiated) {
-            (GoStyleCompletions.items(in: lines.text, caret: caret, fileName: fileName, packageSources: pkg, candidates: candidates),
+            (GoStyleCompletions.items(in: lines.text, caret: caret, fileName: fileName, packageSources: pkg, candidates: candidates,
+                                      externalZeros: externalZeros),
              GoStyleCompletions.isInCommentOrString(lines.text, caret: caret))
         }.value
         guard document.version == version, caretOffset == caret else { return ([], false) }
@@ -207,4 +232,10 @@ extension ProjectContext {
         }
         return out
     }
+}
+
+/// Kinds of imported types rarely change during a session; cache the zero value per type name.
+@MainActor
+enum ExternalZeroCache {
+    static var values: [String: String] = [:]
 }

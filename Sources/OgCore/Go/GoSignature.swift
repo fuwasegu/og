@@ -296,7 +296,10 @@ enum GoTypes {
     ]
 
     /// Zero value expression for a rendered type.
-    static func zeroValue(_ type: String, decls: [String: (kind: GoSignature.TypeKind, typeParams: [GoParam])], typeParams: Set<String>) -> String {
+    static func zeroValue(_ type: String, decls: [String: (kind: GoSignature.TypeKind, typeParams: [GoParam])], typeParams: Set<String>,
+                          external: [String: String] = [:]) -> String {
+        // Types from other packages, resolved by the editor through gopls (`tool.Tool` -> "nil").
+        if let z = external[type] { return z }
         if type == "bool" { return "false" }
         if type == "string" { return "\"\"" }
         if basic.contains(type) { return "0" }
