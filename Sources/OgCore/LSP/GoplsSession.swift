@@ -215,6 +215,13 @@ public actor GoplsSession {
 
     // MARK: - Document sync (DES-1)
 
+    public struct WatchedFileChange: Sendable, Equatable {
+        public enum Kind: Int, Sendable { case created = 1, changed = 2, deleted = 3 }
+        public var uri: String
+        public var kind: Kind
+        public init(uri: String, kind: Kind) { self.uri = uri; self.kind = kind }
+    }
+
     public func open(uri: String, text: String, version: Int) async {
         docs[uri] = (version, text)
         guard phase == .ready, let rpc else { return }
@@ -246,9 +253,24 @@ public actor GoplsSession {
     }
 
     public func didChangeWatchedFiles(_ uris: [String]) async {
-        guard phase == .ready, let rpc, !uris.isEmpty else { return }
+        await didChangeWatchedFiles(uris.map { WatchedFileChange(uri: $0, kind: .changed) })
+    }
+
+    /// Files changed on disk behind gopls' back: `.go` files, and `go.mod` / `go.sum` / `go.work`,
+    /// which make gopls reload its packages (a new module requirement, a new package directory).
+    public func didChangeWatchedFiles(_ changes: [WatchedFileChange]) async {
+        guard phase == .ready, let rpc, !changes.isEmpty else { return }
         try? await rpc.notify("workspace/didChangeWatchedFiles", [
-            "changes": .array(uris.map { ["uri": .string($0), "type": 2] })
+            "changes": .array(changes.map { ["uri": .string($0.uri), "type": .number(Double($0.kind.rawValue))] })
+        ])
+    }
+
+    /// Closes and reopens an open document so gopls re-resolves which package and module it belongs to.
+    public func reopen(uri: String) async {
+        guard phase == .ready, let rpc, let d = docs[uri] else { return }
+        try? await rpc.notify("textDocument/didClose", ["textDocument": ["uri": .string(uri)]])
+        try? await rpc.notify("textDocument/didOpen", [
+            "textDocument": ["uri": .string(uri), "languageId": "go", "version": .number(Double(d.version)), "text": .string(d.text)]
         ])
     }
 

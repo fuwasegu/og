@@ -11,11 +11,11 @@ final class TerminalPanel: NSViewController {
     let context: ProjectContext
 
     private final class Tab {
-        let terminal: LocalProcessTerminalView
+        let terminal: SuggestingTerminalView
         let header: TabHeaderView
         var shellTitle: String?
         var directory: URL
-        init(terminal: LocalProcessTerminalView, header: TabHeaderView, directory: URL) {
+        init(terminal: SuggestingTerminalView, header: TabHeaderView, directory: URL) {
             self.terminal = terminal
             self.header = header
             self.directory = directory
@@ -119,8 +119,14 @@ final class TerminalPanel: NSViewController {
     /// Opens a new terminal tab whose shell starts in `directory`.
     func newTab(in directory: URL) {
         _ = view
-        let term = LocalProcessTerminalView(frame: content.bounds, font: Theme.editorFont, options: TerminalOptions(scrollback: 10_000))
+        let term = SuggestingTerminalView(frame: content.bounds, font: Theme.editorFont, options: TerminalOptions(scrollback: 10_000))
         term.autoresizingMask = [.width, .height]
+        let historyKey = "og.terminalHistory." + context.root.path
+        term.history = { UserDefaults.standard.stringArray(forKey: historyKey) ?? [] }
+        term.onSubmit = { cmd in
+            let h = UserDefaults.standard.stringArray(forKey: historyKey) ?? []
+            UserDefaults.standard.set(TerminalSuggestions.remember(cmd, in: h), forKey: historyKey)
+        }
         style(term)
         term.processDelegate = self
 
@@ -145,6 +151,20 @@ final class TerminalPanel: NSViewController {
         guard let tab = active else { return }
         tab.terminal.send(txt: command + "\r")
         focus()
+    }
+
+    /// Headless driver: types into the active terminal as the keyboard would, reports the hint.
+    func debugType(_ text: String) {
+        if active == nil { newTab() }
+        guard let term = active?.terminal else { return }
+        term.send(source: term, data: ArraySlice(Array(text.utf8)))
+    }
+
+    var debugGhost: String? { active?.terminal.debugGhost }
+
+    var debugLine: String {
+        guard let t = active?.terminal.getTerminal() else { return "" }
+        return t.getLine(row: t.getCursorLocation().y)?.translateToString(trimRight: true) ?? ""
     }
 
     /// Makes the active terminal the first responder.
