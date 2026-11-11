@@ -33,6 +33,11 @@ enum DebugDriver {
 
     private static var project: ProjectWindowController? { AppDelegate.shared?.activeProject ?? AppDelegate.shared?.anyProject }
 
+    private static let keyCodes: [Character: UInt16] = [
+        "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8, "v": 9, "b": 11, "q": 12, "w": 13, "e": 14,
+        "r": 15, "y": 16, "t": 17, "o": 31, "u": 32, "i": 34, "p": 35, "l": 37, "j": 38, "k": 40, "n": 45, "m": 46, "-": 27
+    ]
+
     private static func unescape(_ s: String) -> String {
         s.replacingOccurrences(of: "\\n", with: "\n").replacingOccurrences(of: "\\t", with: "\t")
     }
@@ -74,6 +79,44 @@ enum DebugDriver {
             let t = unescape(arg)
             tv.setMarkedText(t, selectedRange: NSRange(location: (t as NSString).length, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
             print("mark: marked=\(tv.hasMarkedText()) popup=\(project?.editorArea.current?.completion?.isVisible == true)")
+        case "fonts":
+            // fonts: font runs of the caret's line.
+            guard let ed = project?.editorArea.current else { return }
+            let st = ed.document.storage
+            let lr = (st.string as NSString).lineRange(for: NSRange(location: ed.caretOffset, length: 0))
+            st.enumerateAttribute(.font, in: lr) { v, r, _ in
+                print("fonts: \((st.string as NSString).substring(with: r).debugDescription) -> \((v as? NSFont)?.fontName ?? "nil")")
+            }
+        case "panes":
+            // panes: the split tree and each pane's tabs.
+            print("panes: \(project?.editorArea.layoutSummary ?? "-")")
+        case "ime":
+            // ime KEYS: real key events through the Japanese IME (romaji), e.g. `ime nihongo<space><enter>`.
+            guard let tv = project?.editorArea.current?.textView, let window = tv.window else { return }
+            tv.window?.makeFirstResponder(tv)
+            let ctx = tv.inputContext
+            ctx?.activate()
+            let jp = ctx?.keyboardInputSources?.first { $0.contains("Japanese") && !$0.contains("Katakana") }
+            print("ime: sources=\(ctx?.keyboardInputSources ?? []) using=\(jp ?? "none")")
+            if let jp { ctx?.selectedKeyboardInputSource = jp }
+            var keys: [(UInt16, String)] = []
+            var rest = Substring(arg)
+            while let c = rest.first {
+                if rest.hasPrefix("<space>") { keys.append((49, " ")); rest = rest.dropFirst(7); continue }
+                if rest.hasPrefix("<enter>") { keys.append((36, "\r")); rest = rest.dropFirst(7); continue }
+                if let code = keyCodes[c] { keys.append((code, String(c))) }
+                rest = rest.dropFirst()
+            }
+            for (code, chars) in keys {
+                for type in [NSEvent.EventType.keyDown, .keyUp] {
+                    guard let ev = NSEvent.keyEvent(with: type, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                                    windowNumber: window.windowNumber, context: nil, characters: chars,
+                                                    charactersIgnoringModifiers: chars, isARepeat: false, keyCode: code) else { continue }
+                    if type == .keyDown { tv.keyDown(with: ev) } else { tv.keyUp(with: ev) }
+                }
+                try? await Task.sleep(nanoseconds: 60_000_000)
+                print("ime: key=\(chars.debugDescription) marked=\(tv.hasMarkedText()) text=\(tv.string.suffix(20).debugDescription)")
+            }
         case "commit":
             // commit TEXT: the IME commits its composition.
             guard let tv = project?.editorArea.current?.textView else { return }

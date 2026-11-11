@@ -19,6 +19,12 @@ extension ProjectWindowController: NSMenuItemValidation {
         let debugActions: Set<Selector> = [#selector(ogResume(_:)), #selector(ogStepOver(_:)), #selector(ogStepInto(_:)), #selector(ogStepOut(_:))]
         if let action = menuItem.action, debugActions.contains(action) { return bottomPanel.debugPanel.isDebugging }
         if menuItem.action == #selector(ogUndoRename(_:)) { return RenameSheet.lastRecord != nil }
+        switch menuItem.action {
+        case #selector(ogSplitRight(_:)), #selector(ogSplitDown(_:)): return editor != nil
+        case #selector(ogMoveTabToNextPane(_:)): return editorArea.isSplit || (editorArea.activePane?.editors.count ?? 0) > 1
+        case #selector(ogNextPane(_:)), #selector(ogPreviousPane(_:)), #selector(ogUnsplit(_:)): return editorArea.isSplit
+        default: break
+        }
         if menuItem.action == #selector(ogToggleMarkdownPreview(_:)) {
             menuItem.state = editor?.markdownPreview?.view.isHidden == false ? .on : .off
             return editor?.markdownPreview != nil
@@ -38,6 +44,15 @@ extension ProjectWindowController: NSMenuItemValidation {
     }
 
     @objc func ogToggleMarkdownPreview(_ sender: Any?) { editor?.toggleMarkdownPreview() }
+
+    // MARK: - Panes
+
+    @objc func ogSplitRight(_ sender: Any?) { editorArea.split(vertical: true) }
+    @objc func ogSplitDown(_ sender: Any?) { editorArea.split(vertical: false) }
+    @objc func ogMoveTabToNextPane(_ sender: Any?) { editorArea.moveCurrentToNextPane() }
+    @objc func ogNextPane(_ sender: Any?) { editorArea.focusNextPane(1) }
+    @objc func ogPreviousPane(_ sender: Any?) { editorArea.focusNextPane(-1) }
+    @objc func ogUnsplit(_ sender: Any?) { editorArea.unsplit() }
 
     @objc func ogSaveAll(_ sender: Any?) {
         if !context.saveAll() { context.setStatus("Some files could not be saved") }

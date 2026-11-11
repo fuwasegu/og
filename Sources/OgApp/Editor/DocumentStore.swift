@@ -25,6 +25,8 @@ final class Document {
     var text: String { storage.string }
     /// Called after every content change (by edits, reloads, or programmatic replace).
     var onChange: [(Document) -> Void] = []
+    /// Newlines the pending edit removes (set before it, read after it; breakpoints follow their lines).
+    var estimateRemovedNewlines = 0
     var onStateChange: [(Document) -> Void] = []
 
     init(url: URL, text: String) {
