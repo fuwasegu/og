@@ -93,6 +93,13 @@ enum MainMenu {
             item("Hide Bottom Panel", #selector(P.ogToggleBottomPanel(_:)), "j"),
             item("Markdown Preview", #selector(P.ogToggleMarkdownPreview(_:)), "v", [.command, .shift]),
             .separator(),
+            item("Split Right", #selector(P.ogSplitRight(_:)), "\\"),
+            item("Split Down", #selector(P.ogSplitDown(_:)), "\\", [.command, .option]),
+            item("Move Tab to Next Pane", #selector(P.ogMoveTabToNextPane(_:)), ""),
+            item("Next Pane", #selector(P.ogNextPane(_:)), "]", [.command, .option]),
+            item("Previous Pane", #selector(P.ogPreviousPane(_:)), "[", [.command, .option]),
+            item("Unsplit All", #selector(P.ogUnsplit(_:)), ""),
+            .separator(),
             item("Increase Font Size", #selector(P.ogZoomIn(_:)), "+"),
             item("Decrease Font Size", #selector(P.ogZoomOut(_:)), "-"),
             item("Reset Font Size", #selector(P.ogZoomReset(_:)), "0", [.command, .option])

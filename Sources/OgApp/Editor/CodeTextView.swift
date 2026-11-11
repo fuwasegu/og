@@ -16,6 +16,13 @@ final class CodeTextView: NSTextView {
 
     static let pairs: [String: String] = ["(": ")", "[": "]", "{": "}", "\"": "\"", "`": "`", "'": "'"]
 
+    override func becomeFirstResponder() -> Bool {
+        let ok = super.becomeFirstResponder()
+        // Clicking into a pane makes it the active one.
+        if ok, let c = controller { c.context.window?.editorArea.editorDidFocus(c) }
+        return ok
+    }
+
     // MARK: - Drawing
 
     override func drawBackground(in rect: NSRect) {

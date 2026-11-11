@@ -20,6 +20,10 @@
 //   any file is in conflict; the user must resolve the conflict first.
 // ASSUME-4 (confirmed 2026-11-09): rename / move in the tree keep the open tab and
 //   its buffer; they do not change save state, so they are not modeled here.
+// ASSUME-5 (2026-11-11, owner request "split tabs into panes"): split panes are views.
+//   A file shown in several panes is one buffer (one dirty flag, one undo stack), so
+//   `open[f]` means "some pane shows f" and close_tab models closing its last view;
+//   closing any other view only autosaves (ED-2). Not modeled further.
 requirements Workspace {
   entity File
   number Content

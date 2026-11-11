@@ -38,7 +38,6 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
     /// Lines (0-based) of the latest git changes for the gutter.
     var gitChanges: [GitLineChange] = []
     var pendingActions: (version: Int, actions: [LSPCodeAction])?
-    var estimateRemovedNewlines = 0
     /// og's Go style checks (EditorController+Style.swift).
     let style = StyleCheckState()
     private var gitTask: Task<Void, Never>?
@@ -236,18 +235,24 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
 
     func textStorage(_ textStorage: NSTextStorage, didProcessEditing editedMask: NSTextStorageEditActions, range editedRange: NSRange, changeInLength delta: Int) {
         guard editedMask.contains(.editedCharacters) else { return }
+        // The storage has one delegate, but every pane showing this buffer must follow the edit.
+        let views = context.window?.editorArea.editors(showing: document) ?? []
+        let peers = views.isEmpty ? [self] : views
         document.storageDidChange()
         // Keep base attributes on inserted text, but leave the IME's marked text styled as the IME wants.
-        if !textView.hasMarkedText() {
+        if !peers.contains(where: { $0.textView.hasMarkedText() }) {
             textStorage.addAttributes([.font: Theme.editorFont, .foregroundColor: Theme.text], range: editedRange)
         } else {
             textStorage.addAttribute(.font, value: Theme.editorFont, range: editedRange)
         }
+        // Attribute fixing already ran for this edit: redo font fallback, or Japanese (or any glyph
+        // the editor font lacks) would be drawn with a font that has no glyph for it, i.e. not at all.
+        textStorage.fixFontAttribute(in: editedRange)
         // Keep breakpoints attached to their lines.
         let ns = textStorage.string as NSString
         let inserted = ns.substring(with: editedRange).reduce(0) { $1 == "\n" ? $0 + 1 : $0 }
-        let lineDelta = inserted - estimateRemovedNewlines
-        estimateRemovedNewlines = 0
+        let lineDelta = inserted - document.estimateRemovedNewlines
+        document.estimateRemovedNewlines = 0
         if lineDelta != 0 {
             let line = document.lines.line(forOffset: editedRange.location)
             context.breakpoints.shift(document.url, from: line + 1, by: lineDelta)
@@ -256,9 +261,11 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
             MainActor.assumeIsolated {
                 guard let self else { return }
                 self.document.markEditedIfNeeded()
-                self.scheduleHighlight()
-                self.scheduleStyleCheck()
-                self.gutter.needsDisplay = true
+                for ed in peers {
+                    ed.scheduleHighlight()
+                    ed.scheduleStyleCheck()
+                    ed.gutter.needsDisplay = true
+                }
             }
         }
     }
@@ -266,9 +273,9 @@ final class EditorController: NSViewController, NSTextViewDelegate, @preconcurre
     func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange, replacementString: String?) -> Bool {
         let ns = textView.string as NSString
         if affectedCharRange.length > 0, NSMaxRange(affectedCharRange) <= ns.length {
-            estimateRemovedNewlines = ns.substring(with: affectedCharRange).reduce(0) { $1 == "\n" ? $0 + 1 : $0 }
+            document.estimateRemovedNewlines = ns.substring(with: affectedCharRange).reduce(0) { $1 == "\n" ? $0 + 1 : $0 }
         } else {
-            estimateRemovedNewlines = 0
+            document.estimateRemovedNewlines = 0
         }
         return true
     }
@@ -665,3 +672,4 @@ final class EditorBanner: NSView {
         if let id = sender.identifier?.rawValue { onAction?(id) }
     }
 }
+
