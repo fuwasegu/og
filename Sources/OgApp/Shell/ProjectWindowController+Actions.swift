@@ -37,6 +37,7 @@ extension ProjectWindowController: NSMenuItemValidation {
     @objc func ogShowWelcome(_ sender: Any?) { AppDelegate.shared?.showWelcome() }
     @objc func ogShowSettings(_ sender: Any?) { SettingsWindowController.shared.showWindow(nil) }
     @objc func ogNewFile(_ sender: Any?) { sidebar.tree.newFile() }
+    @objc func ogNewPlainFile(_ sender: Any?) { sidebar.tree.newPlainFile() }
 
     @objc func ogSave(_ sender: Any?) {
         guard let editor else { return }

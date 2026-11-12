@@ -67,6 +67,10 @@ enum DebugDriver {
             guard let p = project else { return }
             let url = p.context.root.appendingPathComponent(arg)
             p.sidebar.tree.createFile(named: url.lastPathComponent, in: url.deletingLastPathComponent())
+        case "newplain":
+            // newplain NAME: the sidebar's New File (name as typed, may contain folders), relative to the root.
+            guard let p = project else { return }
+            p.sidebar.tree.createFile(named: arg, in: p.context.root, goByDefault: false)
         case "term":
             // term TEXT: type into the terminal (\\r = Return, \\e = Esc); prints the line and the faint hint.
             guard let tp = project?.bottomPanel.terminalPanel else { return }

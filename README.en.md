@@ -42,6 +42,7 @@ Requires macOS 14 or later. On first launch a setup assistant walks through them
 - **Refactoring:** rename with a diff preview, all-or-nothing apply with rollback, one-step undo
 - **Run & debug:** gutter ▶ for `go run`, tests and benchmarks with a test tree; delve breakpoints, stepping, variables, evaluate
 - **Git, search, terminal:** tree and gutter status, commit, branches, stash; go to file / symbol, find and replace in files; a tabbed xterm-compatible terminal that hints common Go commands and your project's history in faint text (→ accepts)
+- **Files:** New Go File (`⌘N`, adds `package`) and New File (`⌥⌘N`, any name as typed, folders included such as `docs/plan.md`)
 - **Split panes:** split right (`⌘\`) or down (`⌥⌘\`), nested, each pane with its own tabs; one file can show in several panes over one shared buffer; move tabs between panes, switch with `⌥⌘]` / `⌥⌘[`; the layout is restored with the session
 - **Markdown preview:** live, beside the editor (`⇧⌘V`); only changed blocks are re-laid out, so long documents stay at a few ms per keystroke. Mermaid diagrams are rendered in-process by [merman](https://github.com/Latias94/merman) (native Rust, no browser or Node.js), themed for dark and light. Tables, task lists, highlighted Go code, quotes, local images, links, and scroll sync with the editor
 - **Look:** dark, light, or follow the system; any installed monospaced font

@@ -52,6 +52,7 @@ enum MainMenu {
             item("Welcome", #selector(P.ogShowWelcome(_:)), ""),
             .separator(),
             item("New Go File…", #selector(P.ogNewFile(_:)), "n"),
+            item("New File…", #selector(P.ogNewPlainFile(_:)), "n", [.command, .option]),
             item("Save", #selector(P.ogSave(_:)), "s"),
             item("Save All", #selector(P.ogSaveAll(_:)), "s", [.command, .option]),
             .separator(),
