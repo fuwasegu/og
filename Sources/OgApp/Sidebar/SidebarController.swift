@@ -335,6 +335,7 @@ final class FileTreeController: NSViewController, NSOutlineViewDataSource, NSOut
             menu.addItem(i)
         }
         add("New Go File…", #selector(newFile))
+        add("New File…", #selector(newPlainFile))
         add("New Directory…", #selector(newDirectory))
         menu.addItem(.separator())
         add("Rename…", #selector(renameItem))
@@ -357,17 +358,31 @@ final class FileTreeController: NSViewController, NSOutlineViewDataSource, NSOut
         createFile(named: name, in: dir)
     }
 
-    func createFile(named name: String, in dir: URL) {
-        let fileName = name.contains(".") ? name : name + ".go"
-        let url = dir.appendingPathComponent(fileName).standardizedFileURL
-        guard !FileManager.default.fileExists(atPath: url.path) else { context.setStatus("\(fileName) already exists"); return }
+    /// Any file: the name is used as typed (`Makefile`, `notes.md`, `docs/plan.md` with folders).
+    @objc func newPlainFile() {
+        let dir = selectedDirectory
+        guard let name = prompt("New file", placeholder: "name.ext or dir/name.ext", allowSubpath: true) else { return }
+        createFile(named: name, in: dir, goByDefault: false)
+    }
+
+    /// Creates and opens a file. `goByDefault`: a name without an extension gets `.go` (New Go File).
+    func createFile(named name: String, in base: URL, goByDefault: Bool = true) {
+        let typed = goByDefault && !name.contains(".") ? name + ".go" : name
+        let url = base.appendingPathComponent(typed).standardizedFileURL
+        let dir = url.deletingLastPathComponent()
+        let fileName = url.lastPathComponent
+        guard url.path.hasPrefix(context.root.standardizedFileURL.path + "/") else { context.setStatus("\(typed) is outside the project"); return }
+        guard !FileManager.default.fileExists(atPath: url.path) else { context.setStatus("\(typed) already exists"); return }
         let pkg = Self.packageName(for: dir)
         let content = fileName.hasSuffix(".go") ? "package \(pkg)\n\n" : ""
+        // The outermost folder this creates, so the tree shows the new folders too.
+        var top = dir
+        while !FileManager.default.fileExists(atPath: top.deletingLastPathComponent().path) { top = top.deletingLastPathComponent() }
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             try Data(content.utf8).write(to: url, options: .atomic)
-            filesChanged([url.path])
-            guard fileName.hasSuffix(".go") else { context.open(url, line: 2, column: 0); return }
+            filesChanged([url.path, top.path])
+            guard fileName.hasSuffix(".go") else { context.open(url, line: 0, column: 0); return }
             // gopls must learn the file exists before it is opened, or it never puts it in a package
             // ("No active builds contain …") and completion stays dead in it.
             let ctx = context
@@ -482,7 +497,7 @@ final class FileTreeController: NSViewController, NSOutlineViewDataSource, NSOut
         NSPasteboard.general.setString(url.path, forType: .string)
     }
 
-    private func prompt(_ title: String, placeholder: String, initial: String = "") -> String? {
+    private func prompt(_ title: String, placeholder: String, initial: String = "", allowSubpath: Bool = false) -> String? {
         let alert = NSAlert()
         alert.messageText = title
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
@@ -494,7 +509,11 @@ final class FileTreeController: NSViewController, NSOutlineViewDataSource, NSOut
         alert.window.initialFirstResponder = field
         guard alert.runModal() == .alertFirstButtonReturn else { return nil }
         let v = field.stringValue.trimmingCharacters(in: .whitespaces)
-        return v.isEmpty || v.contains("/") ? nil : v
+        if v.isEmpty { return nil }
+        if !allowSubpath { return v.contains("/") ? nil : v }
+        // Relative paths only, and never above the selected folder.
+        let parts = v.split(separator: "/", omittingEmptySubsequences: false)
+        return v.hasPrefix("/") || parts.contains { $0.isEmpty || $0 == ".." || $0 == "." } ? nil : v
     }
 }
 
