@@ -74,12 +74,15 @@ final class CompletionPopup: NSObject, NSTableViewDataSource, NSTableViewDelegat
         panel.contentView = content
     }
 
-    func show(items: [LSPCompletionItem], text: NSString, caret: Int, staleRanges: Bool, explicit: Bool) {
+    /// `anchor`: where the typed prefix starts; by default the identifier before the caret.
+    func show(items: [LSPCompletionItem], text: NSString, caret: Int, staleRanges: Bool, explicit: Bool, anchor: Int? = nil) {
         guard let editor else { return }
         all = items.sorted { ($0.sortText ?? $0.label) < ($1.sortText ?? $1.label) }
         self.staleRanges = staleRanges
-        anchor = caret
-        while anchor > 0, let u = UnicodeScalar(text.character(at: anchor - 1)), CharacterSet.alphanumerics.contains(u) || u == "_" { anchor -= 1 }
+        self.anchor = caret
+        if let anchor, anchor <= caret { self.anchor = anchor }
+        while anchor == nil, self.anchor > 0, let u = UnicodeScalar(text.character(at: self.anchor - 1)),
+              CharacterSet.alphanumerics.contains(u) || u == "_" { self.anchor -= 1 }
         refilter(text: text, caret: caret)
         guard !shown.isEmpty else { close(); return }
         // Position under the caret.

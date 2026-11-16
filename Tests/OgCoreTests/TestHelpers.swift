@@ -189,3 +189,12 @@ func styleTriggers(_ marked: String) -> Bool {
     let text = ns.replacingCharacters(in: NSRange(location: caret, length: 1), with: "") as NSString
     return GoStyleCompletions.shouldTrigger(in: text, caret: caret)
 }
+
+/// Markdown completion context with the caret at `|`.
+func mdContext(_ marked: String, explicit: Bool = false) -> MarkdownCompletionContext? {
+    let ns = marked as NSString
+    let caret = ns.range(of: "|").location
+    let text = ns.replacingCharacters(in: NSRange(location: caret, length: 1), with: "") as NSString
+    return MarkdownCompletions.context(in: text, caret: caret, explicit: explicit)
+}
+func nsRange(_ location: Int, _ length: Int) -> NSRange { NSRange(location: location, length: length) }

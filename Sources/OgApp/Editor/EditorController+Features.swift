@@ -5,6 +5,7 @@ extension EditorController {
     // MARK: - Typing hooks
 
     func textTyped(_ s: String) {
+        if document.isMarkdown { markdownTyped(s); return }
         guard document.isGo else { return }
         if completion?.isVisible == true {
             if s.count == 1, let c = s.unicodeScalars.first, CharacterSet.alphanumerics.contains(c) || s == "_" {
@@ -40,6 +41,7 @@ extension EditorController {
     }
 
     func requestCompletion(explicit: Bool) {
+        if document.isMarkdown { requestMarkdownCompletion(explicit: explicit); return }
         guard document.isGo else { return }
         let flushDoc = document
         let uri = document.uri
@@ -102,6 +104,7 @@ extension EditorController {
         document.undoManager.setActionName("Completion")
         if text.hasSuffix("()") == false && text.contains("(") { showSignatureHelp() }
         styleCompletionAccepted(item)
+        markdownCompletionAccepted(text)
     }
 
     /// Keys while the completion popup is open. Returns true if consumed.
