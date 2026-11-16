@@ -272,6 +272,9 @@ final class CodeTextView: NSTextView {
         textStorage?.replaceCharacters(in: range, with: text)
         didChangeText()
         setSelectedRange(NSRange(location: caret, length: selectLength))
+        // Raw storage edits bypass NSTextView's own scroll-to-caret (e.g. Enter on a long
+        // line scrolled right): follow the caret both vertically and horizontally.
+        scrollRangeToVisible(NSRange(location: caret, length: 0))
     }
 
     // MARK: - Line commands (GoLand keymap)
