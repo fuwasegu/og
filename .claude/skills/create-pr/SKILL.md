@@ -65,7 +65,7 @@ Write `@name` only for a real GitHub login you mean to notify.
 
 ## 6. Wait for CI
 
-1. `gh pr checks <number> --watch --interval 30`
+1. `gh pr checks <number> --watch --interval 30`. A PR that only changes `*.md` files or `.claude/` runs no CI (`paths-ignore` in `.github/workflows/ci.yml`); `gh pr checks` then reports no checks, and that is expected.
 2. If CI fails, read the log (`gh run view <id> --log-failed`), fix the cause on the same branch, and push again. Do not merge a red PR.
 3. Report the PR URL and the CI result to the user.
 
