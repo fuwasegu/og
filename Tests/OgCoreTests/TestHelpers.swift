@@ -198,3 +198,8 @@ func mdContext(_ marked: String, explicit: Bool = false) -> MarkdownCompletionCo
     return MarkdownCompletions.context(in: text, caret: caret, explicit: explicit)
 }
 func nsRange(_ location: Int, _ length: Int) -> NSRange { NSRange(location: location, length: length) }
+func applyEdits(_ text: String, _ edits: [(range: NSRange, text: String)]) -> String {
+    let m = NSMutableString(string: text)
+    for e in edits.sorted(by: { $0.range.location > $1.range.location }) { m.replaceCharacters(in: e.range, with: e.text) }
+    return m as String
+}

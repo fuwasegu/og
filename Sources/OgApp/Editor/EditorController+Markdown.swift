@@ -62,6 +62,18 @@ extension EditorController {
         }
     }
 
+    /// ⌘S on a Markdown file: tables, headings and whitespace (MarkdownFormatter), as one undo step.
+    func formatMarkdown() {
+        let old = document.storage.string
+        let new = MarkdownFormatter.format(old)
+        guard new != old else { return }
+        let lines = document.lines
+        let edits = MarkdownFormatter.edits(from: old, to: new).map { LSPTextEdit(range: lines.lspRange(for: $0.range), newText: $0.text) }
+        let caret = MarkdownFormatter.mapCaret(caretOffset, from: old, to: new)
+        applyTextEdits(edits, undoName: "Format")
+        textView.setSelectedRange(NSRange(location: min(caret, document.storage.length), length: 0))
+    }
+
     /// After a directory was accepted in a link, offer its contents.
     func markdownCompletionAccepted(_ inserted: String) {
         guard document.isMarkdown, inserted.hasSuffix("/") else { return }

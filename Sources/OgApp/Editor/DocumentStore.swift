@@ -234,8 +234,14 @@ final class DocumentStore {
         return !documents.values.contains { $0.dirty }
     }
 
-    /// Cmd-S: organize imports + gofmt via gopls, then save.
+    /// Cmd-S: organize imports + gofmt via gopls (Markdown: og's formatter), then save.
     func saveWithFormatting(_ doc: Document, editor: EditorController?) {
+        if doc.isMarkdown, let editor {
+            editor.formatMarkdown()
+            doc.markEditedIfNeeded()
+            save(doc)
+            return
+        }
         guard doc.isGo, let ctx = context else { save(doc); return }
         let uri = doc.uri
         Task { @MainActor in
