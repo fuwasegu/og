@@ -47,6 +47,7 @@ enum MainMenu {
         recentMenu.delegate = RecentMenuDelegate.shared
         recent.submenu = recentMenu
         main.addItem(menu("File", [
+            item("New Project…", #selector(AppDelegate.ogNewProject(_:)), "n", [.command, .shift]),
             item("Open…", #selector(AppDelegate.openFolderPanel(_:)), "o"),
             recent,
             item("Welcome", #selector(P.ogShowWelcome(_:)), ""),

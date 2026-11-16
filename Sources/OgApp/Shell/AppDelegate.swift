@@ -4,7 +4,8 @@ import OgCore
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     static weak var shared: AppDelegate?
-    private var projects: [ProjectWindowController] = []
+    private(set) var projects: [ProjectWindowController] = []
+    private var newProject: NewProjectWindowController?
     private var welcome: WelcomeWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -65,6 +66,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if welcome == nil { welcome = WelcomeWindowController() }
         welcome?.showWindow(nil)
         welcome?.window?.makeKeyAndOrderFront(nil)
+    }
+
+    @objc func ogNewProject(_ sender: Any?) {
+        if newProject?.window?.isVisible != true { newProject = NewProjectWindowController() }
+        newProject?.showWindow(nil)
+        newProject?.window?.makeKeyAndOrderFront(nil)
     }
 
     @objc func openFolderPanel(_ sender: Any?) {

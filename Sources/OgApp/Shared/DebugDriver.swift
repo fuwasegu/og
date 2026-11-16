@@ -91,7 +91,36 @@ enum DebugDriver {
             st.enumerateAttribute(.font, in: lr) { v, r, _ in
                 print("fonts: \((st.string as NSString).substring(with: r).debugDescription) -> \((v as? NSFont)?.fontName ?? "nil")")
             }
-        case "panes":
+        case "newproject":
+            // newproject PARENT NAME [app|library|empty] [git]: create a project as the dialog would, then open it.
+            let a = arg.split(separator: " ").map(String.init)
+            guard a.count >= 2 else { return }
+            let template = a.count > 2 ? ProjectTemplate(rawValue: a[2]) ?? .app : .app
+            let scaffold = ProjectScaffold(name: a[1], module: ProjectScaffold.suggestedModule(parentPath: a[0], name: a[1]),
+                                           template: template, gitInit: a.contains("git"))
+            do {
+                let dir = try scaffold.create(in: URL(fileURLWithPath: a[0]))
+                print("newproject: \(dir.path) module=\(scaffold.module)")
+                NewProjectWindowController.open(dir, scaffold: scaffold)
+                let opened = AppDelegate.shared?.projects.first { $0.context.root == dir.standardizedFileURL }
+                let ed = opened?.editorArea.current
+                print("newproject: opened=\(opened != nil) file=\(ed?.document.url.lastPathComponent ?? "-") caret=\(ed.map { "\($0.caretPosition.line):\($0.caretPosition.character)" } ?? "-")")
+            } catch {
+                print("newproject: error \(error.localizedDescription)")
+            }
+        case "newprojectdialog":
+            // newprojectdialog NAME PNG: fill the New Project dialog with NAME and write a PNG of it.
+            let a = arg.split(separator: " ").map(String.init)
+            guard a.count == 2 else { return }
+            let c = NewProjectWindowController()
+            c.window?.alphaValue = 0
+            c.window?.orderBack(nil)
+            c.debugSetName(a[0])
+            guard let view = c.window?.contentView, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
+            view.cacheDisplay(in: view.bounds, to: rep)
+            try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: a[1]))
+            c.close()
+
             // panes: the split tree and each pane's tabs.
             print("panes: \(project?.editorArea.layoutSummary ?? "-")")
         case "ime":

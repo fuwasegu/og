@@ -24,6 +24,9 @@
 //   A file shown in several panes is one buffer (one dirty flag, one undo stack), so
 //   `open[f]` means "some pane shows f" and close_tab models closing its last view;
 //   closing any other view only autosaves (ED-2). Not modeled further.
+// ASSUME-6 (2026-11-16, owner request "New Project"): creating a project writes only
+//   into a folder that does not exist yet or is empty, never over existing files, and
+//   then opens it like open_project. It adds no tab or save behavior, so it is not modeled.
 requirements Workspace {
   entity File
   number Content
