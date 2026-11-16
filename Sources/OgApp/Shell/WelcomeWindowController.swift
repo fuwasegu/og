@@ -40,6 +40,9 @@ final class WelcomeWindowController: NSWindowController, NSTableViewDataSource, 
         title.textColor = Theme.text
         let subtitle = NSTextField(labelWithString: "Go editor for macOS")
         subtitle.textColor = Theme.secondaryText
+        let create = NSButton(title: "New Project…", target: AppDelegate.shared, action: #selector(AppDelegate.ogNewProject(_:)))
+        create.bezelStyle = .rounded
+        create.controlSize = .large
         let open = NSButton(title: "Open Folder…", target: AppDelegate.shared, action: #selector(AppDelegate.openFolderPanel(_:)))
         open.bezelStyle = .rounded
         open.keyEquivalent = "\r"
@@ -47,7 +50,7 @@ final class WelcomeWindowController: NSWindowController, NSTableViewDataSource, 
         let tools = NSTextField(wrappingLabelWithString: toolSummary())
         tools.font = Theme.smallFont
         tools.textColor = Theme.secondaryText
-        let stack = NSStackView(views: [icon, title, subtitle, open, tools])
+        let stack = NSStackView(views: [icon, title, subtitle, create, open, tools])
         stack.orientation = .vertical
         stack.spacing = 10
         stack.translatesAutoresizingMaskIntoConstraints = false
