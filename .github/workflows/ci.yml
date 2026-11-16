@@ -1,10 +1,16 @@
 name: Swift macOS CI & Guardrail Harness
 
+# macOS runners are scarce, so CI runs once per change: on the pull request.
+# PRs are squash-merged after a rebase onto the latest main (create-pr skill), so
+# CI on the push to main would repeat the same check. Run it on main by hand with
+# workflow_dispatch when needed. Markdown-only changes need no build (docs/assets
+# holds the app icon, so docs/ is not ignored).
 on:
-  push:
-    branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+    paths-ignore:
+      - "**/*.md"
+      - ".claude/**"
   workflow_dispatch:
 
 concurrency:
