@@ -286,6 +286,20 @@ struct DocsCorpusTests {
         \tBox[T comparable] struct {
         \t\tValue T
         \t}
+        \t// Pair has a multiline generic parameter list on a struct (T-4).
+        \tPair[
+        \t\tK comparable,
+        \t\tV any,
+        \t] struct {
+        \t\tKey K
+        \t\tVal V
+        \t}
+        \t// MultiIface has a multiline generic parameter list on an interface (T-4).
+        \tMultiIface[
+        \t\tT any,
+        \t] interface {
+        \t\tGet() T
+        \t}
         \t// AliasExpr aliases Ident.
         \tAliasExpr = Ident
         \tunexportedNode struct{}
@@ -311,11 +325,16 @@ struct DocsCorpusTests {
         let ident = chunks.first { $0.packageName == "go/ast" && $0.symbol == "Ident" }
         let handler = chunks.first { $0.packageName == "go/ast" && $0.symbol == "Handler" }
         let box = chunks.first { $0.packageName == "go/ast" && $0.symbol == "Box" }
+        let pair = chunks.first { $0.packageName == "go/ast" && $0.symbol == "Pair" }
+        let multiIface = chunks.first { $0.packageName == "go/ast" && $0.symbol == "MultiIface" }
         let alias = chunks.first { $0.packageName == "go/ast" && $0.symbol == "AliasExpr" }
         #expect(node?.kind == .type && stringContains(node?.signature ?? "", "Pos() int"))
         #expect(ident?.kind == .type && ident?.signature == "type Ident struct { ... }" && stringContains(ident?.summary ?? "", "identifier"))
         #expect(handler?.kind == .type && stringContains(handler?.signature ?? "", "y string"))
         #expect(box?.kind == .type && stringContains(box?.signature ?? "", "Box[T comparable]"))
+        // T-4: multiline generic struct emits concise `{ ... }` without folding body fields; interface keeps methods
+        #expect(pair?.kind == .type && stringContains(pair?.signature ?? "", "struct { ... }") && !stringContains(pair?.signature ?? "", "Key K"))
+        #expect(multiIface?.kind == .type && stringContains(multiIface?.signature ?? "", "Get() T"))
         #expect(alias?.kind == .type)
         #expect(!chunks.contains { $0.symbol == "unexportedNode" })
 
@@ -627,11 +646,12 @@ struct DocsBatchTests {
         #expect(fetched[missing] == nil)
     }
 
-    @Test("Legacy v2 GOROOT+bundled hybrid pack migrates provenance accurately to schema v3 (S-1)")
+    @Test("Legacy v2 migrates provenance in place, v1 stays flagged for re-import, and corrupt pack errors are isolated (S-1, T-1, T-2)")
     func legacyV2PackMigratesProvenanceAccurately() async throws {
         let dir = TempDir()
         defer { dir.cleanup() }
         let mgr = try makeDocsPackManager(in: dir)
+        let root = await mgr.rootDirectory
 
         let realGorootChunk = DocsChunk(
             goVersion: "1.23", source: .stdlib, provenance: .officialExtracted,
@@ -641,13 +661,24 @@ struct DocsBatchTests {
         )
         let bundledSpec = try #require(BundledGoCorpus.chunks(forGoVersion: "1.23").first { $0.source == .spec && $0.symbol == "for" })
 
-        try createLegacyV2Pack(in: await mgr.rootDirectory, goVersion: "1.23", chunks: [realGorootChunk, bundledSpec])
+        // Install 3 packs: a corrupt v2 (1.24, sorted first), a healthy v2 (1.23), and a true v1 (1.21)
+        try createCorruptLegacyV2Pack(in: root, goVersion: "1.24")
+        try createLegacyV2Pack(in: root, goVersion: "1.23", chunks: [realGorootChunk, bundledSpec])
+        try createLegacyV1Pack(in: root, goVersion: "1.21")
+
         #expect(await mgr.manifest(for: "1.23")?.schemaVersion == 2)
+        #expect(await mgr.manifest(for: "1.21")?.needsReimport == true)
 
-        let migrated = try await mgr.migrateLegacyPacksIfNeeded()
-        #expect(migrated == 1)
+        let report = await mgr.migrateLegacyPacksIfNeeded()
+        // T-2: corrupt 1.24 fails without aborting 1.23 migration
+        #expect(report.failedVersions["1.24"] != nil)
+        #expect(report.migratedVersions == ["1.23"])
+        // T-1: true v1 pack is NOT falsely bumped to v3; stays flagged for re-import
+        #expect(report.legacyV1ReimportVersions == ["1.21"])
+        #expect(await mgr.manifest(for: "1.21")?.schemaVersion == 1)
+        #expect(await mgr.manifest(for: "1.21")?.needsReimport == true)
+
         #expect(await mgr.manifest(for: "1.23")?.schemaVersion == DocsPackManifest.currentSchemaVersion)
-
         let idx = try await mgr.openIndex(for: "1.23")
         defer { idx?.close() }
         let restoredReal = try idx?.chunk(forStableID: realGorootChunk.stableID)
@@ -798,8 +829,16 @@ struct DocsGoldenQueryTests {
         #expect(rMethod.cards.first?.provenance == .officialExtracted)
         #expect(!stringContains(rMethod.cards.first?.citation ?? "", "bundled summary"))
 
-        // R-1 & S-3: data-driven concept rules can be loaded from global/per-pack JSON files without code changes
+        // T-3: invalid JSON in concept_rules.json surfaces a parse error instead of failing silently
+        try writeRawText("{invalid json", to: await mgr.conceptRulesURL())
+        let fallbackRules = await mgr.loadConceptRules()
+        #expect(fallbackRules.count == BundledGoCorpus.defaultConceptRules.count)
+        let parseErr = await mgr.conceptRulesLoadError()
+        #expect(parseErr != nil && stringContains(parseErr ?? "", "concept_rules.json"))
+
+        // R-1 & S-3: valid global/per-pack JSON rules clear the error and apply live on search without code changes
         try await mgr.saveCustomConceptRules([DocsConceptRule(triggers: ["ハッシュ計算"], expansions: ["MethodGet"])])
+        #expect(await mgr.conceptRulesLoadError() == nil)
         let rGlobalRule = try await svc.search(query: "ハッシュ計算したい", projectRoot: proj.url)
         #expect(rGlobalRule.status == .found && rGlobalRule.cards.first?.symbol == "MethodGet")
 

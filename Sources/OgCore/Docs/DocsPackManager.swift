@@ -116,6 +116,23 @@ public struct DocsIngestionReport: Sendable, Hashable {
     }
 }
 
+/// Result of migrating legacy installed documentation packs to the current schema (T-1, T-2).
+public struct DocsMigrationReport: Sendable, Hashable {
+    public var migratedVersions: [String]
+    public var failedVersions: [String: String]
+    public var legacyV1ReimportVersions: [String]
+
+    public init(
+        migratedVersions: [String] = [],
+        failedVersions: [String: String] = [:],
+        legacyV1ReimportVersions: [String] = []
+    ) {
+        self.migratedVersions = migratedVersions
+        self.failedVersions = failedVersions
+        self.legacyV1ReimportVersions = legacyV1ReimportVersions
+    }
+}
+
 /// Persisted manager-level settings (M-15: selected embedding model survives restarts).
 private struct DocsManagerSettings: Codable {
     var selectedEmbeddingModel: EmbeddingModelDescriptor?
@@ -136,6 +153,8 @@ public actor DocsPackManager {
     private var pinnedVectorKeys: [String: Set<SharedVectorKey>] = [:]
     private var latestProgress: [String: DocsBatchProgress] = [:]
     private var selectedEmbeddingModel: EmbeddingModelDescriptor?
+    /// T-3: surfaces JSON parse/read errors from `concept_rules.json` instead of silently ignoring typos.
+    private var lastConceptRulesError: String?
 
     public static var defaultRootDirectory: URL {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
@@ -182,19 +201,38 @@ public actor DocsPackManager {
         packDirectory(for: goVersion).appendingPathComponent("concept_rules.json")
     }
 
-    /// Loads data-driven Phase 1 concept rules: bundled defaults + global `concept_rules.json` + optional per-pack `concept_rules.json` (R-1, S-3).
+    /// Loads data-driven Phase 1 concept rules: bundled defaults + global `concept_rules.json` + optional per-pack `concept_rules.json` (R-1, S-3, T-3).
+    /// Records any JSON decode/read error in `conceptRulesLoadError()` instead of silently ignoring typos.
     public func loadConceptRules(forGoVersion goVersion: String? = nil) -> [DocsConceptRule] {
         var rules = BundledGoCorpus.defaultConceptRules
-        rules.append(contentsOf: Self.decodeConceptRules(at: conceptRulesURL()))
+        var errors: [String] = []
+
+        let globalResult = Self.decodeConceptRules(at: conceptRulesURL())
+        rules.append(contentsOf: globalResult.rules)
+        if let err = globalResult.error { errors.append(err) }
+
         if let goVersion {
-            rules.append(contentsOf: Self.decodeConceptRules(at: packConceptRulesURL(for: goVersion)))
+            let packResult = Self.decodeConceptRules(at: packConceptRulesURL(for: goVersion))
+            rules.append(contentsOf: packResult.rules)
+            if let err = packResult.error { errors.append(err) }
         }
+
+        lastConceptRulesError = errors.isEmpty ? nil : errors.joined(separator: "; ")
         return rules
     }
 
-    /// Loads only the per-pack custom concept rules, if any (S-3).
+    /// Loads only the per-pack custom concept rules, if any (S-3, T-3).
     public func loadPackConceptRules(forGoVersion goVersion: String) -> [DocsConceptRule] {
-        Self.decodeConceptRules(at: packConceptRulesURL(for: goVersion))
+        let result = Self.decodeConceptRules(at: packConceptRulesURL(for: goVersion))
+        if let err = result.error {
+            lastConceptRulesError = err
+        }
+        return result.rules
+    }
+
+    /// Most recent read/JSON decode error from `concept_rules.json`, or `nil` when valid/absent (T-3).
+    public func conceptRulesLoadError() -> String? {
+        lastConceptRulesError
     }
 
     /// Persists custom global concept rules to `concept_rules.json` so rules can be extended without code changes (S-3).
@@ -203,14 +241,20 @@ public actor DocsPackManager {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(rules)
         try data.write(to: conceptRulesURL(), options: .atomic)
+        lastConceptRulesError = nil
     }
 
-    private static func decodeConceptRules(at url: URL) -> [DocsConceptRule] {
-        guard let data = try? Data(contentsOf: url),
-              let decoded = try? JSONDecoder().decode([DocsConceptRule].self, from: data) else {
-            return []
+    private static func decodeConceptRules(at url: URL) -> (rules: [DocsConceptRule], error: String?) {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return ([], nil)
         }
-        return decoded
+        do {
+            let data = try Data(contentsOf: url)
+            let decoded = try JSONDecoder().decode([DocsConceptRule].self, from: data)
+            return (decoded, nil)
+        } catch {
+            return ([], "Failed to load \(url.lastPathComponent): \(error.localizedDescription)")
+        }
     }
 
     private func manifestURL(in dir: URL) -> URL {
@@ -265,42 +309,59 @@ public actor DocsPackManager {
         return try DocsIndex(databaseURL: url, readOnly: true)
     }
 
-    /// Migrates existing v1/v2 installed packs (including GOROOT-imported packs) in place to schema v3 (S-1):
-    /// adds missing columns, accurately tags bundled complement chunks with `.bundledCurated` provenance while
-    /// preserving `.officialExtracted` on real GOROOT chunks, checkpoints WAL, and bumps `manifest.schemaVersion`.
+    /// Migrates existing v2 installed packs (including GOROOT-imported packs) in place to schema v3 (S-1, T-1, T-2):
+    /// - v2 packs (`schemaVersion == 2`): adds missing `provenance` column, accurately tags bundled complement chunks
+    ///   with `.bundledCurated` while preserving `.officialExtracted` on real GOROOT chunks, checkpoints WAL, closes DB
+    ///   immediately per pack, and bumps `manifest.schemaVersion` to v3.
+    /// - v1 packs (`schemaVersion < 2`): left unbumped and reported in `legacyV1ReimportVersions` because v1 predates
+    ///   `document_id` and current `contentHash` inputs and requires rebuild/re-import rather than in-place hash matching (T-1).
+    /// - Per-pack errors are isolated in `failedVersions` so one corrupt pack never blocks migration of other packs (T-2).
     @discardableResult
-    public func migrateLegacyPacksIfNeeded() throws -> Int {
+    public func migrateLegacyPacksIfNeeded() -> DocsMigrationReport {
         let fm = FileManager.default
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        var migratedCount = 0
+        var report = DocsMigrationReport()
 
         for var pack in installedPacks() {
             guard pack.schemaVersion < DocsPackManifest.currentSchemaVersion else { continue }
             guard !inFlightVersions.contains(pack.goVersion) else { continue }
 
+            // T-1: v1 packs cannot be reliably reclassified by v2/v3 hashes; leave schemaVersion < 2 so they trigger rebuild/re-import.
+            if pack.needsReimport {
+                report.legacyV1ReimportVersions.append(pack.goVersion)
+                continue
+            }
+
             let dir = packDirectory(for: pack.goVersion)
             let dbURL = dir.appendingPathComponent("index.sqlite")
             guard fm.fileExists(atPath: dbURL.path) else { continue }
 
-            let bundled = BundledGoCorpus.chunks(forGoVersion: pack.goVersion)
-            let bundledHashes = Set(bundled.map(\.contentHash))
-            let bundledNonStdlibIDs = Set(bundled.filter { $0.source != .stdlib }.map(\.stableID))
+            // T-2: isolate per-pack errors and close each SQLite handle immediately before moving to the next pack.
+            do {
+                let bundled = BundledGoCorpus.chunks(forGoVersion: pack.goVersion)
+                let bundledHashes = Set(bundled.map(\.contentHash))
+                let bundledNonStdlibIDs = Set(bundled.filter { $0.source != .stdlib }.map(\.stableID))
 
-            let idx = try DocsIndex(databaseURL: dbURL, readOnly: false)
-            defer { idx.close() }
-            _ = try idx.migrateBundledProvenance(
-                bundledContentHashes: bundledHashes,
-                bundledNonStdlibStableIDs: bundledNonStdlibIDs
-            )
-            try idx.checkpointWAL()
+                try {
+                    let idx = try DocsIndex(databaseURL: dbURL, readOnly: false)
+                    defer { idx.close() }
+                    _ = try idx.migrateBundledProvenance(
+                        bundledContentHashes: bundledHashes,
+                        bundledNonStdlibStableIDs: bundledNonStdlibIDs
+                    )
+                    try idx.checkpointWAL()
+                }()
 
-            pack.schemaVersion = DocsPackManifest.currentSchemaVersion
-            pack.sizeBytes = Self.directorySizeBytes(dir)
-            try encoder.encode(pack).write(to: manifestURL(in: dir), options: .atomic)
-            migratedCount += 1
+                pack.schemaVersion = DocsPackManifest.currentSchemaVersion
+                pack.sizeBytes = Self.directorySizeBytes(dir)
+                try encoder.encode(pack).write(to: manifestURL(in: dir), options: .atomic)
+                report.migratedVersions.append(pack.goVersion)
+            } catch {
+                report.failedVersions[pack.goVersion] = error.localizedDescription
+            }
         }
-        return migratedCount
+        return report
     }
 
     /// Ensures the bundled default Go documentation pack is installed (and migrated if schema changed) offline (Q-1).
@@ -308,7 +369,7 @@ public actor DocsPackManager {
     public func ensureBundledPackInstalled(
         goVersion: String = BundledGoCorpus.defaultVersion
     ) async throws -> DocsPackManifest {
-        _ = try? migrateLegacyPacksIfNeeded()
+        _ = migrateLegacyPacksIfNeeded()
         if let existing = manifest(for: goVersion),
            existing.schemaVersion >= DocsPackManifest.currentSchemaVersion {
             return existing

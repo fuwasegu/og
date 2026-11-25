@@ -257,6 +257,12 @@ public struct DocsPackManifest: Sendable, Hashable, Codable {
     public var sizeBytes: Int64
     public var schemaVersion: Int
 
+    /// True for legacy v1 packs created before `document_id` and updated content hashing;
+    /// v1 packs cannot be reliably provenance-migrated in place and should be re-imported (T-1).
+    public var needsReimport: Bool {
+        schemaVersion < 2
+    }
+
     public init(
         goVersion: String,
         createdAt: String,

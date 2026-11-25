@@ -104,19 +104,28 @@ final class DocsManager {
 
     func refreshPacks() async {
         guard let pm = packManager else { return }
-        // S-1: migrate any existing v1/v2 packs (including GOROOT packs) in place to schema v3 provenance.
-        _ = try? await pm.migrateLegacyPacksIfNeeded()
-        // S-3: wire data-driven global/custom concept rules from disk into ResearchService.
+        // S-1, T-1, T-2: migrate v2 packs in place with per-pack error isolation; surface failures rather than swallowing.
+        let migration = await pm.migrateLegacyPacksIfNeeded()
+        if let firstFail = migration.failedVersions.sorted(by: { $0.key < $1.key }).first {
+            lastError = "Pack go\(firstFail.key) migration failed: \(firstFail.value)"
+        }
+        // S-3, T-3: validate concept_rules.json (surfacing JSON errors) while keeping live disk reload enabled.
         await reloadConceptRules()
         installedPacks = await pm.installedPacks()
         notifyPacksChanged()
     }
 
-    /// Reloads data-driven Phase 1 concept rules (bundled defaults + `concept_rules.json`) into `ResearchService` (S-3).
+    /// Validates `concept_rules.json` (surfacing any parse error in `lastError`) and keeps `ResearchService`
+    /// reading live global & per-pack rules on every search (S-3, T-3).
     func reloadConceptRules() async {
         guard let pm = packManager, let service else { return }
-        let rules = await pm.loadConceptRules()
-        await service.setConceptRules(rules)
+        _ = await pm.loadConceptRules()
+        await service.setConceptRules(nil)
+        if let err = await pm.conceptRulesLoadError() {
+            lastError = err
+        } else if lastError?.contains("concept_rules.json") == true {
+            lastError = nil
+        }
     }
 
     func ensureDefaultPackIfNeeded() async {
@@ -265,13 +274,26 @@ final class DocsManager {
         let hasCompletedDetection = toolchainDetectionCompleted
         let provider: (@Sendable () -> GoVersion?)? = hasCompletedDetection ? { @Sendable in cachedToolchain } : nil
         do {
-            return try await service.search(
+            let answer = try await service.search(
                 query: query,
                 projectRoot: projectRoot,
                 explicitVersionOverride: explicitVersion,
                 editorContext: editorContext,
                 toolchainVersionProvider: provider
             )
+            // T-3: surface any concept_rules.json decode error encountered during live reload.
+            if let pm = packManager {
+                if let err = await pm.conceptRulesLoadError() {
+                    if lastError != err {
+                        lastError = err
+                        notifyProgressChanged()
+                    }
+                } else if lastError?.contains("concept_rules.json") == true {
+                    lastError = nil
+                    notifyProgressChanged()
+                }
+            }
+            return answer
         } catch is CancellationError {
             return DocsAnswer(
                 query: query,

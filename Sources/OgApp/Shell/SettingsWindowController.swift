@@ -316,7 +316,8 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
             let lines = packs.map { p in
                 let kb = max(1, p.sizeBytes / 1024)
                 let mode = p.status == .ready ? "ready (FTS + semantic)" : "FTS-only"
-                return "• go\(p.goVersion): \(p.chunkCount) chunks, \(kb) KB [\(mode)]"
+                let legacyNote = p.needsReimport ? " — legacy v1 schema: re-import recommended" : ""
+                return "• go\(p.goVersion): \(p.chunkCount) chunks, \(kb) KB [\(mode)]\(legacyNote)"
             }
             docsPacksLabel.stringValue = "Installed packs:\n" + lines.joined(separator: "\n")
         }

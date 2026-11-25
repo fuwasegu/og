@@ -886,20 +886,49 @@ public enum DocsCorpusExtractor {
         }
 
         if parenDepth > 0 || bracketDepth > 0 {
-            // S-5: multi-line `func(...)` type or generic type parameter list inside `type (...)`.
-            var parts = [header]
+            // S-5 & T-4: multi-line `func(...)` type OR multi-line generic parameter list `[ ... ] struct/interface { ... }`.
+            var headerParts = [header]
             var i = startIndex + 1
-            while i < lines.count && (braceDepth > 0 || parenDepth > 0 || bracketDepth > 0) {
+            while i < lines.count && braceDepth == 0 && (parenDepth > 0 || bracketDepth > 0) {
                 let l = lines[i]
                 let d = state.scanDelimiters(l)
                 braceDepth += d.brace
                 parenDepth += d.paren
                 bracketDepth += d.bracket
                 let trimmed = l.trimmingCharacters(in: .whitespaces)
-                if !trimmed.isEmpty { parts.append(trimmed) }
+                if !trimmed.isEmpty { headerParts.append(trimmed) }
                 i += 1
             }
-            return (parts.joined(separator: " "), i)
+            let joinedHeader = headerParts.joined(separator: " ")
+            if braceDepth > 0 {
+                let isMultilineInterface = joinedHeader.contains("interface {") || joinedHeader.hasSuffix("interface{")
+                if isMultilineInterface {
+                    var blockLines = [joinedHeader]
+                    while i < lines.count && (braceDepth > 0 || parenDepth > 0 || bracketDepth > 0) {
+                        let l = lines[i]
+                        let d = state.scanDelimiters(l)
+                        braceDepth += d.brace
+                        parenDepth += d.paren
+                        bracketDepth += d.bracket
+                        blockLines.append(l)
+                        i += 1
+                    }
+                    return (blockLines.joined(separator: "\n"), i)
+                } else {
+                    while i < lines.count && (braceDepth > 0 || parenDepth > 0 || bracketDepth > 0) {
+                        let d = state.scanDelimiters(lines[i])
+                        braceDepth += d.brace
+                        parenDepth += d.paren
+                        bracketDepth += d.bracket
+                        i += 1
+                    }
+                    let sig = joinedHeader.hasSuffix("{")
+                        ? String(joinedHeader.dropLast()).trimmingCharacters(in: .whitespaces) + " { ... }"
+                        : joinedHeader
+                    return (sig, i)
+                }
+            }
+            return (joinedHeader, i)
         }
 
         return (header, startIndex + 1)

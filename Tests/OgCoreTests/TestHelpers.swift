@@ -359,6 +359,74 @@ func writeConceptRulesJSON(_ rules: [DocsConceptRule], to url: URL) throws {
     try data.write(to: url, options: .atomic)
 }
 
+func writeRawText(_ text: String, to url: URL) throws {
+    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try text.write(to: url, atomically: true, encoding: .utf8)
+}
+
+/// Creates a genuine legacy schema v1 pack (no `document_id`, no `provenance`, `schemaVersion == 1`) for T-1 testing.
+func createLegacyV1Pack(in rootURL: URL, goVersion: String) throws {
+    let packDir = rootURL.appendingPathComponent("packs/go\(goVersion)", isDirectory: true)
+    try FileManager.default.createDirectory(at: packDir, withIntermediateDirectories: true)
+    let dbURL = packDir.appendingPathComponent("index.sqlite")
+
+    var db: OpaquePointer?
+    guard sqlite3_open_v2(dbURL.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK, let db else {
+        throw DocsStorageError.sqlite("unable to create legacy v1 db")
+    }
+    defer { sqlite3_close(db) }
+
+    let ddl = """
+    CREATE TABLE chunks (
+        stable_id TEXT PRIMARY KEY,
+        go_version TEXT NOT NULL,
+        source TEXT NOT NULL,
+        package_name TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        title TEXT NOT NULL,
+        anchor TEXT NOT NULL,
+        since TEXT,
+        summary TEXT NOT NULL,
+        signature TEXT,
+        example TEXT,
+        body TEXT NOT NULL,
+        search_aliases TEXT NOT NULL,
+        content_hash TEXT NOT NULL
+    );
+    """
+    var err: UnsafeMutablePointer<CChar>?
+    if sqlite3_exec(db, ddl, nil, nil, &err) != SQLITE_OK {
+        let msg = err.map { String(cString: $0) } ?? "v1 ddl failed"
+        sqlite3_free(err)
+        throw DocsStorageError.sqlite(msg)
+    }
+
+    let manifest = DocsPackManifest(
+        goVersion: goVersion,
+        createdAt: "2026-01-01T00:00:00Z",
+        chunkCount: 0,
+        status: .indexingFTSOnly,
+        schemaVersion: 1
+    )
+    try JSONEncoder().encode(manifest).write(to: packDir.appendingPathComponent("manifest.json"), options: .atomic)
+}
+
+/// Creates a corrupt legacy v2 pack (`index.sqlite` contains non-SQLite garbage bytes) for T-2 error isolation testing.
+func createCorruptLegacyV2Pack(in rootURL: URL, goVersion: String) throws {
+    let packDir = rootURL.appendingPathComponent("packs/go\(goVersion)", isDirectory: true)
+    try FileManager.default.createDirectory(at: packDir, withIntermediateDirectories: true)
+    try Data("not a valid sqlite database file".utf8).write(to: packDir.appendingPathComponent("index.sqlite"))
+    let manifest = DocsPackManifest(
+        goVersion: goVersion,
+        createdAt: "2026-01-01T00:00:00Z",
+        chunkCount: 1,
+        status: .indexingFTSOnly,
+        schemaVersion: 2
+    )
+    try JSONEncoder().encode(manifest).write(to: packDir.appendingPathComponent("manifest.json"), options: .atomic)
+}
+
 /// Creates a genuine legacy schema v2 pack on disk (without the `provenance` column) for S-1 migration testing.
 func createLegacyV2Pack(in rootURL: URL, goVersion: String, chunks: [DocsChunk]) throws {
     let packDir = rootURL.appendingPathComponent("packs/go\(goVersion)", isDirectory: true)
