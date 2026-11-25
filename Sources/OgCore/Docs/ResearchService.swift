@@ -29,9 +29,11 @@ public struct DocsAnswerCard: Sendable, Hashable {
     public var reason: String
     public var signature: String?
     public var example: String?
-    /// Citation label: document name + section or symbol (FR-13, G-4).
+    /// Citation label: document name + section or symbol (FR-13, G-4, R-9).
     public var citation: String
     public var sourceKind: DocsSourceKind
+    /// Provenance distinguishing directly extracted official GoDoc from bundled curated summaries (R-9).
+    public var provenance: DocsProvenance
     public var packageName: String
     public var symbol: String
     public var anchor: String
@@ -51,6 +53,7 @@ public struct DocsAnswerCard: Sendable, Hashable {
         example: String?,
         citation: String,
         sourceKind: DocsSourceKind,
+        provenance: DocsProvenance = .officialExtracted,
         packageName: String,
         symbol: String,
         anchor: String,
@@ -66,6 +69,7 @@ public struct DocsAnswerCard: Sendable, Hashable {
         self.example = example
         self.citation = citation
         self.sourceKind = sourceKind
+        self.provenance = provenance
         self.packageName = packageName
         self.symbol = symbol
         self.anchor = anchor
@@ -151,23 +155,24 @@ public struct DocsPreparedSnippet: Sendable, Hashable {
     }
 }
 
-/// Formats and validates a card snippet for insertion into a Go editor (UX-2, DOC-9, M-3, L-11).
+/// Formats and validates a card snippet for insertion into a Go editor (UX-2, DOC-9, M-3, L-11, R-10c).
 public enum DocsCodeInserter {
-    /// Async preparation that runs `gofmt` off the caller/main thread so the UI never blocks (M-3).
+    /// Async preparation that runs `gofmt` off the main thread and terminates `gofmt` immediately on Task cancellation (M-3, R-10c).
     public static func prepareSnippetAsync(
         from card: DocsAnswerCard,
         targetVersion: GoVersion,
         locator: ToolLocator = .shared
     ) async -> DocsPreparedSnippet? {
+        guard !Task.isCancelled else { return nil }
         guard card.canInsert, let raw = card.example, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return nil
         }
         guard GoVersionGate.evaluate(since: card.since, target: targetVersion) == .allowed else {
             return nil
         }
-        return await Task.detached(priority: .userInitiated) {
-            formatGoSnippetDetailed(raw, locator: locator)
-        }.value
+        let prepared = await formatGoSnippetDetailedAsync(raw, locator: locator)
+        guard !Task.isCancelled else { return nil }
+        return prepared
     }
 
     /// Synchronous convenience helper (for unit tests and non-UI callers).
@@ -183,6 +188,28 @@ public enum DocsCodeInserter {
             return nil
         }
         return formatGoSnippetDetailed(raw, locator: locator).code
+    }
+
+    /// Runs `gofmt` asynchronously with cancellation propagation; returns explicit `formattedByGofmt` status (L-11, R-10c).
+    public static func formatGoSnippetDetailedAsync(_ snippet: String, locator: ToolLocator = .shared) async -> DocsPreparedSnippet {
+        let trimmed = snippet.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return DocsPreparedSnippet(code: "", formattedByGofmt: false) }
+        guard !Task.isCancelled, let gofmt = locator.find("gofmt") else {
+            return DocsPreparedSnippet(code: normalizeIndentation(trimmed), formattedByGofmt: false)
+        }
+        let isTopLevel = trimmed.hasPrefix("package ") || trimmed.hasPrefix("func ") || trimmed.hasPrefix("type ")
+        if isTopLevel, let formatted = await runGofmtAsync(gofmt, input: trimmed, env: locator.environment) {
+            return DocsPreparedSnippet(code: formatted.trimmingCharacters(in: .newlines), formattedByGofmt: true)
+        }
+        guard !Task.isCancelled else {
+            return DocsPreparedSnippet(code: normalizeIndentation(trimmed), formattedByGofmt: false)
+        }
+        let wrapped = "package _og\n\nfunc _() {\n" + trimmed + "\n}\n"
+        if let formatted = await runGofmtAsync(gofmt, input: wrapped, env: locator.environment),
+           let unwrapped = unwrapDummyFunc(formatted) {
+            return DocsPreparedSnippet(code: unwrapped, formattedByGofmt: true)
+        }
+        return DocsPreparedSnippet(code: normalizeIndentation(trimmed), formattedByGofmt: false)
     }
 
     /// Runs `gofmt` if available; returns explicit `formattedByGofmt` status (L-11).
@@ -206,6 +233,62 @@ public enum DocsCodeInserter {
 
     public static func formatGoSnippet(_ snippet: String, locator: ToolLocator = .shared) -> String {
         formatGoSnippetDetailed(snippet, locator: locator).code
+    }
+
+    private static func runGofmtAsync(_ executable: String, input: String, env: [String: String]) async -> String? {
+        guard !Task.isCancelled else { return nil }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: executable)
+        proc.environment = env
+        let inPipe = Pipe()
+        let outPipe = Pipe()
+        proc.standardInput = inPipe
+        proc.standardOutput = outPipe
+        proc.standardError = FileHandle.nullDevice
+
+        let output: String? = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                let finished = LockedFlag()
+                let timeoutTask = Task.detached(priority: .utility) {
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    if finished.trySet() {
+                        if proc.isRunning { proc.terminate() }
+                        continuation.resume(returning: nil)
+                    }
+                }
+                proc.terminationHandler = { p in
+                    timeoutTask.cancel()
+                    if finished.trySet() {
+                        guard p.terminationStatus == 0 else {
+                            continuation.resume(returning: nil)
+                            return
+                        }
+                        let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+                        continuation.resume(returning: String(data: data, encoding: .utf8))
+                    }
+                }
+                do {
+                    try proc.run()
+                    if Task.isCancelled {
+                        if proc.isRunning { proc.terminate() }
+                    }
+                    inPipe.fileHandleForWriting.write(Data(input.utf8))
+                    try? inPipe.fileHandleForWriting.close()
+                } catch {
+                    timeoutTask.cancel()
+                    if finished.trySet() {
+                        continuation.resume(returning: nil)
+                    }
+                }
+            }
+        } onCancel: {
+            if proc.isRunning { proc.terminate() }
+        }
+        return Task.isCancelled ? nil : output
     }
 
     private static func runGofmt(_ executable: String, input: String, env: [String: String]) -> String? {
@@ -279,6 +362,7 @@ public actor ResearchService {
     private var enabled: Bool
     private var validatedEndpoint: URL?
     private var queryEmbedder: (any DocsEmbedder)?
+    private var conceptRules: [DocsConceptRule] = BundledGoCorpus.defaultConceptRules
 
     public init(packManager: DocsPackManager, enabled: Bool = false) {
         self.packManager = packManager
@@ -289,6 +373,11 @@ public actor ResearchService {
 
     public func setEnabled(_ value: Bool) {
         enabled = value
+    }
+
+    /// Overrides the temporary Phase 1 data-driven cross-lingual concept rules (R-1).
+    public func setConceptRules(_ rules: [DocsConceptRule]) {
+        conceptRules = rules
     }
 
     /// DES-1 / DOC-6: Validates that any configured model server endpoint is loopback only.
@@ -319,7 +408,7 @@ public actor ResearchService {
         toolchainVersionProvider: (() -> GoVersion?)? = nil
     ) async throws -> DocsAnswer {
         try Task.checkCancellation()
-        let plan = DocsQueryRouter.route(rawQuery)
+        let plan = DocsQueryRouter.route(rawQuery, conceptRules: conceptRules)
 
         // DOC-1: opt-in check
         guard enabled else {
@@ -575,6 +664,7 @@ public actor ResearchService {
                 example: c.example,
                 citation: c.citationLabel,
                 sourceKind: c.source,
+                provenance: c.provenance,
                 packageName: c.packageName,
                 symbol: c.symbol,
                 anchor: c.anchor,

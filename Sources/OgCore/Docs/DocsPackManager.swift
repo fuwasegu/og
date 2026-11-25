@@ -130,6 +130,8 @@ public actor DocsPackManager {
     /// H-8: per-version in-flight guard preventing concurrent re-entrant ingests on the same staging DB.
     private var inFlightVersions: Set<String> = []
     private var cancelRequested: [String: Bool] = [:]
+    /// R-8: marks versions deleted while an ingest was in-flight so staging & orphan vectors are reclaimed on exit.
+    private var deletedWhileInFlight: Set<String> = []
     /// H-9: vector keys pinned by currently running batches so concurrent GC never deletes them.
     private var pinnedVectorKeys: [String: Set<SharedVectorKey>] = [:]
     private var latestProgress: [String: DocsBatchProgress] = [:]
@@ -239,7 +241,7 @@ public actor DocsPackManager {
         return installed
     }
 
-    /// Deletes an installed pack and reclaims unreferenced vectors while preserving staging/in-flight vectors (FR-20, FR-30, H-8, H-9).
+    /// Deletes an installed pack and reclaims unreferenced vectors while preserving other staging/in-flight vectors (FR-20, FR-30, H-8, H-9, R-8).
     @discardableResult
     public func deletePack(goVersion: String) async throws -> Int {
         cancelRequested[goVersion] = true
@@ -249,7 +251,10 @@ public actor DocsPackManager {
             try fm.removeItem(at: packDir)
         }
         let stageDir = stagingDirectory(for: goVersion)
-        if !inFlightVersions.contains(goVersion), fm.fileExists(atPath: stageDir.path) {
+        if inFlightVersions.contains(goVersion) {
+            // R-8: defer staging removal & GC to the in-flight ingest's cancellation exit so no orphan staging leaks.
+            deletedWhileInFlight.insert(goVersion)
+        } else if fm.fileExists(atPath: stageDir.path) {
             try? fm.removeItem(at: stageDir)
         }
         latestProgress.removeValue(forKey: goVersion)
@@ -350,10 +355,12 @@ public actor DocsPackManager {
         }
         inFlightVersions.insert(goVersion)
         cancelRequested[goVersion] = false
+        deletedWhileInFlight.remove(goVersion)
         pinnedVectorKeys[goVersion] = []
         defer {
             inFlightVersions.remove(goVersion)
             pinnedVectorKeys.removeValue(forKey: goVersion)
+            deletedWhileInFlight.remove(goVersion)
         }
 
         let estimate = Self.estimateBatch(chunks: chunks, includesEmbeddings: embedder != nil)
@@ -382,6 +389,15 @@ public actor DocsPackManager {
             onProgress?(p)
         }
 
+        var stageIndexHandle: DocsIndex?
+        var stageClosed = false
+        func closeStageIndex() {
+            if !stageClosed {
+                stageIndexHandle?.close()
+                stageClosed = true
+            }
+        }
+
         do {
             emit(.extracting)
 
@@ -402,8 +418,8 @@ public actor DocsPackManager {
             try fm.createDirectory(at: stageDir, withIntermediateDirectories: true)
             let stageDBURL = stageDir.appendingPathComponent("index.sqlite")
             let stageIndex = try DocsIndex(databaseURL: stageDBURL, readOnly: false)
-            var stageClosed = false
-            defer { if !stageClosed { stageIndex.close() } }
+            stageIndexHandle = stageIndex
+            defer { closeStageIndex() }
 
             let stageRefs = try stageIndex.vectorReferences()
 
@@ -414,10 +430,9 @@ public actor DocsPackManager {
             try stageIndex.removeVectorReferences(forStableIDs: diff.removed + changedIDs)
 
             // Preserve compatible references ONLY for unchanged chunks (FR-25, FR-26, M-9).
+            // R-8: never silently overwrite `selectedEmbeddingModel` here; `selectEmbeddingModel(_:)` owns that state.
             if let embedder {
                 let model = embedder.descriptor
-                selectedEmbeddingModel = model
-                try persistSettings()
                 for (stableID, ref) in previousRefs where unchangedIDs.contains(stableID) {
                     if ref.modelID == model.id && ref.modelVersion == model.version && stageRefs[stableID] == nil {
                         try stageIndex.recordVectorReference(stableID: stableID, key: ref)
@@ -431,7 +446,7 @@ public actor DocsPackManager {
             // M-7: checkpoint WAL before copying the initial FTS-only snapshot!
             try stageIndex.checkpointWAL()
 
-            if !activeExists && embedder != nil {
+            if !activeExists && embedder != nil && !(Task.isCancelled || cancelRequested[goVersion] == true) {
                 try publishInitialFTSOnlySnapshot(fromStageDB: stageDBURL, goVersion: goVersion, chunkCount: chunks.count)
             }
 
@@ -444,8 +459,8 @@ public actor DocsPackManager {
                 for chunk in chunks {
                     if Task.isCancelled || cancelRequested[goVersion] == true {
                         try? stageIndex.checkpointWAL()
-                        stageIndex.close()
-                        stageClosed = true
+                        closeStageIndex()
+                        await cleanupDeletedInFlightIfNeeded(goVersion: goVersion)
                         emit(.cancelled)
                         return DocsIngestionReport(
                             goVersion: goVersion,
@@ -494,11 +509,11 @@ public actor DocsPackManager {
                 finalStatus = .indexingFTSOnly
             }
 
-            // H-8: honor cancellation/deletePack before atomic activation (covers FTS-only path too).
+            // H-8 & R-8: honor cancellation/deletePack before atomic activation (covers FTS-only path too).
             if Task.isCancelled || cancelRequested[goVersion] == true {
                 try? stageIndex.checkpointWAL()
-                stageIndex.close()
-                stageClosed = true
+                closeStageIndex()
+                await cleanupDeletedInFlightIfNeeded(goVersion: goVersion)
                 emit(.cancelled)
                 return DocsIngestionReport(
                     goVersion: goVersion,
@@ -516,8 +531,7 @@ public actor DocsPackManager {
 
             // M-7: flush WAL completely before closing & swapping.
             try stageIndex.checkpointWAL()
-            stageIndex.close()
-            stageClosed = true
+            closeStageIndex()
 
             emit(.activating)
 
@@ -554,10 +568,29 @@ public actor DocsPackManager {
                 cancelled: false
             )
         } catch {
+            // R-8: clean up staging & orphan vectors if deletePack raced with this error/cancellation.
+            closeStageIndex()
+            await cleanupDeletedInFlightIfNeeded(goVersion: goVersion)
             // M-16: always emit `.failed` on any ingestion error (embedder, SQLite, or swap).
             emit(.failed, error: error.localizedDescription)
             throw error
         }
+    }
+
+    private func cleanupDeletedInFlightIfNeeded(goVersion: String) async {
+        guard deletedWhileInFlight.remove(goVersion) != nil else { return }
+        let fm = FileManager.default
+        let stageDir = stagingDirectory(for: goVersion)
+        let activeDir = packDirectory(for: goVersion)
+        if fm.fileExists(atPath: stageDir.path) {
+            try? fm.removeItem(at: stageDir)
+        }
+        if fm.fileExists(atPath: activeDir.path) {
+            try? fm.removeItem(at: activeDir)
+        }
+        pinnedVectorKeys.removeValue(forKey: goVersion)
+        latestProgress.removeValue(forKey: goVersion)
+        _ = try? await garbageCollectSharedVectors()
     }
 
     /// Reclaims any vector in `SharedVectorStore` not referenced by any active pack, staging checkpoint,
@@ -585,7 +618,11 @@ public actor DocsPackManager {
             for dir in entries where dir.lastPathComponent.hasPrefix("go") {
                 let dbURL = dir.appendingPathComponent("index.sqlite")
                 guard FileManager.default.fileExists(atPath: dbURL.path) else { continue }
-                if let stageIdx = try? DocsIndex(databaseURL: dbURL, readOnly: true) {
+                // R-10b: if an uncheckpointed WAL staging DB from a crash fails read-only open,
+                // fall back to read-write open so SQLite recovers the WAL and preserves checkpointed refs.
+                let stageIdx = (try? DocsIndex(databaseURL: dbURL, readOnly: true))
+                    ?? (try? DocsIndex(databaseURL: dbURL, readOnly: false))
+                if let stageIdx {
                     defer { stageIdx.close() }
                     if let refs = try? stageIdx.vectorReferences() {
                         for key in refs.values { referenced.insert(key) }

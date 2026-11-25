@@ -32,6 +32,12 @@ public enum DocsChunkKind: String, Sendable, Hashable, Codable, CaseIterable {
     case releaseNote = "release_note"
 }
 
+/// Provenance distinguishing official extracted GoDoc/docs from og's bundled curated summaries (R-9).
+public enum DocsProvenance: String, Sendable, Hashable, Codable {
+    case officialExtracted = "official_extracted"
+    case bundledCurated = "bundled_curated"
+}
+
 /// One indexed documentation chunk with version-independent stable ID and content hash (FR-7, FR-8, FR-31).
 public struct DocsChunk: Sendable, Hashable, Codable {
     /// Version-independent deterministic ID (FR-31, H-6): derived from
@@ -40,6 +46,8 @@ public struct DocsChunk: Sendable, Hashable, Codable {
     /// Pack Go version (minor key, e.g. `"1.23"` or `"1.21"`).
     public var goVersion: String
     public var source: DocsSourceKind
+    /// Provenance of the chunk's text (official extracted vs og bundled curated summary, R-9).
+    public var provenance: DocsProvenance
     /// For stdlib: Go import path (e.g. `"encoding/json"`). For guides/spec: empty.
     public var packageName: String
     /// Document identity for non-stdlib sources (e.g. `"go_spec"`, `"effective_go"`, `"tutorial"`) to prevent
@@ -68,6 +76,7 @@ public struct DocsChunk: Sendable, Hashable, Codable {
     public init(
         goVersion: String,
         source: DocsSourceKind,
+        provenance: DocsProvenance = .officialExtracted,
         packageName: String,
         documentID: String? = nil,
         symbol: String,
@@ -92,6 +101,7 @@ public struct DocsChunk: Sendable, Hashable, Codable {
         )
         self.goVersion = goVersion
         self.source = source
+        self.provenance = provenance
         self.packageName = packageName
         self.documentID = resolvedDocID
         self.symbol = symbol
@@ -121,6 +131,7 @@ public struct DocsChunk: Sendable, Hashable, Codable {
         restoredStableID: String,
         goVersion: String,
         source: DocsSourceKind,
+        provenance: DocsProvenance = .officialExtracted,
         packageName: String,
         documentID: String,
         symbol: String,
@@ -138,6 +149,7 @@ public struct DocsChunk: Sendable, Hashable, Codable {
         self.stableID = restoredStableID
         self.goVersion = goVersion
         self.source = source
+        self.provenance = provenance
         self.packageName = packageName
         self.documentID = documentID
         self.symbol = symbol
@@ -196,15 +208,18 @@ public struct DocsChunk: Sendable, Hashable, Codable {
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Human-readable citation label (FR-13 / G-4).
+    /// Human-readable citation label (FR-13 / G-4, R-9: clearly marks bundled curated summaries).
     public var citationLabel: String {
+        let sourceLabel = provenance == .bundledCurated
+            ? "\(source.displayName) [og bundled summary]"
+            : source.displayName
         switch source {
         case .stdlib:
             let sym = symbol.isEmpty ? packageName : "\(packageName).\(symbol)"
-            return "\(source.displayName): \(sym)"
+            return "\(sourceLabel): \(sym)"
         case .spec, .guide, .release:
             let suffix = anchor.isEmpty ? title : "\(title) (\(anchor))"
-            return "\(source.displayName): \(suffix)"
+            return "\(sourceLabel): \(suffix)"
         }
     }
 
@@ -230,7 +245,7 @@ public enum DocsPackStatus: String, Sendable, Hashable, Codable {
 
 /// Metadata stored alongside a documentation pack (FR-5, FR-20, Q-4).
 public struct DocsPackManifest: Sendable, Hashable, Codable {
-    public static let currentSchemaVersion = 2
+    public static let currentSchemaVersion = 3
 
     public var goVersion: String
     public var createdAt: String

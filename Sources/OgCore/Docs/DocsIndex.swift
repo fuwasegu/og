@@ -27,6 +27,7 @@ public final class DocsIndex: @unchecked Sendable {
     private let lock = NSLock()
     private var db: OpaquePointer?
     private let hasDocumentIDColumn: Bool
+    private let hasProvenanceColumn: Bool
 
     public init(databaseURL: URL, readOnly: Bool = false) throws {
         self.databaseURL = databaseURL
@@ -51,8 +52,10 @@ public final class DocsIndex: @unchecked Sendable {
         if !readOnly {
             try Self.initializeSchema(db: handle)
             self.hasDocumentIDColumn = true
+            self.hasProvenanceColumn = true
         } else {
             self.hasDocumentIDColumn = Self.tableHasColumn(db: handle, table: "chunks", column: "document_id")
+            self.hasProvenanceColumn = Self.tableHasColumn(db: handle, table: "chunks", column: "provenance")
         }
     }
 
@@ -95,6 +98,7 @@ public final class DocsIndex: @unchecked Sendable {
             stable_id TEXT PRIMARY KEY,
             go_version TEXT NOT NULL,
             source TEXT NOT NULL,
+            provenance TEXT NOT NULL DEFAULT 'official_extracted',
             package_name TEXT NOT NULL,
             document_id TEXT NOT NULL DEFAULT '',
             symbol TEXT NOT NULL,
@@ -135,9 +139,12 @@ public final class DocsIndex: @unchecked Sendable {
         );
         """
         try SQLiteHelpers.exec(db: db, sql: sql)
-        // Migrate v1 databases created before `document_id` was added.
+        // Migrate v1/v2 databases created before `document_id` / `provenance` were added.
         if !Self.tableHasColumn(db: db, table: "chunks", column: "document_id") {
             try SQLiteHelpers.exec(db: db, sql: "ALTER TABLE chunks ADD COLUMN document_id TEXT NOT NULL DEFAULT '';")
+        }
+        if !Self.tableHasColumn(db: db, table: "chunks", column: "provenance") {
+            try SQLiteHelpers.exec(db: db, sql: "ALTER TABLE chunks ADD COLUMN provenance TEXT NOT NULL DEFAULT 'official_extracted';")
         }
     }
 
@@ -163,10 +170,10 @@ public final class DocsIndex: @unchecked Sendable {
                 try SQLiteHelpers.exec(db: db, sql: "DELETE FROM chunks; DELETE FROM chunks_fts;")
                 let insertChunk = """
                 INSERT INTO chunks (
-                    stable_id, go_version, source, package_name, document_id, symbol, kind,
+                    stable_id, go_version, source, provenance, package_name, document_id, symbol, kind,
                     title, anchor, since, summary, signature, example, body,
                     search_aliases, content_hash
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16);
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17);
                 """
                 let insertFTS = """
                 INSERT INTO chunks_fts (
@@ -193,19 +200,20 @@ public final class DocsIndex: @unchecked Sendable {
                     SQLiteHelpers.bindText(chunkStmt, index: 1, value: c.stableID)
                     SQLiteHelpers.bindText(chunkStmt, index: 2, value: c.goVersion)
                     SQLiteHelpers.bindText(chunkStmt, index: 3, value: c.source.rawValue)
-                    SQLiteHelpers.bindText(chunkStmt, index: 4, value: c.packageName)
-                    SQLiteHelpers.bindText(chunkStmt, index: 5, value: c.documentID)
-                    SQLiteHelpers.bindText(chunkStmt, index: 6, value: c.symbol)
-                    SQLiteHelpers.bindText(chunkStmt, index: 7, value: c.kind.rawValue)
-                    SQLiteHelpers.bindText(chunkStmt, index: 8, value: c.title)
-                    SQLiteHelpers.bindText(chunkStmt, index: 9, value: c.anchor)
-                    SQLiteHelpers.bindOptionalText(chunkStmt, index: 10, value: c.since)
-                    SQLiteHelpers.bindText(chunkStmt, index: 11, value: c.summary)
-                    SQLiteHelpers.bindOptionalText(chunkStmt, index: 12, value: c.signature)
-                    SQLiteHelpers.bindOptionalText(chunkStmt, index: 13, value: c.example)
-                    SQLiteHelpers.bindText(chunkStmt, index: 14, value: c.body)
-                    SQLiteHelpers.bindText(chunkStmt, index: 15, value: aliasesJSON)
-                    SQLiteHelpers.bindText(chunkStmt, index: 16, value: c.contentHash)
+                    SQLiteHelpers.bindText(chunkStmt, index: 4, value: c.provenance.rawValue)
+                    SQLiteHelpers.bindText(chunkStmt, index: 5, value: c.packageName)
+                    SQLiteHelpers.bindText(chunkStmt, index: 6, value: c.documentID)
+                    SQLiteHelpers.bindText(chunkStmt, index: 7, value: c.symbol)
+                    SQLiteHelpers.bindText(chunkStmt, index: 8, value: c.kind.rawValue)
+                    SQLiteHelpers.bindText(chunkStmt, index: 9, value: c.title)
+                    SQLiteHelpers.bindText(chunkStmt, index: 10, value: c.anchor)
+                    SQLiteHelpers.bindOptionalText(chunkStmt, index: 11, value: c.since)
+                    SQLiteHelpers.bindText(chunkStmt, index: 12, value: c.summary)
+                    SQLiteHelpers.bindOptionalText(chunkStmt, index: 13, value: c.signature)
+                    SQLiteHelpers.bindOptionalText(chunkStmt, index: 14, value: c.example)
+                    SQLiteHelpers.bindText(chunkStmt, index: 15, value: c.body)
+                    SQLiteHelpers.bindText(chunkStmt, index: 16, value: aliasesJSON)
+                    SQLiteHelpers.bindText(chunkStmt, index: 17, value: c.contentHash)
                     guard sqlite3_step(chunkStmt) == SQLITE_DONE else {
                         throw DocsStorageError.sqlite(String(cString: sqlite3_errmsg(db)))
                     }
@@ -472,9 +480,10 @@ public final class DocsIndex: @unchecked Sendable {
             .joined(separator: " OR ")
 
         var hits: [DocsIndexHit] = try withDB { db in
+            let provCol = hasProvenanceColumn ? "c.provenance" : "'official_extracted' AS provenance"
             let docCol = hasDocumentIDColumn ? "c.document_id" : "'' AS document_id"
             let sql = """
-            SELECT c.stable_id, c.go_version, c.source, c.package_name, \(docCol), c.symbol, c.kind,
+            SELECT c.stable_id, c.go_version, c.source, \(provCol), c.package_name, \(docCol), c.symbol, c.kind,
                    c.title, c.anchor, c.since, c.summary, c.signature, c.example, c.body,
                    c.search_aliases, c.content_hash,
                    bm25(chunks_fts, 0.0, 4.0, 3.0, 5.0, 2.5, 1.0, 4.5) AS rank
@@ -497,7 +506,7 @@ public final class DocsIndex: @unchecked Sendable {
                 let rc = sqlite3_step(stmt)
                 if rc == SQLITE_ROW {
                     let chunk = Self.decodeChunk(stmt: stmt, offset: 0)
-                    let bm25 = sqlite3_column_double(stmt, 16)
+                    let bm25 = sqlite3_column_double(stmt, 17)
                     let normalized = max(0.1, -bm25)
                     out.append(DocsIndexHit(chunk: chunk, score: normalized, matchedBy: .fts5))
                 } else if rc == SQLITE_DONE {
@@ -550,9 +559,9 @@ public final class DocsIndex: @unchecked Sendable {
         return Array(hits.prefix(limit))
     }
 
-    /// Semantic similarity search reading referenced vectors from `SharedVectorStore` (FR-9c, FR-27, FR-30, H-7, M-1, M-9).
+    /// Semantic similarity search reading referenced vectors from `SharedVectorStore` in batch (FR-9c, FR-27, FR-30, H-7, M-1, M-9, R-5).
     /// Strictly validates BOTH embedding model match (FR-27) AND chunk `contentHash` match (M-9),
-    /// and decodes only top-K matching chunks rather than the entire table (H-7).
+    /// fetches vectors in a single batch call (no N+1), and decodes only top-K matching chunks (H-7).
     public func semanticSearch(
         queryVector: [Float],
         model: EmbeddingModelDescriptor,
@@ -564,16 +573,26 @@ public final class DocsIndex: @unchecked Sendable {
         guard !refs.isEmpty else { return [] }
         let currentHashes = try contentHashesByStableID()
 
-        var scoredIDs: [(stableID: String, score: Double)] = []
+        var eligible: [(stableID: String, key: SharedVectorKey)] = []
+        eligible.reserveCapacity(refs.count)
         for (stableID, refKey) in refs {
             // FR-27: strict model match guard
             guard refKey.modelID == model.id && refKey.modelVersion == model.version else { continue }
             // M-9: strict content hash match guard (never use a stale vector for a changed chunk)
             guard currentHashes[stableID] == refKey.contentHash else { continue }
-            guard let vec = try await sharedStore.vector(for: refKey) else { continue }
+            eligible.append((stableID, refKey))
+        }
+        guard !eligible.isEmpty else { return [] }
+
+        // R-5: batch fetch all eligible vectors in one actor/SQLite sweep instead of N+1 awaits.
+        let vectorMap = try await sharedStore.vectors(for: eligible.map(\.key))
+
+        var scoredIDs: [(stableID: String, score: Double)] = []
+        for item in eligible {
+            guard let vec = vectorMap[item.key] else { continue }
             let sim = SharedVectorStore.cosineSimilarity(queryVector, vec)
             if sim >= minimumSimilarity {
-                scoredIDs.append((stableID, sim * 100.0))
+                scoredIDs.append((item.stableID, sim * 100.0))
             }
         }
         scoredIDs.sort { ($0.score, $1.stableID) > ($1.score, $0.stableID) }
@@ -590,9 +609,10 @@ public final class DocsIndex: @unchecked Sendable {
     // MARK: - Decoding (H-7: zero SHA-256 recomputation; L-1: JSON aliases; L-3: error propagation)
 
     private var selectColumns: String {
+        let provCol = hasProvenanceColumn ? "provenance" : "'official_extracted' AS provenance"
         let docCol = hasDocumentIDColumn ? "document_id" : "'' AS document_id"
         return """
-        SELECT stable_id, go_version, source, package_name, \(docCol), symbol, kind,
+        SELECT stable_id, go_version, source, \(provCol), package_name, \(docCol), symbol, kind,
                title, anchor, since, summary, signature, example, body,
                search_aliases, content_hash
         """
@@ -617,19 +637,20 @@ public final class DocsIndex: @unchecked Sendable {
         let stableID = SQLiteHelpers.columnText(stmt, index: offset + 0)
         let goVersion = SQLiteHelpers.columnText(stmt, index: offset + 1)
         let source = DocsSourceKind(rawValue: SQLiteHelpers.columnText(stmt, index: offset + 2)) ?? .stdlib
-        let pkg = SQLiteHelpers.columnText(stmt, index: offset + 3)
-        let docID = SQLiteHelpers.columnText(stmt, index: offset + 4)
-        let sym = SQLiteHelpers.columnText(stmt, index: offset + 5)
-        let kind = DocsChunkKind(rawValue: SQLiteHelpers.columnText(stmt, index: offset + 6)) ?? .section
-        let title = SQLiteHelpers.columnText(stmt, index: offset + 7)
-        let anchor = SQLiteHelpers.columnText(stmt, index: offset + 8)
-        let since = SQLiteHelpers.columnOptionalText(stmt, index: offset + 9)
-        let summary = SQLiteHelpers.columnText(stmt, index: offset + 10)
-        let signature = SQLiteHelpers.columnOptionalText(stmt, index: offset + 11)
-        let example = SQLiteHelpers.columnOptionalText(stmt, index: offset + 12)
-        let body = SQLiteHelpers.columnText(stmt, index: offset + 13)
-        let aliasesRaw = SQLiteHelpers.columnText(stmt, index: offset + 14)
-        let storedHash = SQLiteHelpers.columnText(stmt, index: offset + 15)
+        let provenance = DocsProvenance(rawValue: SQLiteHelpers.columnText(stmt, index: offset + 3)) ?? .officialExtracted
+        let pkg = SQLiteHelpers.columnText(stmt, index: offset + 4)
+        let docID = SQLiteHelpers.columnText(stmt, index: offset + 5)
+        let sym = SQLiteHelpers.columnText(stmt, index: offset + 6)
+        let kind = DocsChunkKind(rawValue: SQLiteHelpers.columnText(stmt, index: offset + 7)) ?? .section
+        let title = SQLiteHelpers.columnText(stmt, index: offset + 8)
+        let anchor = SQLiteHelpers.columnText(stmt, index: offset + 9)
+        let since = SQLiteHelpers.columnOptionalText(stmt, index: offset + 10)
+        let summary = SQLiteHelpers.columnText(stmt, index: offset + 11)
+        let signature = SQLiteHelpers.columnOptionalText(stmt, index: offset + 12)
+        let example = SQLiteHelpers.columnOptionalText(stmt, index: offset + 13)
+        let body = SQLiteHelpers.columnText(stmt, index: offset + 14)
+        let aliasesRaw = SQLiteHelpers.columnText(stmt, index: offset + 15)
+        let storedHash = SQLiteHelpers.columnText(stmt, index: offset + 16)
 
         let aliases: [String]
         if aliasesRaw.hasPrefix("["),
@@ -646,6 +667,7 @@ public final class DocsIndex: @unchecked Sendable {
             restoredStableID: stableID,
             goVersion: goVersion,
             source: source,
+            provenance: provenance,
             packageName: pkg,
             documentID: docID,
             symbol: sym,

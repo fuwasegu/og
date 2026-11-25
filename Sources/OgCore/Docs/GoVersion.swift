@@ -158,6 +158,15 @@ public enum GoVersionResolver {
         return GoVersion(parsing: output)
     }
 
+    /// Async non-blocking `go version` detection (R-10a: never blocks a thread with semaphore wait).
+    public static func detectInstalledToolchainVersionAsync(locator: ToolLocator = .shared) async -> GoVersion? {
+        guard let goExe = locator.find("go") else { return nil }
+        guard let output = await runShortCommandAsync(executable: goExe, arguments: ["version"], env: locator.environment) else {
+            return nil
+        }
+        return GoVersion(parsing: output)
+    }
+
     /// Runs `go env GOROOT` via `ToolLocator` if available.
     public static func detectGoroot(locator: ToolLocator = .shared) -> URL? {
         guard let goExe = locator.find("go") else { return nil }
@@ -167,6 +176,65 @@ public enum GoVersionResolver {
         let path = output.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !path.isEmpty else { return nil }
         return URL(fileURLWithPath: path)
+    }
+
+    /// Async non-blocking `go env GOROOT` detection (R-10a).
+    public static func detectGorootAsync(locator: ToolLocator = .shared) async -> URL? {
+        guard let goExe = locator.find("go") else { return nil }
+        guard let output = await runShortCommandAsync(executable: goExe, arguments: ["env", "GOROOT"], env: locator.environment) else {
+            return nil
+        }
+        let path = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty else { return nil }
+        return URL(fileURLWithPath: path)
+    }
+
+    private static func runShortCommandAsync(executable: String, arguments: [String], env: [String: String]) async -> String? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: executable)
+        proc.arguments = arguments
+        proc.environment = env
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        proc.standardInput = FileHandle.nullDevice
+
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                let finished = LockedFlag()
+                let timeoutTask = Task.detached(priority: .utility) {
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    if finished.trySet() {
+                        if proc.isRunning { proc.terminate() }
+                        continuation.resume(returning: nil)
+                    }
+                }
+                proc.terminationHandler = { _ in
+                    timeoutTask.cancel()
+                    if finished.trySet() {
+                        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                        continuation.resume(returning: String(data: data, encoding: .utf8))
+                    }
+                }
+                do {
+                    try proc.run()
+                    if Task.isCancelled, proc.isRunning {
+                        proc.terminate()
+                    }
+                } catch {
+                    timeoutTask.cancel()
+                    if finished.trySet() {
+                        continuation.resume(returning: nil)
+                    }
+                }
+            }
+        } onCancel: {
+            if proc.isRunning { proc.terminate() }
+        }
     }
 
     private static func runShortCommand(executable: String, arguments: [String], env: [String: String]) -> String? {
@@ -191,6 +259,20 @@ public enum GoVersionResolver {
         }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         return String(data: data, encoding: .utf8)
+    }
+}
+
+/// Thread-safe one-shot flag used to guard continuation resumption on process completion/timeout.
+final class LockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var flag = false
+
+    func trySet() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if flag { return false }
+        flag = true
+        return true
     }
 }
 

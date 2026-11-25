@@ -338,10 +338,28 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         }
     }
 
-    private var selectedDocsVersion: String {
+    private var knownDocsVersions: Set<String> {
+        let d = DocsManager.shared
+        var versions = Set(d.installedPacks.map(\.goVersion))
+        if let detected = d.detectedToolchainVersion?.minorKey {
+            versions.insert(detected)
+        }
+        versions.insert(BundledGoCorpus.defaultVersion)
+        return versions
+    }
+
+    private func parsedSelectedDocsVersion() -> String? {
         let raw = docsVersionCombo.stringValue.trimmingCharacters(in: .whitespaces)
-        if let parsed = GoVersion(parsing: raw) { return parsed.minorKey }
-        return BundledGoCorpus.defaultVersion
+        return GoVersion(parsing: raw)?.minorKey
+    }
+
+    private func showDocsAlert(message: String, info: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = message
+        alert.informativeText = info
+        alert.addButton(withTitle: "OK")
+        if let w = window { alert.beginSheetModal(for: w, completionHandler: nil) } else { alert.runModal() }
     }
 
     @objc private func docsEnabledChanged() {
@@ -354,22 +372,61 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     }
 
     @objc private func docsInstallClicked() {
-        DocsManager.shared.startBundledPackIngestion(goVersion: selectedDocsVersion)
+        guard let ver = parsedSelectedDocsVersion() else {
+            showDocsAlert(
+                message: "Invalid Go Version",
+                info: "Enter a valid Go version such as go\(BundledGoCorpus.defaultVersion)."
+            )
+            return
+        }
+        // R-3: require explicit confirmation before creating a bundled-excerpt pack for an unverified version.
+        if !knownDocsVersions.contains(ver) {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Create pack for unverified Go version go\(ver)?"
+            alert.informativeText = "go\(ver) was not detected among installed packs or your local Go toolchain. Bundled excerpts are curated for go\(BundledGoCorpus.defaultVersion); for an accurate pack of another Go version, use \"Import GOROOT…\" instead. Continue anyway?"
+            alert.addButton(withTitle: "Cancel")
+            alert.addButton(withTitle: "Create Pack")
+            let proceed: (NSApplication.ModalResponse) -> Void = { response in
+                if response == .alertSecondButtonReturn {
+                    DocsManager.shared.startBundledPackIngestion(goVersion: ver)
+                }
+            }
+            if let w = window {
+                alert.beginSheetModal(for: w, completionHandler: proceed)
+            } else {
+                proceed(alert.runModal())
+            }
+            return
+        }
+        DocsManager.shared.startBundledPackIngestion(goVersion: ver)
     }
 
     @objc private func docsImportGorootClicked() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.message = "Choose a local GOROOT directory (containing src/)"
-        if let goroot = GoVersionResolver.detectGoroot() { panel.directoryURL = goroot }
-        if panel.runModal() == .OK, let url = panel.url {
-            DocsManager.shared.startGorootIngestion(goroot: url, goVersion: selectedDocsVersion)
+        guard let ver = parsedSelectedDocsVersion() else {
+            showDocsAlert(
+                message: "Invalid Go Version",
+                info: "Enter the Go version matching the GOROOT you are importing (e.g. go\(BundledGoCorpus.defaultVersion))."
+            )
+            return
+        }
+        Task { @MainActor [weak self] in
+            let detected = await GoVersionResolver.detectGorootAsync()
+            guard self != nil else { return }
+            let panel = NSOpenPanel()
+            panel.canChooseDirectories = true
+            panel.canChooseFiles = false
+            panel.message = "Choose a local GOROOT directory (containing src/) for go\(ver)"
+            if let detected { panel.directoryURL = detected }
+            if panel.runModal() == .OK, let url = panel.url {
+                DocsManager.shared.startGorootIngestion(goroot: url, goVersion: ver)
+            }
         }
     }
 
     @objc private func docsDeleteClicked() {
-        DocsManager.shared.deletePack(goVersion: selectedDocsVersion)
+        guard let ver = parsedSelectedDocsVersion() else { return }
+        DocsManager.shared.deletePack(goVersion: ver)
     }
 
     @objc private func docsCancelClicked() {

@@ -97,7 +97,22 @@ public struct DocsEditorContext: Sendable, Hashable {
     }
 }
 
-/// Deterministic rule-based query router and Japanese->English Go concept expander (FR-1, §6.1).
+/// Data-driven temporary Phase 1 Japanese/English cross-lingual concept expansion rule (R-1).
+/// Separated from router code so rules can be extended or supplied as data without code changes
+/// until Phase 2 cross-lingual embeddings replace/augment lexical expansion.
+public struct DocsConceptRule: Sendable, Hashable, Codable {
+    public var triggers: [String]
+    public var excludeIfPresent: [String]
+    public var expansions: [String]
+
+    public init(triggers: [String], excludeIfPresent: [String] = [], expansions: [String]) {
+        self.triggers = triggers
+        self.excludeIfPresent = excludeIfPresent
+        self.expansions = expansions
+    }
+}
+
+/// Deterministic rule-based query router and data-driven Japanese->English Go concept expander (FR-1, §6.1, R-1).
 public enum DocsQueryRouter {
     /// Known Go standard library package names for deterministic detection.
     public static let knownStdlibPackages: Set<String> = [
@@ -107,29 +122,6 @@ public enum DocsQueryRouter {
         "maps", "math", "math/rand", "net", "net/http", "net/url", "os", "os/exec",
         "path", "path/filepath", "reflect", "regexp", "runtime", "slices", "sort",
         "strconv", "strings", "sync", "sync/atomic", "testing", "text/template", "time", "unicode"
-    ]
-
-    /// Cross-lingual concept rules: (Japanese/English trigger phrases -> canonical Go search terms).
-    private static let conceptExpansions: [(triggers: [String], excludeIfPresent: [String], expansions: [String])] = [
-        (["1行ずつ", "一行ずつ", "行ごと", "行単位", "line by line", "read line"], [], ["bufio", "Scanner", "Scan", "ScanLines"]),
-        (["ファイル", "read file", "write file"], ["1行ずつ", "一行ずつ", "行ごと", "行単位", "line by line"], ["os", "ReadFile", "WriteFile", "bufio", "Scanner"]),
-        (["json", "整形", "インデント", "きれいに", "pretty print", "indent"], [], ["json", "MarshalIndent", "Encoder", "SetIndent", "Unmarshal"]),
-        (["重複", "取り除", "ユニーク", "deduplicate", "dedup", "unique"], [], ["slices", "Compact", "Sort", "deduplicate", "map"]),
-        (["タイムアウト", "timeout", "deadline", "期限", "キャンセル"], [], ["context", "WithTimeout", "deadline", "cancel"]),
-        (["正規表現", "regex", "regexp", "パターンマッチ"], [], ["regexp", "Compile", "MustCompile", "MatchString"]),
-        (["for", "ループ", "繰り返し", "while", "反復", "loop", "iterate"], [], ["for", "range", "For_statements"]),
-        (["switch", "条件分岐", "型スイッチ"], [], ["switch", "Switch_statements"]),
-        (["defer", "後処理", "リソース解放", "finally"], [], ["defer", "Close"]),
-        (["ソート", "並べ替え", "sort"], [], ["slices", "Sort", "SortFunc"]),
-        (["文字列", "連結", "結合", "concat", "string builder"], [], ["strings", "Builder", "WriteString"]),
-        (["数値", "変換", "atoi", "itoa", "parse int"], [], ["strconv", "Atoi", "Itoa"]),
-        (["日時", "日付", "時間", "フォーマット", "date format", "timestamp"], [], ["time", "Format", "Parse", "RFC3339"]),
-        (["goroutine", "並行", "完了待ち", "waitgroup"], [], ["sync", "WaitGroup", "Done", "Wait"]),
-        (["http", "リクエスト", "api", "クライアント"], [], ["net/http", "Client", "NewRequestWithContext"]),
-        (["ディレクトリ", "再帰", "ファイル一覧", "walk"], [], ["path/filepath", "WalkDir"]),
-        (["マップ", "キー一覧", "map keys"], [], ["maps", "Keys", "Collect"]),
-        (["エラー", "ラップ", "wrap error", "errors.is", "errors.as"], [], ["error", "Errorf", "errors.Is", "errors.As"]),
-        (["整数 range", "range over int", "イテレータ", "iter.seq"], [], ["range", "iter.Seq", "For_range", "1.22", "1.23"])
     ]
 
     /// Generic filler words that must NEVER trigger a match on their own (prevents hallucination / false hits).
@@ -142,7 +134,10 @@ public enum DocsQueryRouter {
         "with", "for", "from", "what", "when", "why", "there", "have", "has", "using"
     ]
 
-    public static func route(_ rawQuery: String) -> DocsRoutingPlan {
+    public static func route(
+        _ rawQuery: String,
+        conceptRules: [DocsConceptRule] = BundledGoCorpus.defaultConceptRules
+    ) -> DocsRoutingPlan {
         let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         let language = DocsLanguage.detect(in: query)
         let lower = query.lowercased()
@@ -185,7 +180,7 @@ public enum DocsQueryRouter {
         }
 
         var matchedConcept = false
-        for rule in conceptExpansions {
+        for rule in conceptRules {
             if rule.excludeIfPresent.contains(where: { lower.contains($0) }) {
                 continue
             }

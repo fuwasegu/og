@@ -1,23 +1,51 @@
 import Foundation
 
+/// Target Go build platform (`GOOS` / `GOARCH`) used to evaluate `//go:build` and filename constraints (R-2).
+public struct GoBuildTarget: Sendable, Hashable {
+    public var goos: String
+    public var goarch: String
+
+    public init(goos: String, goarch: String) {
+        self.goos = goos
+        self.goarch = goarch
+    }
+
+    public static var hostDefault: GoBuildTarget {
+        #if arch(arm64)
+        return GoBuildTarget(goos: "darwin", goarch: "arm64")
+        #else
+        return GoBuildTarget(goos: "darwin", goarch: "amd64")
+        #endif
+    }
+}
+
 /// Extracts structured `DocsChunk` items from authoritative Go sources without HTML scraping (FR-4, FR-7):
 /// 1. Local GOROOT `src/` `.go` files (GoDoc comments + exported `func`/`method`/`type`/`interface`/`const`/`var` + `Example*` tests)
 /// 2. `golang/website` Markdown guides (stripping Hugo front matter and shortcode tags while keeping inner prose)
 /// 3. Language specification / release notes sections
 public enum DocsCorpusExtractor {
-    /// Target platform tags used when filtering `//go:build` and filename suffixes (M-13).
+    /// Target platform tags used when filtering `//go:build` and filename suffixes (M-13, R-2).
     public static let defaultTargetGOOS = "darwin"
-    private static let nonDarwinOSNames: Set<String> = [
-        "aix", "android", "dragonfly", "freebsd", "hurd", "illumos", "ios",
+    private static let knownOSNames: Set<String> = [
+        "aix", "android", "darwin", "dragonfly", "freebsd", "hurd", "illumos", "ios",
         "js", "linux", "nacl", "netbsd", "openbsd", "plan9", "solaris", "wasip1", "windows"
     ]
-    private static let darwinCompatibleTags: Set<String> = [
-        "darwin", "unix", "arm64", "amd64", "cgo", "gc"
+    private static let knownArchNames: Set<String> = [
+        "386", "amd64", "arm", "arm64", "loong64", "mips", "mips64", "mips64le",
+        "mipsle", "ppc64", "ppc64le", "riscv64", "s390x", "wasm"
+    ]
+    private static let unixOSNames: Set<String> = [
+        "aix", "android", "darwin", "dragonfly", "freebsd", "hurd", "illumos", "ios",
+        "linux", "netbsd", "openbsd", "solaris"
     ]
 
     /// Extracts standard library chunks from a local `GOROOT/src` directory (FR-4-1, FR-7, L-6).
     /// Includes `builtin` (L-6) and skips `internal/`, `vendor/`, `testdata/`, `cmd/`.
-    public static func extractStdlib(fromGorootSrc srcRoot: URL, goVersion: String, targetGOOS: String = defaultTargetGOOS) -> [DocsChunk] {
+    public static func extractStdlib(
+        fromGorootSrc srcRoot: URL,
+        goVersion: String,
+        target: GoBuildTarget = .hostDefault
+    ) -> [DocsChunk] {
         let fm = FileManager.default
         guard fm.fileExists(atPath: srcRoot.path) else { return [] }
 
@@ -43,18 +71,18 @@ public enum DocsCorpusExtractor {
         for dir in packageDirs.sorted(by: { $0.path < $1.path }) {
             let relPath = relativePackagePath(dir: dir, root: srcRoot)
             guard !relPath.isEmpty else { continue }
-            chunks.append(contentsOf: extractStdlibPackage(directory: dir, importPath: relPath, goVersion: goVersion, targetGOOS: targetGOOS))
+            chunks.append(contentsOf: extractStdlibPackage(directory: dir, importPath: relPath, goVersion: goVersion, target: target))
         }
         return chunks
     }
 
-    /// Extracts exported symbols (`func`, `method`, `type`/`interface`, `const`, `var`) and attaches
-    /// `Example*` functions to their exact parent symbol (H-1, M-12, M-13, M-14).
+    /// Extracts exported symbols (`func`, `method`, `type`/`interface`, `const`, `var`, including grouped declarations)
+    /// and attaches `Example*` functions to their exact parent symbol (H-1, M-12..14, R-2, R-4, R-7).
     public static func extractStdlibPackage(
         directory: URL,
         importPath: String,
         goVersion: String,
-        targetGOOS: String = defaultTargetGOOS
+        target: GoBuildTarget = .hostDefault
     ) -> [DocsChunk] {
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else {
@@ -67,9 +95,9 @@ public enum DocsCorpusExtractor {
         // First collect examples from `*_test.go` files keyed by exact target symbol name.
         var examplesBySymbol: [String: String] = [:]
         for file in goFiles where file.lastPathComponent.hasSuffix("_test.go") {
-            guard matchesBuildFilename(file.lastPathComponent, targetGOOS: targetGOOS),
+            guard matchesBuildFilename(file.lastPathComponent, target: target),
                   let text = try? String(contentsOf: file, encoding: .utf8),
-                  matchesBuildConstraints(in: text, targetGOOS: targetGOOS) else { continue }
+                  matchesBuildConstraints(in: text, target: target) else { continue }
             for (targetSymbol, snippet) in parseExamples(from: text) {
                 if examplesBySymbol[targetSymbol] == nil {
                     examplesBySymbol[targetSymbol] = snippet
@@ -81,9 +109,9 @@ public enum DocsCorpusExtractor {
         var packageDoc: String?
 
         for file in goFiles where !file.lastPathComponent.hasSuffix("_test.go") {
-            guard matchesBuildFilename(file.lastPathComponent, targetGOOS: targetGOOS),
+            guard matchesBuildFilename(file.lastPathComponent, target: target),
                   let text = try? String(contentsOf: file, encoding: .utf8),
-                  matchesBuildConstraints(in: text, targetGOOS: targetGOOS) else { continue }
+                  matchesBuildConstraints(in: text, target: target) else { continue }
             let parsed = parseGoDocFile(text: text, importPath: importPath, goVersion: goVersion, examples: examplesBySymbol)
             if packageDoc == nil, let doc = parsed.packageDoc, !doc.isEmpty {
                 packageDoc = doc
@@ -219,10 +247,10 @@ public enum DocsCorpusExtractor {
         return text
     }
 
-    // MARK: - Build constraints filtering (M-13)
+    // MARK: - Build constraints filtering (M-13, R-2: recursive-descent parser + GOOS/GOARCH)
 
-    /// Evaluates filename OS suffixes like `foo_windows.go` or `bar_linux_amd64.go`.
-    static func matchesBuildFilename(_ fileName: String, targetGOOS: String) -> Bool {
+    /// Evaluates filename OS/ARCH suffixes like `foo_windows.go`, `bar_linux_amd64.go`, or `asm_386.go`.
+    public static func matchesBuildFilename(_ fileName: String, target: GoBuildTarget = .hostDefault) -> Bool {
         var base = fileName
         if base.hasSuffix("_test.go") {
             base = String(base.dropLast("_test.go".count))
@@ -231,16 +259,22 @@ public enum DocsCorpusExtractor {
         }
         let parts = base.split(separator: "_").map(String.init)
         guard parts.count >= 2 else { return true }
-        for suffix in parts.suffix(2) {
-            if nonDarwinOSNames.contains(suffix) && suffix != targetGOOS {
-                return false
-            }
+        let last = parts[parts.count - 1]
+        let prev = parts.count >= 3 ? parts[parts.count - 2] : nil
+
+        if knownArchNames.contains(last) {
+            if last != target.goarch { return false }
+            if let prev, knownOSNames.contains(prev), prev != target.goos { return false }
+            return true
+        }
+        if knownOSNames.contains(last) {
+            return last == target.goos
         }
         return true
     }
 
-    /// Evaluates `//go:build` and legacy `// +build` constraints before the `package` line (M-13).
-    static func matchesBuildConstraints(in text: String, targetGOOS: String) -> Bool {
+    /// Evaluates `//go:build` and legacy `// +build` constraints before the `package` line (R-2).
+    public static func matchesBuildConstraints(in text: String, target: GoBuildTarget = .hostDefault) -> Bool {
         var goBuildExpr: String?
         var plusBuildLines: [String] = []
         for raw in text.components(separatedBy: "\n") {
@@ -253,53 +287,127 @@ public enum DocsCorpusExtractor {
             }
         }
         if let expr = goBuildExpr {
-            return evaluateGoBuildExpr(expr, targetGOOS: targetGOOS)
+            return evaluateGoBuildExpr(expr, target: target)
         }
         if !plusBuildLines.isEmpty {
-            return plusBuildLines.allSatisfy { evaluatePlusBuildLine($0, targetGOOS: targetGOOS) }
+            return plusBuildLines.allSatisfy { evaluatePlusBuildLine($0, target: target) }
         }
         return true
     }
 
-    private static func evaluateGoBuildExpr(_ expr: String, targetGOOS: String) -> Bool {
-        // OR branches: `a || b`
-        let orBranches = expr.components(separatedBy: "||")
-        return orBranches.contains { branch in
-            let andTerms = branch.components(separatedBy: "&&")
-            return andTerms.allSatisfy { rawTerm in
-                let t = rawTerm.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "()")))
-                if t.isEmpty { return true }
-                if t.hasPrefix("!") {
-                    let tag = String(t.dropFirst()).trimmingCharacters(in: .whitespaces)
-                    return !buildTagActive(tag, targetGOOS: targetGOOS)
+    /// Recursive-descent evaluator for Go `//go:build` boolean expressions (`||`, `&&`, `!`, parentheses) (R-2).
+    public static func evaluateGoBuildExpr(_ expr: String, target: GoBuildTarget = .hostDefault) -> Bool {
+        var parser = BuildExprParser(expr: expr, target: target)
+        return parser.parseOr()
+    }
+
+    private struct BuildExprParser {
+        enum Token: Equatable {
+            case lparen, rparen, not, and, or, tag(String)
+        }
+
+        let tokens: [Token]
+        var index: Int = 0
+        let target: GoBuildTarget
+
+        init(expr: String, target: GoBuildTarget) {
+            self.tokens = Self.tokenize(expr)
+            self.target = target
+        }
+
+        static func tokenize(_ s: String) -> [Token] {
+            var out: [Token] = []
+            let chars = Array(s)
+            var i = 0
+            while i < chars.count {
+                let c = chars[i]
+                if c.isWhitespace { i += 1; continue }
+                if c == "(" { out.append(.lparen); i += 1; continue }
+                if c == ")" { out.append(.rparen); i += 1; continue }
+                if c == "!" { out.append(.not); i += 1; continue }
+                if c == "&", i + 1 < chars.count, chars[i + 1] == "&" { out.append(.and); i += 2; continue }
+                if c == "|", i + 1 < chars.count, chars[i + 1] == "|" { out.append(.or); i += 2; continue }
+                var word = ""
+                while i < chars.count {
+                    let ch = chars[i]
+                    if ch.isLetter || ch.isNumber || ch == "_" || ch == "." {
+                        word.append(ch)
+                        i += 1
+                    } else {
+                        break
+                    }
                 }
-                return buildTagActive(t, targetGOOS: targetGOOS)
+                if !word.isEmpty {
+                    out.append(.tag(word))
+                } else {
+                    i += 1
+                }
+            }
+            return out
+        }
+
+        mutating func parseOr() -> Bool {
+            var value = parseAnd()
+            while index < tokens.count && tokens[index] == .or {
+                index += 1
+                let rhs = parseAnd()
+                value = value || rhs
+            }
+            return value
+        }
+
+        mutating func parseAnd() -> Bool {
+            var value = parseUnary()
+            while index < tokens.count && tokens[index] == .and {
+                index += 1
+                let rhs = parseUnary()
+                value = value && rhs
+            }
+            return value
+        }
+
+        mutating func parseUnary() -> Bool {
+            guard index < tokens.count else { return false }
+            switch tokens[index] {
+            case .not:
+                index += 1
+                return !parseUnary()
+            case .lparen:
+                index += 1
+                let inner = parseOr()
+                if index < tokens.count && tokens[index] == .rparen { index += 1 }
+                return inner
+            case .tag(let name):
+                index += 1
+                return DocsCorpusExtractor.buildTagActive(name, target: target)
+            default:
+                index += 1
+                return false
             }
         }
     }
 
-    private static func evaluatePlusBuildLine(_ line: String, targetGOOS: String) -> Bool {
-        // Space-separated OR clauses, comma-separated AND terms.
+    private static func evaluatePlusBuildLine(_ line: String, target: GoBuildTarget) -> Bool {
         let clauses = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
         return clauses.contains { clause in
             let terms = clause.split(separator: ",")
             return terms.allSatisfy { rawTerm in
                 let t = String(rawTerm)
                 if t.hasPrefix("!") {
-                    return !buildTagActive(String(t.dropFirst()), targetGOOS: targetGOOS)
+                    return !buildTagActive(String(t.dropFirst()), target: target)
                 }
-                return buildTagActive(t, targetGOOS: targetGOOS)
+                return buildTagActive(t, target: target)
             }
         }
     }
 
-    private static func buildTagActive(_ tag: String, targetGOOS: String) -> Bool {
+    private static func buildTagActive(_ tag: String, target: GoBuildTarget) -> Bool {
         if tag == "ignore" { return false }
-        if tag == targetGOOS { return true }
-        if nonDarwinOSNames.contains(tag) { return false }
-        if targetGOOS == "darwin" && darwinCompatibleTags.contains(tag) { return true }
+        if tag == target.goos || tag == target.goarch { return true }
+        if tag == "unix" { return unixOSNames.contains(target.goos) }
+        if tag == "cgo" || tag == "gc" { return true }
+        if knownOSNames.contains(tag) || knownArchNames.contains(tag) { return false }
         if tag.hasPrefix("go1.") { return true }
-        // Unknown positive feature/arch tags are conservatively treated as inactive unless non-OS.
         return false
     }
 
@@ -394,12 +502,12 @@ public enum DocsCorpusExtractor {
                     continue
                 }
 
-                // Single-line `const Name = ...` or `var Name = ...` (H-1)
+                // Single-line `const A, B = 1, 2` or `var A, B int = ...` (H-1, R-7: supports multi-name specs)
                 if trimmed.hasPrefix("const ") || trimmed.hasPrefix("var ") {
                     let kind: DocsChunkKind = trimmed.hasPrefix("const ") ? .constant : .variable
                     let keywordLen = kind == .constant ? 6 : 4
                     let rest = String(trimmed.dropFirst(keywordLen)).trimmingCharacters(in: .whitespaces)
-                    if let name = leadingIdentifier(rest), isExported(name) {
+                    for name in leadingIdentifierList(rest) where isExported(name) {
                         chunks.append(makeStdlibChunk(
                             importPath: importPath,
                             symbol: name,
@@ -435,7 +543,23 @@ public enum DocsCorpusExtractor {
                     continue
                 }
 
-                // `type` (preserves interface method set and struct definition summary, M-14)
+                // Grouped `type (...)` blocks (R-4)
+                if trimmed.hasPrefix("type (") || trimmed == "type(" {
+                    let (groupChunks, nextIdx) = parseTypeGroup(
+                        lines: lines,
+                        startIndex: i,
+                        groupDoc: doc,
+                        importPath: importPath,
+                        goVersion: goVersion,
+                        examples: examples
+                    )
+                    chunks.append(contentsOf: groupChunks)
+                    pendingComments.removeAll()
+                    i = nextIdx
+                    continue
+                }
+
+                // Single `type` (preserves full interface method set and struct definition summary, M-14, R-7)
                 if trimmed.hasPrefix("type ") {
                     let (declOpt, nextIdx) = parseExportedType(lines: lines, startIndex: i)
                     if let decl = declOpt {
@@ -528,7 +652,8 @@ public enum DocsCorpusExtractor {
                 let rawComment = String(trimmed[trimmed.index(cIdx, offsetBy: 2)...])
                 inlineComment = rawComment.hasPrefix(" ") ? String(rawComment.dropFirst()) : rawComment
             }
-            if let name = leadingIdentifier(codePart), isExported(name) {
+            // Extract all comma-separated exported identifiers on the LHS (`A, B = 1, 2`, R-7)
+            for name in leadingIdentifierList(codePart) where isExported(name) {
                 var docParts: [String] = []
                 if !itemComments.isEmpty {
                     docParts.append(itemComments.joined(separator: "\n"))
@@ -546,6 +671,60 @@ public enum DocsCorpusExtractor {
                     example: examples[name],
                     goVersion: goVersion
                 ))
+            }
+            itemComments.removeAll()
+            i += 1
+        }
+        return (out, i)
+    }
+
+    /// Parses grouped `type (...)` blocks, including nested `interface { ... }` and `struct { ... }` bodies (R-4, R-7).
+    private static func parseTypeGroup(
+        lines: [String],
+        startIndex: Int,
+        groupDoc: String,
+        importPath: String,
+        goVersion: String,
+        examples: [String: String]
+    ) -> ([DocsChunk], Int) {
+        var out: [DocsChunk] = []
+        var itemComments: [String] = []
+        var i = startIndex + 1
+
+        while i < lines.count {
+            let rawLine = lines[i]
+            let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
+            if trimmed == ")" {
+                return (out, i + 1)
+            }
+            if trimmed.isEmpty {
+                itemComments.removeAll()
+                i += 1
+                continue
+            }
+            if trimmed.hasPrefix("//") {
+                let body = String(trimmed.dropFirst(2))
+                itemComments.append(body.hasPrefix(" ") ? String(body.dropFirst()) : body)
+                i += 1
+                continue
+            }
+            if let name = leadingIdentifier(trimmed) {
+                let (sig, nextIdx) = parseTypeSpecBody(lines: lines, startIndex: i, prefixTypeKeyword: true)
+                if isExported(name) {
+                    let doc = !itemComments.isEmpty ? itemComments.joined(separator: "\n") : groupDoc
+                    out.append(makeStdlibChunk(
+                        importPath: importPath,
+                        symbol: name,
+                        kind: .type,
+                        signature: sig,
+                        doc: doc,
+                        example: examples[name],
+                        goVersion: goVersion
+                    ))
+                }
+                itemComments.removeAll()
+                i = nextIdx
+                continue
             }
             itemComments.removeAll()
             i += 1
@@ -631,32 +810,54 @@ public enum DocsCorpusExtractor {
         return ExportedDecl(symbol: name, kind: .function, signature: sig)
     }
 
-    /// Parses an exported `type` declaration, preserving full `interface { ... }` method sets (M-14).
+    /// Parses an exported single `type` declaration, preserving full `interface { ... }` method sets without 40-line cap (M-14, R-7).
     private static func parseExportedType(lines: [String], startIndex: Int) -> (ExportedDecl?, Int) {
         let first = lines[startIndex].trimmingCharacters(in: .whitespaces)
         let rest = String(first.dropFirst(5)).trimmingCharacters(in: .whitespaces)
         guard let name = leadingIdentifier(rest), isExported(name) else {
             return (nil, startIndex + 1)
         }
+        let (sig, nextIdx) = parseTypeSpecBody(lines: lines, startIndex: startIndex, prefixTypeKeyword: false)
+        return (ExportedDecl(symbol: name, kind: .type, signature: sig), nextIdx)
+    }
 
-        if first.contains("interface {") || first.hasSuffix("interface{") {
-            var blockLines = [first]
-            var depth = braceDelta(first)
+    /// Reads a type specification starting at `startIndex`.
+    /// For `interface { ... }`, preserves the complete method set until matching closing brace (R-7).
+    /// For `struct { ... }`, advances past the full struct block and emits a concise `{ ... }` signature.
+    private static func parseTypeSpecBody(lines: [String], startIndex: Int, prefixTypeKeyword: Bool) -> (String, Int) {
+        let first = lines[startIndex].trimmingCharacters(in: .whitespaces)
+        let header = prefixTypeKeyword ? "type \(first)" : first
+
+        let isInterface = first.contains("interface {") || first.hasSuffix("interface{")
+        var state = BraceScanState()
+        var depth = state.scanLine(first)
+
+        if isInterface && depth > 0 {
+            var blockLines = [header]
             var i = startIndex + 1
-            while i < lines.count && depth > 0 && blockLines.count < 40 {
+            while i < lines.count && depth > 0 {
                 let l = lines[i]
-                depth += braceDelta(l)
+                depth += state.scanLine(l)
                 blockLines.append(l)
                 i += 1
             }
-            let sig = blockLines.joined(separator: "\n")
-            return (ExportedDecl(symbol: name, kind: .type, signature: sig), i)
+            return (blockLines.joined(separator: "\n"), i)
         }
 
-        let sig = first.hasSuffix("{")
-            ? String(first.dropLast()).trimmingCharacters(in: .whitespaces) + " { ... }"
-            : first
-        return (ExportedDecl(symbol: name, kind: .type, signature: sig), startIndex + 1)
+        if depth > 0 {
+            // Struct or other braced type body: skip to matching brace so inner fields aren't misparsed inside `type (...)`.
+            var i = startIndex + 1
+            while i < lines.count && depth > 0 {
+                depth += state.scanLine(lines[i])
+                i += 1
+            }
+            let sig = header.hasSuffix("{")
+                ? String(header.dropLast()).trimmingCharacters(in: .whitespaces) + " { ... }"
+                : header
+            return (sig, i)
+        }
+
+        return (header, startIndex + 1)
     }
 
     /// Parses `func ExampleFoo()` / `func ExampleType_Method()` blocks and returns `[parentSymbol: code]` (M-12).
@@ -826,6 +1027,19 @@ public enum DocsCorpusExtractor {
             }
         }
         return out.isEmpty ? nil : out
+    }
+
+    /// Parses comma-separated identifiers on the LHS of a const/var spec (`A, B = 1, 2` -> `["A", "B"]`, R-7).
+    private static func leadingIdentifierList(_ spec: String) -> [String] {
+        var names: [String] = []
+        var rest = Substring(spec).drop(while: { $0.isWhitespace })
+        while let ident = leadingIdentifier(String(rest)) {
+            names.append(ident)
+            rest = rest.dropFirst(ident.count).drop(while: { $0.isWhitespace })
+            guard rest.first == "," else { break }
+            rest = rest.dropFirst().drop(while: { $0.isWhitespace })
+        }
+        return names
     }
 
     private static func isExported(_ name: String) -> Bool {

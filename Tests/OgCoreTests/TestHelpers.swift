@@ -215,6 +215,7 @@ final class CountingFakeEmbedder: DocsEmbedder, @unchecked Sendable {
     private var _cancelManager: DocsPackManager?
     private var _cancelAfter: Int?
     private var _cancelVersion: String?
+    private var _deleteInsteadOfCancel = false
 
     init(id: String = "fake-embed", version: String = "v1") {
         self.descriptor = EmbeddingModelDescriptor(id: id, version: version)
@@ -237,6 +238,16 @@ final class CountingFakeEmbedder: DocsEmbedder, @unchecked Sendable {
         _cancelManager = manager
         _cancelVersion = goVersion
         _cancelAfter = afterCalls
+        _deleteInsteadOfCancel = false
+        lock.unlock()
+    }
+
+    func configureDelete(manager: DocsPackManager, goVersion: String, afterCalls: Int) {
+        lock.lock()
+        _cancelManager = manager
+        _cancelVersion = goVersion
+        _cancelAfter = afterCalls
+        _deleteInsteadOfCancel = true
         lock.unlock()
     }
 
@@ -245,24 +256,29 @@ final class CountingFakeEmbedder: DocsEmbedder, @unchecked Sendable {
         _cancelManager = nil
         _cancelVersion = nil
         _cancelAfter = nil
+        _deleteInsteadOfCancel = false
         lock.unlock()
     }
 
-    private func recordCallAndTakeCancelTarget() -> (DocsPackManager, String)? {
+    private func recordCallAndTakeCancelTarget() -> (DocsPackManager, String, Bool)? {
         lock.lock()
         defer { lock.unlock() }
         _callCount += 1
         let count = _callCount
         if let mgr = _cancelManager, let ver = _cancelVersion, let limit = _cancelAfter, count >= limit {
             _cancelAfter = nil
-            return (mgr, ver)
+            return (mgr, ver, _deleteInsteadOfCancel)
         }
         return nil
     }
 
     func embed(_ text: String) async throws -> [Float] {
-        if let (mgr, ver) = recordCallAndTakeCancelTarget() {
-            await mgr.requestCancel(goVersion: ver)
+        if let (mgr, ver, shouldDelete) = recordCallAndTakeCancelTarget() {
+            if shouldDelete {
+                _ = try? await mgr.deletePack(goVersion: ver)
+            } else {
+                await mgr.requestCancel(goVersion: ver)
+            }
         }
 
         // Deterministic 8-dim bag-of-bytes vector (normalized).
@@ -331,6 +347,10 @@ func reopenDocsPackManager(at rootURL: URL) throws -> DocsPackManager {
 
 func stringContains(_ haystack: String, _ needle: String) -> Bool {
     haystack.contains(needle)
+}
+
+func pathExists(_ url: URL) -> Bool {
+    FileManager.default.fileExists(atPath: url.path)
 }
 
 func recordProgress(_ box: ProgressRecorder, _ progress: DocsBatchProgress) {

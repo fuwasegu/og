@@ -193,6 +193,65 @@ public actor SharedVectorStore {
         return Self.decodeFloatArray(raw: raw, count: dim)
     }
 
+    /// Batch-fetches vectors for a set of keys to avoid N+1 SQLite/actor round-trips during semantic search (R-5).
+    public func vectors(for keys: [SharedVectorKey]) throws -> [SharedVectorKey: [Float]] {
+        guard let db else { throw DocsStorageError.sqlite("database closed") }
+        guard !keys.isEmpty else { return [:] }
+
+        var hashesByModel: [EmbeddingModelDescriptor: [String]] = [:]
+        var seenPerModel: [EmbeddingModelDescriptor: Set<String>] = [:]
+        for key in keys {
+            let model = EmbeddingModelDescriptor(id: key.modelID, version: key.modelVersion)
+            if seenPerModel[model, default: []].insert(key.contentHash).inserted {
+                hashesByModel[model, default: []].append(key.contentHash)
+            }
+        }
+
+        var result: [SharedVectorKey: [Float]] = [:]
+        let batchSize = 500
+        for (model, hashes) in hashesByModel {
+            var idx = 0
+            while idx < hashes.count {
+                let end = min(idx + batchSize, hashes.count)
+                let slice = hashes[idx..<end]
+                let placeholders = (0..<slice.count).map { "?\($0 + 3)" }.joined(separator: ", ")
+                let sql = """
+                SELECT content_hash, dim, vector
+                FROM shared_vectors
+                WHERE model_id = ?1 AND model_version = ?2 AND content_hash IN (\(placeholders));
+                """
+                var stmt: OpaquePointer?
+                guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
+                    throw DocsStorageError.sqlite(String(cString: sqlite3_errmsg(db)))
+                }
+                defer { sqlite3_finalize(stmt) }
+                SQLiteHelpers.bindText(stmt, index: 1, value: model.id)
+                SQLiteHelpers.bindText(stmt, index: 2, value: model.version)
+                for (offset, hash) in slice.enumerated() {
+                    SQLiteHelpers.bindText(stmt, index: Int32(offset + 3), value: hash)
+                }
+                while true {
+                    let rc = sqlite3_step(stmt)
+                    if rc == SQLITE_ROW {
+                        let hash = SQLiteHelpers.columnText(stmt, index: 0)
+                        let dim = Int(sqlite3_column_int(stmt, 1))
+                        guard let raw = sqlite3_column_blob(stmt, 2) else { continue }
+                        let bytes = Int(sqlite3_column_bytes(stmt, 2))
+                        guard bytes == dim * MemoryLayout<Float>.size else { continue }
+                        let key = SharedVectorKey(contentHash: hash, model: model)
+                        result[key] = Self.decodeFloatArray(raw: raw, count: dim)
+                    } else if rc == SQLITE_DONE {
+                        break
+                    } else {
+                        throw DocsStorageError.sqlite(String(cString: sqlite3_errmsg(db))) // L-3
+                    }
+                }
+                idx = end
+            }
+        }
+        return result
+    }
+
     public func store(key: SharedVectorKey, vector: [Float]) throws {
         guard let db else { throw DocsStorageError.sqlite("database closed") }
         let sql = """

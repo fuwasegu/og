@@ -706,7 +706,53 @@ public enum BundledGoCorpus {
             ))
         }
 
+        // R-9: mark every bundled curated chunk with `.bundledCurated` provenance so citations
+        // clearly distinguish curated summaries from directly extracted official GoDoc.
+        items = items.map { c in
+            DocsChunk(
+                goVersion: c.goVersion,
+                source: c.source,
+                provenance: .bundledCurated,
+                packageName: c.packageName,
+                documentID: c.documentID,
+                symbol: c.symbol,
+                kind: c.kind,
+                title: c.title,
+                anchor: c.anchor,
+                since: c.since,
+                summary: c.summary,
+                signature: c.signature,
+                example: c.example,
+                body: c.body,
+                searchAliases: c.searchAliases
+            )
+        }
         items.sort { $0.stableID < $1.stableID }
         return items
     }
+
+    /// Data-driven temporary Phase 1 Japanese/English cross-lingual concept expansion rules (R-1).
+    /// Separated from router code so new concepts or pack-supplied rules can be added as data
+    /// until Phase 2 cross-lingual embeddings replace/augment lexical expansion.
+    public static let defaultConceptRules: [DocsConceptRule] = [
+        DocsConceptRule(triggers: ["1行ずつ", "一行ずつ", "行ごと", "行単位", "line by line", "read line"], expansions: ["bufio", "Scanner", "Scan", "ScanLines"]),
+        DocsConceptRule(triggers: ["ファイル", "read file", "write file"], excludeIfPresent: ["1行ずつ", "一行ずつ", "行ごと", "行単位", "line by line"], expansions: ["os", "ReadFile", "WriteFile", "bufio", "Scanner"]),
+        DocsConceptRule(triggers: ["json", "整形", "インデント", "きれいに", "pretty print", "indent"], expansions: ["json", "MarshalIndent", "Encoder", "SetIndent", "Unmarshal"]),
+        DocsConceptRule(triggers: ["重複", "取り除", "ユニーク", "deduplicate", "dedup", "unique"], expansions: ["slices", "Compact", "Sort", "deduplicate", "map"]),
+        DocsConceptRule(triggers: ["タイムアウト", "timeout", "deadline", "期限", "キャンセル"], expansions: ["context", "WithTimeout", "deadline", "cancel"]),
+        DocsConceptRule(triggers: ["正規表現", "regex", "regexp", "パターンマッチ"], expansions: ["regexp", "Compile", "MustCompile", "MatchString"]),
+        DocsConceptRule(triggers: ["for", "ループ", "繰り返し", "while", "反復", "loop", "iterate"], expansions: ["for", "range", "For_statements"]),
+        DocsConceptRule(triggers: ["switch", "条件分岐", "型スイッチ"], expansions: ["switch", "Switch_statements"]),
+        DocsConceptRule(triggers: ["defer", "後処理", "リソース解放", "finally"], expansions: ["defer", "Close"]),
+        DocsConceptRule(triggers: ["ソート", "並べ替え", "sort"], expansions: ["slices", "Sort", "SortFunc"]),
+        DocsConceptRule(triggers: ["文字列", "連結", "結合", "concat", "string builder"], expansions: ["strings", "Builder", "WriteString"]),
+        DocsConceptRule(triggers: ["数値", "変換", "atoi", "itoa", "parse int"], expansions: ["strconv", "Atoi", "Itoa"]),
+        DocsConceptRule(triggers: ["日時", "日付", "時間", "フォーマット", "date format", "timestamp"], expansions: ["time", "Format", "Parse", "RFC3339"]),
+        DocsConceptRule(triggers: ["goroutine", "並行", "完了待ち", "waitgroup"], expansions: ["sync", "WaitGroup", "Done", "Wait"]),
+        DocsConceptRule(triggers: ["http", "リクエスト", "api", "クライアント"], expansions: ["net/http", "Client", "NewRequestWithContext"]),
+        DocsConceptRule(triggers: ["ディレクトリ", "再帰", "ファイル一覧", "walk"], expansions: ["path/filepath", "WalkDir"]),
+        DocsConceptRule(triggers: ["マップ", "キー一覧", "map keys"], expansions: ["maps", "Keys", "Collect"]),
+        DocsConceptRule(triggers: ["エラー", "ラップ", "wrap error", "errors.is", "errors.as"], expansions: ["error", "Errorf", "errors.Is", "errors.As"]),
+        DocsConceptRule(triggers: ["整数 range", "range over int", "イテレータ", "iter.seq"], expansions: ["range", "iter.Seq", "For_range", "1.22", "1.23"])
+    ]
 }

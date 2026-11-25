@@ -36,7 +36,7 @@ final class DocsManager {
             self.lastError = error.localizedDescription
         }
         Task.detached(priority: .utility) {
-            let ver = GoVersionResolver.detectInstalledToolchainVersion()
+            let ver = await GoVersionResolver.detectInstalledToolchainVersionAsync()
             await MainActor.run {
                 DocsManager.shared.setDetectedToolchainVersion(ver)
             }

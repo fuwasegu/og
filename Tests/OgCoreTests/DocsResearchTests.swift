@@ -171,6 +171,107 @@ struct DocsCorpusTests {
         #expect(!chunks.contains { $0.symbol == "WindowsOnly" })
         #expect(!chunks.contains { $0.symbol == "IgnoredGen" })
         #expect(!chunks.contains { $0.packageName.contains("internal") })
+        // R-9: extracted GOROOT chunks carry officialExtracted provenance (not bundled summary)
+        #expect(eof?.provenance == .officialExtracted)
+        #expect(!stringContains(eof?.citationLabel ?? "", "bundled summary"))
+    }
+
+    @Test("Evaluates parenthesized //go:build expressions and GOARCH accurately (R-2)")
+    func evaluatesCompoundGoBuildExpressions() {
+        let darwinArm64 = GoBuildTarget(goos: "darwin", goarch: "arm64")
+        let darwinAmd64 = GoBuildTarget(goos: "darwin", goarch: "amd64")
+
+        #expect(!DocsCorpusExtractor.evaluateGoBuildExpr("(windows && arm64)", target: darwinArm64))
+        #expect(DocsCorpusExtractor.evaluateGoBuildExpr("!(windows || linux)", target: darwinArm64))
+        #expect(DocsCorpusExtractor.evaluateGoBuildExpr("(darwin || linux) && arm64", target: darwinArm64))
+        #expect(!DocsCorpusExtractor.evaluateGoBuildExpr("(darwin || linux) && arm64", target: darwinAmd64))
+        #expect(!DocsCorpusExtractor.evaluateGoBuildExpr("darwin && !cgo", target: darwinArm64))
+        #expect(DocsCorpusExtractor.evaluateGoBuildExpr("unix && (arm64 || amd64)", target: darwinArm64))
+
+        let dir = TempDir()
+        defer { dir.cleanup() }
+        let src = dir.subdir("src")
+        _ = dir.file("src/sys/win_arm64.go", """
+        //go:build (windows && arm64)
+
+        package sys
+        func WinArmOnly() {}
+        """)
+        _ = dir.file("src/sys/ok_darwin.go", """
+        //go:build (darwin || linux) && arm64
+
+        package sys
+        func DarwinArmOK() {}
+        """)
+        let extracted = DocsCorpusExtractor.extractStdlib(fromGorootSrc: src, goVersion: "1.23", target: darwinArm64)
+        #expect(!extracted.contains { $0.symbol == "WinArmOnly" })
+        #expect(extracted.contains { $0.symbol == "DarwinArmOK" })
+    }
+
+    @Test("Extracts grouped type (...) blocks, multi-name const/var declarations, and long interfaces without truncation (R-4, R-7)")
+    func extractsTypeGroupsMultiNameDeclsAndLongInterfaces() {
+        let dir = TempDir()
+        defer { dir.cleanup() }
+        let src = dir.subdir("src")
+
+        var methods: [String] = []
+        for i in 1...45 {
+            methods.append("\tMethod\(i)() int")
+        }
+        let longInterface = """
+        // Package ast declares types for Go syntax trees.
+        package ast
+
+        // Node types in a grouped declaration.
+        type (
+        \t// Node represents any syntax node.
+        \tNode interface {
+        \t\tPos() int
+        \t}
+        \t// Ident represents an identifier.
+        \tIdent struct {
+        \t\tName string
+        \t}
+        \t// AliasExpr aliases Ident.
+        \tAliasExpr = Ident
+        \tunexportedNode struct{}
+        )
+
+        // Multi-name constants and variables.
+        const (
+        \tAlpha, Beta = 1, 2
+        )
+        const SingleA, SingleB = "a", "b"
+        var FirstErr, SecondErr error
+
+        // BigInterface has more than 40 lines.
+        type BigInterface interface {
+        \(methods.joined(separator: "\n"))
+        }
+        """
+        _ = dir.file("src/go/ast/ast.go", longInterface)
+
+        let chunks = DocsCorpusExtractor.extractStdlib(fromGorootSrc: src, goVersion: "1.23")
+        // R-4: grouped type (...) extracted
+        let node = chunks.first { $0.packageName == "go/ast" && $0.symbol == "Node" }
+        let ident = chunks.first { $0.packageName == "go/ast" && $0.symbol == "Ident" }
+        let alias = chunks.first { $0.packageName == "go/ast" && $0.symbol == "AliasExpr" }
+        #expect(node?.kind == .type && stringContains(node?.signature ?? "", "Pos() int"))
+        #expect(ident?.kind == .type && ident?.signature == "type Ident struct { ... }" && stringContains(ident?.summary ?? "", "identifier"))
+        #expect(alias?.kind == .type)
+        #expect(!chunks.contains { $0.symbol == "unexportedNode" })
+
+        // R-7: multi-name const/var declarations extract all exported identifiers
+        #expect(chunks.contains { $0.symbol == "Alpha" && $0.kind == .constant })
+        #expect(chunks.contains { $0.symbol == "Beta" && $0.kind == .constant })
+        #expect(chunks.contains { $0.symbol == "SingleA" && $0.kind == .constant })
+        #expect(chunks.contains { $0.symbol == "SingleB" && $0.kind == .constant })
+        #expect(chunks.contains { $0.symbol == "FirstErr" && $0.kind == .variable })
+        #expect(chunks.contains { $0.symbol == "SecondErr" && $0.kind == .variable })
+
+        // R-7: long interface preserves methods beyond line 40
+        let big = chunks.first { $0.symbol == "BigInterface" }
+        #expect(stringContains(big?.signature ?? "", "Method45() int"))
     }
 
     @Test("Preserves paired shortcode prose, ignores # inside code fences, and avoids cross-doc/duplicate heading collisions (H-6, M-10, M-11)")
@@ -438,6 +539,51 @@ struct DocsBatchTests {
         #expect(gc2 == c123.count)
         #expect(try await mgr.sharedVectorStore.count() == 0)
     }
+
+    @Test("Batch vector lookup returns all requested keys and omits missing ones (R-5)")
+    func batchVectorStoreLookup() async throws {
+        let dir = TempDir()
+        defer { dir.cleanup() }
+        let store = try SharedVectorStore(databaseURL: dir.url.appendingPathComponent("shared.sqlite"))
+        let m1 = EmbeddingModelDescriptor(id: "m", version: "1")
+        let m2 = EmbeddingModelDescriptor(id: "m", version: "2")
+        let k1 = SharedVectorKey(contentHash: "h1", model: m1)
+        let k2 = SharedVectorKey(contentHash: "h2", model: m1)
+        let k3 = SharedVectorKey(contentHash: "h3", model: m2)
+        let missing = SharedVectorKey(contentHash: "missing", model: m1)
+
+        try await store.store(key: k1, vector: [1, 0, 0])
+        try await store.store(key: k2, vector: [0, 1, 0])
+        try await store.store(key: k3, vector: [0, 0, 1])
+
+        let fetched = try await store.vectors(for: [k1, k2, k3, missing, k1])
+        #expect(fetched.count == 3)
+        #expect(fetched[k1] == [1, 0, 0])
+        #expect(fetched[k2] == [0, 1, 0])
+        #expect(fetched[k3] == [0, 0, 1])
+        #expect(fetched[missing] == nil)
+    }
+
+    @Test("Deleting pack during in-flight ingest removes staging and reclaims vectors; ingest does not silently overwrite selectedEmbeddingModel (R-8)")
+    func deleteDuringInFlightIngestCleansStagingAndNoSilentModelOverwrite() async throws {
+        let dir = TempDir()
+        defer { dir.cleanup() }
+        let mgr = try makeDocsPackManager(in: dir)
+        let chunks = Array(BundledGoCorpus.chunks(forGoVersion: "1.23").prefix(6))
+
+        let embedder = CountingFakeEmbedder(id: "ephemeral-embed", version: "v1")
+        embedder.configureDelete(manager: mgr, goVersion: "1.23", afterCalls: 2)
+
+        let report = try await mgr.ingest(goVersion: "1.23", chunks: chunks, embedder: embedder)
+        #expect(report.cancelled)
+        // R-8: ingest must not silently overwrite selectedEmbeddingModel
+        #expect(await mgr.currentEmbeddingModel() == nil)
+        // R-8: staging directory and all vectors from the deleted in-flight pack must be cleaned up
+        let stageDir = await mgr.stagingDirectory(for: "1.23")
+        #expect(!pathExists(stageDir))
+        #expect(await mgr.manifest(for: "1.23") == nil)
+        #expect(try await mgr.sharedVectorStore.count() == 0)
+    }
 }
 
 @Suite("Real GOROOT Integration, Semantic Search, Loopback & Golden Queries")
@@ -554,6 +700,15 @@ struct DocsGoldenQueryTests {
 
         let rMethod = try await svc.search(query: "http.MethodGet", projectRoot: proj.url)
         #expect(rMethod.status == .found && rMethod.cards.first?.symbol == "MethodGet")
+        // R-9: real GOROOT cards report officialExtracted provenance without bundled summary suffix
+        #expect(rMethod.cards.first?.provenance == .officialExtracted)
+        #expect(!stringContains(rMethod.cards.first?.citation ?? "", "bundled summary"))
+
+        // R-1: data-driven concept rules can be injected without changing router code
+        let customRule = DocsConceptRule(triggers: ["ハッシュ計算"], expansions: ["MethodGet"])
+        await svc.setConceptRules(BundledGoCorpus.defaultConceptRules + [customRule])
+        let rCustom = try await svc.search(query: "ハッシュ計算したい", projectRoot: proj.url)
+        #expect(rCustom.status == .found && rCustom.cards.first?.symbol == "MethodGet")
     }
 
     @Test("Semantic retrieval integration, model switch demotion, and anti-hallucination gating (M-1, M-2, L-12)")
@@ -629,6 +784,9 @@ struct DocsGoldenQueryTests {
         for card in for121.cards {
             #expect(!card.citation.isEmpty)
             #expect(card.goVersion == "1.21")
+            // R-9: bundled curated pack cards explicitly distinguish provenance from official extracted GoDoc
+            #expect(card.provenance == .bundledCurated)
+            #expect(stringContains(card.citation, "[og bundled summary]"))
         }
 
         // L-7: Go 1.21 pack does not contain Go 1.22 release notes

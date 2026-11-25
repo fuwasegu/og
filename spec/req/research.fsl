@@ -27,8 +27,10 @@
 //   and two embedding models are sufficient to expose pack-level, chunk-`since`, and model bugs.
 // ASSUME-2 (confirmed 2026-11-26): Research is specified independently of ModelServer (which
 //   governs the inline completion server); both share D-9 (og-owned loopback servers only).
-//   Phase 1 runs completely offline without a generation/embedding server; Phase 2 will add
-//   server lifecycle supervision for research models under the same D-9 contract.
+//   Phase 1 runs completely offline without a generation/embedding server, using a temporary
+//   data-driven concept dictionary for Japanese-to-English FTS5 expansion until Phase 2
+//   cross-lingual embeddings replace/augment it. Phase 2 will add server lifecycle supervision
+//   for research models under the same D-9 contract.
 requirements Research {
   number GoVer
   number ModelId
@@ -394,6 +396,11 @@ requirements Research {
   acceptance AC-DOC-6 "DOC-3: updating an already-Ready pack and aborting leaves the active Ready pack intact and queryable" {
     enable() start_batch(0) complete_batch_compute(0) start_batch(0) pause_batch() abort_batch() query_found(Local, 0, false)
     expect pack_state[0] == Ready and answer_kind == GroundedCards and answer_used_semantic
+  }
+
+  acceptance AC-DOC-7 "DOC-3: updating an already-Ready pack to completion atomically swaps while reusing cached vectors" {
+    enable() start_batch(0) complete_batch_compute(0) start_batch(0) complete_batch_reuse(0) query_found(Local, 0, false)
+    expect pack_state[0] == Ready and pack_model[0] == 0 and last_batch_reused and answer_used_semantic
   }
 
   forbidden FB-DOC-1 "DOC-6: queries to a remote endpoint are refused" {
