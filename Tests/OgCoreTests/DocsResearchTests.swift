@@ -30,6 +30,22 @@ struct GoVersionTests {
         let fromToolchain = GoVersionResolver.resolve(projectRoot: emptyDir.url, toolchainVersionProvider: { GoVersion(major: 1, minor: 23, patch: 1) })
         #expect(fromToolchain?.version == GoVersion(major: 1, minor: 23, patch: 1))
         #expect(fromToolchain?.source == .toolchain)
+
+        // S-2: explicit nil-returning provider never falls through to blocking toolchain detection
+        let noToolchain = GoVersionResolver.resolve(projectRoot: emptyDir.url, toolchainVersionProvider: { nil })
+        #expect(noToolchain == nil)
+    }
+
+    @Test("Async version resolution works without blocking threads (S-2)")
+    func resolvesVersionAsync() async {
+        let dir = TempDir()
+        defer { dir.cleanup() }
+        let fromProvider = await GoVersionResolver.resolveAsync(projectRoot: dir.url, toolchainVersionProvider: { GoVersion(major: 1, minor: 23) })
+        #expect(fromProvider?.version == GoVersion(major: 1, minor: 23))
+        #expect(fromProvider?.source == .toolchain)
+
+        let none = await GoVersionResolver.resolveAsync(projectRoot: dir.url, toolchainVersionProvider: { nil })
+        #expect(none == nil)
     }
 
     @Test("Strictly rejects malformed version strings like 1.x.3 (L-4)")
@@ -176,10 +192,11 @@ struct DocsCorpusTests {
         #expect(!stringContains(eof?.citationLabel ?? "", "bundled summary"))
     }
 
-    @Test("Evaluates parenthesized //go:build expressions and GOARCH accurately (R-2)")
+    @Test("Evaluates parenthesized //go:build expressions, GOARCH, 2-part OS_ARCH filenames, and go1.x release tags (R-2, S-4, S-7)")
     func evaluatesCompoundGoBuildExpressions() {
-        let darwinArm64 = GoBuildTarget(goos: "darwin", goarch: "arm64")
-        let darwinAmd64 = GoBuildTarget(goos: "darwin", goarch: "amd64")
+        let darwinArm64 = GoBuildTarget(goos: "darwin", goarch: "arm64", goVersion: GoVersion(major: 1, minor: 23))
+        let darwinAmd64 = GoBuildTarget(goos: "darwin", goarch: "amd64", goVersion: GoVersion(major: 1, minor: 23))
+        let darwinArm121 = GoBuildTarget(goos: "darwin", goarch: "arm64", goVersion: GoVersion(major: 1, minor: 21))
 
         #expect(!DocsCorpusExtractor.evaluateGoBuildExpr("(windows && arm64)", target: darwinArm64))
         #expect(DocsCorpusExtractor.evaluateGoBuildExpr("!(windows || linux)", target: darwinArm64))
@@ -187,6 +204,19 @@ struct DocsCorpusTests {
         #expect(!DocsCorpusExtractor.evaluateGoBuildExpr("(darwin || linux) && arm64", target: darwinAmd64))
         #expect(!DocsCorpusExtractor.evaluateGoBuildExpr("darwin && !cgo", target: darwinArm64))
         #expect(DocsCorpusExtractor.evaluateGoBuildExpr("unix && (arm64 || amd64)", target: darwinArm64))
+
+        // S-7: go1.x release tag comparison against target goVersion
+        #expect(!DocsCorpusExtractor.evaluateGoBuildExpr("go1.23", target: darwinArm121))
+        #expect(DocsCorpusExtractor.evaluateGoBuildExpr("go1.23", target: darwinArm64))
+        #expect(DocsCorpusExtractor.evaluateGoBuildExpr("!go1.22", target: darwinArm121))
+        #expect(!DocsCorpusExtractor.evaluateGoBuildExpr("!go1.22", target: darwinArm64))
+
+        // S-4: 2-part OS_ARCH filenames like `windows_arm64.go` check BOTH GOOS and GOARCH
+        #expect(!DocsCorpusExtractor.matchesBuildFilename("windows_arm64.go", target: darwinArm64))
+        #expect(DocsCorpusExtractor.matchesBuildFilename("darwin_arm64.go", target: darwinArm64))
+        #expect(!DocsCorpusExtractor.matchesBuildFilename("darwin_arm64.go", target: darwinAmd64))
+        #expect(!DocsCorpusExtractor.matchesBuildFilename("foo_windows_arm64.go", target: darwinArm64))
+        #expect(DocsCorpusExtractor.matchesBuildFilename("windows_arm64.go", target: GoBuildTarget(goos: "windows", goarch: "arm64")))
 
         let dir = TempDir()
         defer { dir.cleanup() }
@@ -197,18 +227,33 @@ struct DocsCorpusTests {
         package sys
         func WinArmOnly() {}
         """)
+        _ = dir.file("src/sys/windows_arm64.go", """
+        package sys
+        func TwoPartWinArmOnly() {}
+        """)
+        _ = dir.file("src/sys/future.go", """
+        //go:build go1.23
+
+        package sys
+        func Go123Only() {}
+        """)
         _ = dir.file("src/sys/ok_darwin.go", """
         //go:build (darwin || linux) && arm64
 
         package sys
         func DarwinArmOK() {}
         """)
-        let extracted = DocsCorpusExtractor.extractStdlib(fromGorootSrc: src, goVersion: "1.23", target: darwinArm64)
-        #expect(!extracted.contains { $0.symbol == "WinArmOnly" })
-        #expect(extracted.contains { $0.symbol == "DarwinArmOK" })
+        let extracted121 = DocsCorpusExtractor.extractStdlib(fromGorootSrc: src, goVersion: "1.21", target: GoBuildTarget(goos: "darwin", goarch: "arm64"))
+        #expect(!extracted121.contains { $0.symbol == "WinArmOnly" })
+        #expect(!extracted121.contains { $0.symbol == "TwoPartWinArmOnly" })
+        #expect(!extracted121.contains { $0.symbol == "Go123Only" })
+        #expect(extracted121.contains { $0.symbol == "DarwinArmOK" })
+
+        let extracted123 = DocsCorpusExtractor.extractStdlib(fromGorootSrc: src, goVersion: "1.23", target: GoBuildTarget(goos: "darwin", goarch: "arm64"))
+        #expect(extracted123.contains { $0.symbol == "Go123Only" })
     }
 
-    @Test("Extracts grouped type (...) blocks, multi-name const/var declarations, and long interfaces without truncation (R-4, R-7)")
+    @Test("Extracts grouped type (...) blocks including multiline func types and generics, multi-name const/var, and long interfaces (R-4, R-7, S-5, S-7)")
     func extractsTypeGroupsMultiNameDeclsAndLongInterfaces() {
         let dir = TempDir()
         defer { dir.cleanup() }
@@ -232,6 +277,15 @@ struct DocsCorpusTests {
         \tIdent struct {
         \t\tName string
         \t}
+        \t// Handler is a multiline function type inside a type group (S-5).
+        \tHandler func(
+        \t\tx int,
+        \t\ty string,
+        \t)
+        \t// Box is a generic type inside a type group (S-7).
+        \tBox[T comparable] struct {
+        \t\tValue T
+        \t}
         \t// AliasExpr aliases Ident.
         \tAliasExpr = Ident
         \tunexportedNode struct{}
@@ -252,12 +306,16 @@ struct DocsCorpusTests {
         _ = dir.file("src/go/ast/ast.go", longInterface)
 
         let chunks = DocsCorpusExtractor.extractStdlib(fromGorootSrc: src, goVersion: "1.23")
-        // R-4: grouped type (...) extracted
+        // R-4, S-5, S-7: grouped type (...) including multiline func type & generic struct extracted without premature close
         let node = chunks.first { $0.packageName == "go/ast" && $0.symbol == "Node" }
         let ident = chunks.first { $0.packageName == "go/ast" && $0.symbol == "Ident" }
+        let handler = chunks.first { $0.packageName == "go/ast" && $0.symbol == "Handler" }
+        let box = chunks.first { $0.packageName == "go/ast" && $0.symbol == "Box" }
         let alias = chunks.first { $0.packageName == "go/ast" && $0.symbol == "AliasExpr" }
         #expect(node?.kind == .type && stringContains(node?.signature ?? "", "Pos() int"))
         #expect(ident?.kind == .type && ident?.signature == "type Ident struct { ... }" && stringContains(ident?.summary ?? "", "identifier"))
+        #expect(handler?.kind == .type && stringContains(handler?.signature ?? "", "y string"))
+        #expect(box?.kind == .type && stringContains(box?.signature ?? "", "Box[T comparable]"))
         #expect(alias?.kind == .type)
         #expect(!chunks.contains { $0.symbol == "unexportedNode" })
 
@@ -540,28 +598,64 @@ struct DocsBatchTests {
         #expect(try await mgr.sharedVectorStore.count() == 0)
     }
 
-    @Test("Batch vector lookup returns all requested keys and omits missing ones (R-5)")
+    @Test("Batch vector lookup returns all requested keys across >500 batch boundary and omits missing ones (R-5, S-7)")
     func batchVectorStoreLookup() async throws {
         let dir = TempDir()
         defer { dir.cleanup() }
         let store = try SharedVectorStore(databaseURL: dir.url.appendingPathComponent("shared.sqlite"))
         let m1 = EmbeddingModelDescriptor(id: "m", version: "1")
         let m2 = EmbeddingModelDescriptor(id: "m", version: "2")
-        let k1 = SharedVectorKey(contentHash: "h1", model: m1)
-        let k2 = SharedVectorKey(contentHash: "h2", model: m1)
-        let k3 = SharedVectorKey(contentHash: "h3", model: m2)
+
+        var keys: [SharedVectorKey] = []
+        for i in 0..<620 {
+            let k = SharedVectorKey(contentHash: "h\(i)", model: m1)
+            try await store.store(key: k, vector: [Float(i), 1.0])
+            keys.append(k)
+        }
+        let otherModelKey = SharedVectorKey(contentHash: "h_other", model: m2)
+        try await store.store(key: otherModelKey, vector: [0, 0, 1])
+        keys.append(otherModelKey)
+
         let missing = SharedVectorKey(contentHash: "missing", model: m1)
-
-        try await store.store(key: k1, vector: [1, 0, 0])
-        try await store.store(key: k2, vector: [0, 1, 0])
-        try await store.store(key: k3, vector: [0, 0, 1])
-
-        let fetched = try await store.vectors(for: [k1, k2, k3, missing, k1])
-        #expect(fetched.count == 3)
-        #expect(fetched[k1] == [1, 0, 0])
-        #expect(fetched[k2] == [0, 1, 0])
-        #expect(fetched[k3] == [0, 0, 1])
+        let fetched = try await store.vectors(for: keys + [missing, keys[0]])
+        #expect(fetched.count == 621)
+        #expect(fetched[keys[0]] == [0, 1.0])
+        #expect(fetched[keys[499]] == [499, 1.0])
+        #expect(fetched[keys[500]] == [500, 1.0])
+        #expect(fetched[keys[619]] == [619, 1.0])
+        #expect(fetched[otherModelKey] == [0, 0, 1])
         #expect(fetched[missing] == nil)
+    }
+
+    @Test("Legacy v2 GOROOT+bundled hybrid pack migrates provenance accurately to schema v3 (S-1)")
+    func legacyV2PackMigratesProvenanceAccurately() async throws {
+        let dir = TempDir()
+        defer { dir.cleanup() }
+        let mgr = try makeDocsPackManager(in: dir)
+
+        let realGorootChunk = DocsChunk(
+            goVersion: "1.23", source: .stdlib, provenance: .officialExtracted,
+            packageName: "io", symbol: "EOF", kind: .variable,
+            title: "io.EOF", anchor: "io.EOF", summary: "EOF from real GOROOT.",
+            body: "EOF is the error returned by Read when no more input is available."
+        )
+        let bundledSpec = try #require(BundledGoCorpus.chunks(forGoVersion: "1.23").first { $0.source == .spec && $0.symbol == "for" })
+
+        try createLegacyV2Pack(in: await mgr.rootDirectory, goVersion: "1.23", chunks: [realGorootChunk, bundledSpec])
+        #expect(await mgr.manifest(for: "1.23")?.schemaVersion == 2)
+
+        let migrated = try await mgr.migrateLegacyPacksIfNeeded()
+        #expect(migrated == 1)
+        #expect(await mgr.manifest(for: "1.23")?.schemaVersion == DocsPackManifest.currentSchemaVersion)
+
+        let idx = try await mgr.openIndex(for: "1.23")
+        defer { idx?.close() }
+        let restoredReal = try idx?.chunk(forStableID: realGorootChunk.stableID)
+        let restoredBundled = try idx?.chunk(forStableID: bundledSpec.stableID)
+        #expect(restoredReal?.provenance == .officialExtracted)
+        #expect(!stringContains(restoredReal?.citationLabel ?? "", "bundled summary"))
+        #expect(restoredBundled?.provenance == .bundledCurated)
+        #expect(stringContains(restoredBundled?.citationLabel ?? "", "[og bundled summary]"))
     }
 
     @Test("Deleting pack during in-flight ingest removes staging and reclaims vectors; ingest does not silently overwrite selectedEmbeddingModel (R-8)")
@@ -704,11 +798,21 @@ struct DocsGoldenQueryTests {
         #expect(rMethod.cards.first?.provenance == .officialExtracted)
         #expect(!stringContains(rMethod.cards.first?.citation ?? "", "bundled summary"))
 
-        // R-1: data-driven concept rules can be injected without changing router code
-        let customRule = DocsConceptRule(triggers: ["ハッシュ計算"], expansions: ["MethodGet"])
+        // R-1 & S-3: data-driven concept rules can be loaded from global/per-pack JSON files without code changes
+        try await mgr.saveCustomConceptRules([DocsConceptRule(triggers: ["ハッシュ計算"], expansions: ["MethodGet"])])
+        let rGlobalRule = try await svc.search(query: "ハッシュ計算したい", projectRoot: proj.url)
+        #expect(rGlobalRule.status == .found && rGlobalRule.cards.first?.symbol == "MethodGet")
+
+        let packRuleURL = await mgr.packConceptRulesURL(for: "1.23")
+        try writeConceptRulesJSON([DocsConceptRule(triggers: ["終端判定"], expansions: ["EOF"])], to: packRuleURL)
+        let rPackRule = try await svc.search(query: "終端判定したい", projectRoot: proj.url)
+        #expect(rPackRule.status == .found && rPackRule.cards.first?.symbol == "EOF")
+
+        // Explicit API override also works
+        let customRule = DocsConceptRule(triggers: ["カスタム概念"], expansions: ["MethodPost"])
         await svc.setConceptRules(BundledGoCorpus.defaultConceptRules + [customRule])
-        let rCustom = try await svc.search(query: "ハッシュ計算したい", projectRoot: proj.url)
-        #expect(rCustom.status == .found && rCustom.cards.first?.symbol == "MethodGet")
+        let rCustom = try await svc.search(query: "カスタム概念したい", projectRoot: proj.url)
+        #expect(rCustom.status == .found && rCustom.cards.first?.symbol == "MethodPost")
     }
 
     @Test("Semantic retrieval integration, model switch demotion, and anti-hallucination gating (M-1, M-2, L-12)")

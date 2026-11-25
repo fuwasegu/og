@@ -1,13 +1,16 @@
 import Foundation
 
-/// Target Go build platform (`GOOS` / `GOARCH`) used to evaluate `//go:build` and filename constraints (R-2).
+/// Target Go build platform (`GOOS` / `GOARCH` / optional target `goVersion`) used to evaluate
+/// `//go:build` and filename constraints (R-2, S-7).
 public struct GoBuildTarget: Sendable, Hashable {
     public var goos: String
     public var goarch: String
+    public var goVersion: GoVersion?
 
-    public init(goos: String, goarch: String) {
+    public init(goos: String, goarch: String, goVersion: GoVersion? = nil) {
         self.goos = goos
         self.goarch = goarch
+        self.goVersion = goVersion
     }
 
     public static var hostDefault: GoBuildTarget {
@@ -16,6 +19,11 @@ public struct GoBuildTarget: Sendable, Hashable {
         #else
         return GoBuildTarget(goos: "darwin", goarch: "amd64")
         #endif
+    }
+
+    func withDefaultVersion(_ rawVersion: String) -> GoBuildTarget {
+        guard goVersion == nil, let parsed = GoVersion(parsing: rawVersion) else { return self }
+        return GoBuildTarget(goos: goos, goarch: goarch, goVersion: parsed)
     }
 }
 
@@ -67,11 +75,12 @@ public enum DocsCorpusExtractor {
             }
         }
 
+        let resolvedTarget = target.withDefaultVersion(goVersion)
         var chunks: [DocsChunk] = []
         for dir in packageDirs.sorted(by: { $0.path < $1.path }) {
             let relPath = relativePackagePath(dir: dir, root: srcRoot)
             guard !relPath.isEmpty else { continue }
-            chunks.append(contentsOf: extractStdlibPackage(directory: dir, importPath: relPath, goVersion: goVersion, target: target))
+            chunks.append(contentsOf: extractStdlibPackage(directory: dir, importPath: relPath, goVersion: goVersion, target: resolvedTarget))
         }
         return chunks
     }
@@ -84,6 +93,7 @@ public enum DocsCorpusExtractor {
         goVersion: String,
         target: GoBuildTarget = .hostDefault
     ) -> [DocsChunk] {
+        let target = target.withDefaultVersion(goVersion)
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else {
             return []
@@ -249,7 +259,7 @@ public enum DocsCorpusExtractor {
 
     // MARK: - Build constraints filtering (M-13, R-2: recursive-descent parser + GOOS/GOARCH)
 
-    /// Evaluates filename OS/ARCH suffixes like `foo_windows.go`, `bar_linux_amd64.go`, or `asm_386.go`.
+    /// Evaluates filename OS/ARCH suffixes like `foo_windows.go`, `windows_arm64.go`, `bar_linux_amd64.go`, or `asm_386.go` (R-2, S-4).
     public static func matchesBuildFilename(_ fileName: String, target: GoBuildTarget = .hostDefault) -> Bool {
         var base = fileName
         if base.hasSuffix("_test.go") {
@@ -260,11 +270,12 @@ public enum DocsCorpusExtractor {
         let parts = base.split(separator: "_").map(String.init)
         guard parts.count >= 2 else { return true }
         let last = parts[parts.count - 1]
-        let prev = parts.count >= 3 ? parts[parts.count - 2] : nil
+        // S-4: check second-to-last GOOS whenever parts.count >= 2 (matches Go's `go/build` goodOSArchFile rule, e.g. `windows_arm64.go`).
+        let prev = parts[parts.count - 2]
 
         if knownArchNames.contains(last) {
             if last != target.goarch { return false }
-            if let prev, knownOSNames.contains(prev), prev != target.goos { return false }
+            if knownOSNames.contains(prev), prev != target.goos { return false }
             return true
         }
         if knownOSNames.contains(last) {
@@ -407,7 +418,13 @@ public enum DocsCorpusExtractor {
         if tag == "unix" { return unixOSNames.contains(target.goos) }
         if tag == "cgo" || tag == "gc" { return true }
         if knownOSNames.contains(tag) || knownArchNames.contains(tag) { return false }
-        if tag.hasPrefix("go1.") { return true }
+        if tag.hasPrefix("go1.") {
+            // S-7: compare Go release build tag against target pack Go version when known.
+            if let tagVer = GoVersion(parsing: tag), let targetVer = target.goVersion {
+                return targetVer.isAtLeast(tagVer)
+            }
+            return true
+        }
         return false
     }
 
@@ -824,37 +841,65 @@ public enum DocsCorpusExtractor {
     /// Reads a type specification starting at `startIndex`.
     /// For `interface { ... }`, preserves the complete method set until matching closing brace (R-7).
     /// For `struct { ... }`, advances past the full struct block and emits a concise `{ ... }` signature.
+    /// Also tracks multi-line `(...)` / `[...]` (e.g. multi-line `func(...)` types or generic parameter lists)
+    /// so `type (...)` groups never terminate prematurely on an inner closing `)` (S-5).
     private static func parseTypeSpecBody(lines: [String], startIndex: Int, prefixTypeKeyword: Bool) -> (String, Int) {
         let first = lines[startIndex].trimmingCharacters(in: .whitespaces)
         let header = prefixTypeKeyword ? "type \(first)" : first
 
         let isInterface = first.contains("interface {") || first.hasSuffix("interface{")
         var state = BraceScanState()
-        var depth = state.scanLine(first)
+        let firstDelims = state.scanDelimiters(first)
+        var braceDepth = firstDelims.brace
+        var parenDepth = firstDelims.paren
+        var bracketDepth = firstDelims.bracket
 
-        if isInterface && depth > 0 {
+        if isInterface && braceDepth > 0 {
             var blockLines = [header]
             var i = startIndex + 1
-            while i < lines.count && depth > 0 {
+            while i < lines.count && (braceDepth > 0 || parenDepth > 0 || bracketDepth > 0) {
                 let l = lines[i]
-                depth += state.scanLine(l)
+                let d = state.scanDelimiters(l)
+                braceDepth += d.brace
+                parenDepth += d.paren
+                bracketDepth += d.bracket
                 blockLines.append(l)
                 i += 1
             }
             return (blockLines.joined(separator: "\n"), i)
         }
 
-        if depth > 0 {
+        if braceDepth > 0 {
             // Struct or other braced type body: skip to matching brace so inner fields aren't misparsed inside `type (...)`.
             var i = startIndex + 1
-            while i < lines.count && depth > 0 {
-                depth += state.scanLine(lines[i])
+            while i < lines.count && (braceDepth > 0 || parenDepth > 0 || bracketDepth > 0) {
+                let d = state.scanDelimiters(lines[i])
+                braceDepth += d.brace
+                parenDepth += d.paren
+                bracketDepth += d.bracket
                 i += 1
             }
             let sig = header.hasSuffix("{")
                 ? String(header.dropLast()).trimmingCharacters(in: .whitespaces) + " { ... }"
                 : header
             return (sig, i)
+        }
+
+        if parenDepth > 0 || bracketDepth > 0 {
+            // S-5: multi-line `func(...)` type or generic type parameter list inside `type (...)`.
+            var parts = [header]
+            var i = startIndex + 1
+            while i < lines.count && (braceDepth > 0 || parenDepth > 0 || bracketDepth > 0) {
+                let l = lines[i]
+                let d = state.scanDelimiters(l)
+                braceDepth += d.brace
+                parenDepth += d.paren
+                bracketDepth += d.bracket
+                let trimmed = l.trimmingCharacters(in: .whitespaces)
+                if !trimmed.isEmpty { parts.append(trimmed) }
+                i += 1
+            }
+            return (parts.joined(separator: " "), i)
         }
 
         return (header, startIndex + 1)
@@ -902,7 +947,13 @@ public enum DocsCorpusExtractor {
         var inBlockComment = false
 
         mutating func scanLine(_ line: String) -> Int {
-            var delta = 0
+            scanDelimiters(line).brace
+        }
+
+        mutating func scanDelimiters(_ line: String) -> (brace: Int, paren: Int, bracket: Int) {
+            var brace = 0
+            var paren = 0
+            var bracket = 0
             var inString = false
             var inRune = false
             var escaped = false
@@ -955,11 +1006,15 @@ public enum DocsCorpusExtractor {
                 if ch == "\"" { inString = true; idx += 1; continue }
                 if ch == "'" { inRune = true; idx += 1; continue }
                 if ch == "`" { inRawString = true; idx += 1; continue }
-                if ch == "{" { delta += 1 }
-                else if ch == "}" { delta -= 1 }
+                if ch == "{" { brace += 1 }
+                else if ch == "}" { brace -= 1 }
+                else if ch == "(" { paren += 1 }
+                else if ch == ")" { paren -= 1 }
+                else if ch == "[" { bracket += 1 }
+                else if ch == "]" { bracket -= 1 }
                 idx += 1
             }
-            return delta
+            return (brace, paren, bracket)
         }
     }
 

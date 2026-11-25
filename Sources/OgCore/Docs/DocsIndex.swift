@@ -286,6 +286,61 @@ public final class DocsIndex: @unchecked Sendable {
         }
     }
 
+    /// Updates chunk provenance in place for schema v2 -> v3 migration (S-1).
+    /// Marks chunks whose `content_hash` or non-stdlib `stable_id` matches bundled curated excerpts.
+    @discardableResult
+    public func migrateBundledProvenance(
+        bundledContentHashes: Set<String>,
+        bundledNonStdlibStableIDs: Set<String>
+    ) throws -> Int {
+        guard !bundledContentHashes.isEmpty || !bundledNonStdlibStableIDs.isEmpty else { return 0 }
+        return try withDB { db in
+            try SQLiteHelpers.exec(db: db, sql: "BEGIN IMMEDIATE TRANSACTION;")
+            do {
+                var updated = 0
+                if !bundledContentHashes.isEmpty {
+                    let sql = "UPDATE chunks SET provenance = ?1 WHERE content_hash = ?2 AND provenance != ?1;"
+                    var stmt: OpaquePointer?
+                    guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
+                        throw DocsStorageError.sqlite(String(cString: sqlite3_errmsg(db)))
+                    }
+                    defer { sqlite3_finalize(stmt) }
+                    for hash in bundledContentHashes {
+                        sqlite3_reset(stmt)
+                        SQLiteHelpers.bindText(stmt, index: 1, value: DocsProvenance.bundledCurated.rawValue)
+                        SQLiteHelpers.bindText(stmt, index: 2, value: hash)
+                        guard sqlite3_step(stmt) == SQLITE_DONE else {
+                            throw DocsStorageError.sqlite(String(cString: sqlite3_errmsg(db)))
+                        }
+                        updated += Int(sqlite3_changes(db))
+                    }
+                }
+                if !bundledNonStdlibStableIDs.isEmpty {
+                    let sql = "UPDATE chunks SET provenance = ?1 WHERE stable_id = ?2 AND source != 'stdlib' AND provenance != ?1;"
+                    var stmt: OpaquePointer?
+                    guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
+                        throw DocsStorageError.sqlite(String(cString: sqlite3_errmsg(db)))
+                    }
+                    defer { sqlite3_finalize(stmt) }
+                    for id in bundledNonStdlibStableIDs {
+                        sqlite3_reset(stmt)
+                        SQLiteHelpers.bindText(stmt, index: 1, value: DocsProvenance.bundledCurated.rawValue)
+                        SQLiteHelpers.bindText(stmt, index: 2, value: id)
+                        guard sqlite3_step(stmt) == SQLITE_DONE else {
+                            throw DocsStorageError.sqlite(String(cString: sqlite3_errmsg(db)))
+                        }
+                        updated += Int(sqlite3_changes(db))
+                    }
+                }
+                try SQLiteHelpers.exec(db: db, sql: "COMMIT;")
+                return updated
+            } catch {
+                try? SQLiteHelpers.exec(db: db, sql: "ROLLBACK;")
+                throw error
+            }
+        }
+    }
+
     public func vectorReferences() throws -> [String: SharedVectorKey] {
         try withDB { db in
             let sql = "SELECT stable_id, content_hash, model_id, model_version FROM pack_vector_refs;"

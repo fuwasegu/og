@@ -152,6 +152,7 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
         })
         observers.append(NotificationCenter.default.addObserver(forName: .ogDocsBatchProgressChanged, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
+                self?.refreshVersionPopup()
                 self?.updateModeLabelForProgress()
             }
         })
@@ -338,7 +339,9 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
     // MARK: - Rendering
 
     private func refreshVersionPopup() {
-        let detected = GoVersionResolver.resolve(projectRoot: context.root)
+        // S-2: use cached async toolchain detection so the main thread never blocks on `go version`.
+        let cachedToolchain = DocsManager.shared.detectedToolchainVersion
+        let detected = GoVersionResolver.resolve(projectRoot: context.root, toolchainVersionProvider: { cachedToolchain })
         let autoLabel = detected.map { "Auto (\($0.version.description))" } ?? "Auto (go\(BundledGoCorpus.defaultVersion))"
         versionPopup.removeAllItems()
         versionPopup.addItem(withTitle: autoLabel)
@@ -563,9 +566,10 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
         queryField.stringValue = query
         // M-6: use in-memory debug override so headless tests never persist opt-in to UserDefaults.
         DocsManager.shared.debugEnabledOverride = true
+        let cachedToolchain = DocsManager.shared.detectedToolchainVersion
         await DocsManager.shared.ensureBundledPackSync(
             goVersion: explicitVersion?.minorKey
-                ?? GoVersionResolver.resolve(projectRoot: context.root)?.version.minorKey
+                ?? GoVersionResolver.resolve(projectRoot: context.root, toolchainVersionProvider: { cachedToolchain })?.version.minorKey
                 ?? BundledGoCorpus.defaultVersion
         )
         searchTask?.cancel()

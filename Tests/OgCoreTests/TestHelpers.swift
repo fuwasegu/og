@@ -1,5 +1,6 @@
 // Foundation helpers for tests live here (AGENTS.md: never import Foundation and Testing in one file).
 import Foundation
+import SQLite3
 @testable import OgCore
 
 // MARK: - Postfix
@@ -351,6 +352,99 @@ func stringContains(_ haystack: String, _ needle: String) -> Bool {
 
 func pathExists(_ url: URL) -> Bool {
     FileManager.default.fileExists(atPath: url.path)
+}
+
+func writeConceptRulesJSON(_ rules: [DocsConceptRule], to url: URL) throws {
+    let data = try JSONEncoder().encode(rules)
+    try data.write(to: url, options: .atomic)
+}
+
+/// Creates a genuine legacy schema v2 pack on disk (without the `provenance` column) for S-1 migration testing.
+func createLegacyV2Pack(in rootURL: URL, goVersion: String, chunks: [DocsChunk]) throws {
+    let packDir = rootURL.appendingPathComponent("packs/go\(goVersion)", isDirectory: true)
+    try FileManager.default.createDirectory(at: packDir, withIntermediateDirectories: true)
+    let dbURL = packDir.appendingPathComponent("index.sqlite")
+
+    var db: OpaquePointer?
+    guard sqlite3_open_v2(dbURL.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK, let db else {
+        throw DocsStorageError.sqlite("unable to create legacy v2 db")
+    }
+    defer { sqlite3_close(db) }
+
+    let ddl = """
+    CREATE TABLE chunks (
+        stable_id TEXT PRIMARY KEY,
+        go_version TEXT NOT NULL,
+        source TEXT NOT NULL,
+        package_name TEXT NOT NULL,
+        document_id TEXT NOT NULL DEFAULT '',
+        symbol TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        title TEXT NOT NULL,
+        anchor TEXT NOT NULL,
+        since TEXT,
+        summary TEXT NOT NULL,
+        signature TEXT,
+        example TEXT,
+        body TEXT NOT NULL,
+        search_aliases TEXT NOT NULL,
+        content_hash TEXT NOT NULL
+    );
+    CREATE VIRTUAL TABLE chunks_fts USING fts5(
+        stable_id UNINDEXED, title, package_name, symbol, summary, body, search_aliases, tokenize = 'unicode61'
+    );
+    CREATE TABLE pack_vector_refs (
+        stable_id TEXT PRIMARY KEY, content_hash TEXT NOT NULL, model_id TEXT NOT NULL, model_version TEXT NOT NULL
+    );
+    """
+    var err: UnsafeMutablePointer<CChar>?
+    if sqlite3_exec(db, ddl, nil, nil, &err) != SQLITE_OK {
+        let msg = err.map { String(cString: $0) } ?? "ddl failed"
+        sqlite3_free(err)
+        throw DocsStorageError.sqlite(msg)
+    }
+
+    let insert = """
+    INSERT INTO chunks (
+        stable_id, go_version, source, package_name, document_id, symbol, kind,
+        title, anchor, since, summary, signature, example, body, search_aliases, content_hash
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16);
+    """
+    var stmt: OpaquePointer?
+    guard sqlite3_prepare_v2(db, insert, -1, &stmt, nil) == SQLITE_OK, let stmt else {
+        throw DocsStorageError.sqlite("prepare failed")
+    }
+    defer { sqlite3_finalize(stmt) }
+    let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+    for c in chunks {
+        sqlite3_reset(stmt)
+        let aliasesJSON = (try? JSONEncoder().encode(c.searchAliases)).flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+        let values: [String?] = [
+            c.stableID, c.goVersion, c.source.rawValue, c.packageName, c.documentID,
+            c.symbol, c.kind.rawValue, c.title, c.anchor, c.since,
+            c.summary, c.signature, c.example, c.body, aliasesJSON, c.contentHash
+        ]
+        for (i, val) in values.enumerated() {
+            if let val {
+                _ = val.withCString { sqlite3_bind_text(stmt, Int32(i + 1), $0, -1, transient) }
+            } else {
+                sqlite3_bind_null(stmt, Int32(i + 1))
+            }
+        }
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DocsStorageError.sqlite("insert failed")
+        }
+    }
+
+    let manifest = DocsPackManifest(
+        goVersion: goVersion,
+        createdAt: "2026-01-01T00:00:00Z",
+        chunkCount: chunks.count,
+        status: .indexingFTSOnly,
+        schemaVersion: 2
+    )
+    let data = try JSONEncoder().encode(manifest)
+    try data.write(to: packDir.appendingPathComponent("manifest.json"), options: .atomic)
 }
 
 func recordProgress(_ box: ProgressRecorder, _ progress: DocsBatchProgress) {

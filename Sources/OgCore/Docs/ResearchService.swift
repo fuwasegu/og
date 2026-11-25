@@ -273,12 +273,17 @@ public enum DocsCodeInserter {
                 }
                 do {
                     try proc.run()
-                    if Task.isCancelled {
+                    // S-6: never write stdin after cancellation or process termination; use throwing write(contentsOf:) to avoid EPIPE NSException.
+                    if Task.isCancelled || !proc.isRunning {
+                        try? inPipe.fileHandleForWriting.close()
                         if proc.isRunning { proc.terminate() }
+                        return
                     }
-                    inPipe.fileHandleForWriting.write(Data(input.utf8))
+                    try inPipe.fileHandleForWriting.write(contentsOf: Data(input.utf8))
                     try? inPipe.fileHandleForWriting.close()
                 } catch {
+                    try? inPipe.fileHandleForWriting.close()
+                    if proc.isRunning { proc.terminate() }
                     timeoutTask.cancel()
                     if finished.trySet() {
                         continuation.resume(returning: nil)
@@ -304,11 +309,13 @@ public enum DocsCodeInserter {
         proc.terminationHandler = { _ in sema.signal() }
         do {
             try proc.run()
+            try inPipe.fileHandleForWriting.write(contentsOf: Data(input.utf8))
+            try? inPipe.fileHandleForWriting.close()
         } catch {
+            try? inPipe.fileHandleForWriting.close()
+            if proc.isRunning { proc.terminate() }
             return nil
         }
-        inPipe.fileHandleForWriting.write(Data(input.utf8))
-        try? inPipe.fileHandleForWriting.close()
         if sema.wait(timeout: .now() + .seconds(2)) == .timedOut {
             proc.terminate()
             return nil
@@ -362,7 +369,7 @@ public actor ResearchService {
     private var enabled: Bool
     private var validatedEndpoint: URL?
     private var queryEmbedder: (any DocsEmbedder)?
-    private var conceptRules: [DocsConceptRule] = BundledGoCorpus.defaultConceptRules
+    private var conceptRulesOverride: [DocsConceptRule]?
 
     public init(packManager: DocsPackManager, enabled: Bool = false) {
         self.packManager = packManager
@@ -375,9 +382,10 @@ public actor ResearchService {
         enabled = value
     }
 
-    /// Overrides the temporary Phase 1 data-driven cross-lingual concept rules (R-1).
-    public func setConceptRules(_ rules: [DocsConceptRule]) {
-        conceptRules = rules
+    /// Overrides the temporary Phase 1 data-driven cross-lingual concept rules (R-1, S-3).
+    /// Pass `nil` to revert to loading rules dynamically from `packManager.loadConceptRules(forGoVersion:)`.
+    public func setConceptRules(_ rules: [DocsConceptRule]?) {
+        conceptRulesOverride = rules
     }
 
     /// DES-1 / DOC-6: Validates that any configured model server endpoint is loopback only.
@@ -405,13 +413,15 @@ public actor ResearchService {
         projectRoot: URL? = nil,
         explicitVersionOverride: GoVersion? = nil,
         editorContext: DocsEditorContext? = nil,
-        toolchainVersionProvider: (() -> GoVersion?)? = nil
+        toolchainVersionProvider: (@Sendable () -> GoVersion?)? = nil
     ) async throws -> DocsAnswer {
         try Task.checkCancellation()
-        let plan = DocsQueryRouter.route(rawQuery, conceptRules: conceptRules)
+        let trimmedQuery = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        let detectedLang = DocsLanguage.detect(in: trimmedQuery)
 
         // DOC-1: opt-in check
         guard enabled else {
+            let plan = DocsQueryRouter.route(rawQuery, conceptRules: conceptRulesOverride ?? BundledGoCorpus.defaultConceptRules)
             let msg = plan.language == .japanese
                 ? "Go 調べ物機能は現在オフです。設定画面（⌘,）で有効にしてください。"
                 : "Offline Go Docs lookup is disabled. Enable it in Settings (⌘,)."
@@ -424,24 +434,24 @@ public actor ResearchService {
             )
         }
 
-        guard !plan.originalQuery.isEmpty else {
-            let msg = plan.language == .japanese
+        guard !trimmedQuery.isEmpty else {
+            let msg = detectedLang == .japanese
                 ? "調べたい内容（例: 「ファイルを1行ずつ読みたい」「for ループの書き方」「json.Encoder」）を入力してください。"
                 : "Enter a Go question or symbol (e.g. \"read file line by line\", \"json.Encoder\")."
             return DocsAnswer(
                 query: "",
                 status: .notFound,
-                language: plan.language,
-                intent: plan.intent,
+                language: detectedLang,
+                intent: .needsReverseLookup,
                 conclusion: msg
             )
         }
 
-        // Step 2: Resolve target Go version (FR-2).
+        // Step 2: Resolve target Go version asynchronously (FR-2, S-2: never blocks a thread with semaphore wait).
         let resolved: ResolvedGoVersion
         if let override = explicitVersionOverride {
             resolved = ResolvedGoVersion(version: override, source: .manualOverride)
-        } else if let detected = GoVersionResolver.resolve(projectRoot: projectRoot, toolchainVersionProvider: toolchainVersionProvider) {
+        } else if let detected = await GoVersionResolver.resolveAsync(projectRoot: projectRoot, toolchainVersionProvider: toolchainVersionProvider) {
             resolved = detected
         } else {
             let fallbackVer = GoVersion(parsing: BundledGoCorpus.defaultVersion) ?? GoVersion(major: 1, minor: 23)
@@ -451,6 +461,16 @@ public actor ResearchService {
         try Task.checkCancellation()
         let targetVer = resolved.version
         let packKey = targetVer.minorKey
+
+        // Step 1 (data-driven routing): load global + per-pack concept rules (R-1, S-3).
+        let activeRules: [DocsConceptRule]
+        if let overrideRules = conceptRulesOverride {
+            let packRules = await packManager.loadPackConceptRules(forGoVersion: packKey)
+            activeRules = packRules.isEmpty ? overrideRules : (overrideRules + packRules)
+        } else {
+            activeRules = await packManager.loadConceptRules(forGoVersion: packKey)
+        }
+        let plan = DocsQueryRouter.route(rawQuery, conceptRules: activeRules)
 
         // §7.4 / DOC-2: Never silently answer from a different Go version's pack when the matching pack is missing.
         guard let manifest = await packManager.manifest(for: packKey),

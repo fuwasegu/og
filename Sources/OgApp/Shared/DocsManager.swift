@@ -20,6 +20,7 @@ final class DocsManager {
     private(set) var activeProgress: DocsBatchProgress?
     private(set) var lastError: String?
     private(set) var detectedToolchainVersion: GoVersion?
+    private var toolchainDetectionCompleted = false
     private var batchTasks: [String: Task<Void, Never>] = [:]
     /// In-memory override for headless tests so `DebugDriver` never mutates UserDefaults opt-in (M-6).
     var debugEnabledOverride: Bool?
@@ -48,6 +49,7 @@ final class DocsManager {
 
     private func setDetectedToolchainVersion(_ ver: GoVersion?) {
         detectedToolchainVersion = ver
+        toolchainDetectionCompleted = true
         notifyProgressChanged()
     }
 
@@ -102,8 +104,19 @@ final class DocsManager {
 
     func refreshPacks() async {
         guard let pm = packManager else { return }
+        // S-1: migrate any existing v1/v2 packs (including GOROOT packs) in place to schema v3 provenance.
+        _ = try? await pm.migrateLegacyPacksIfNeeded()
+        // S-3: wire data-driven global/custom concept rules from disk into ResearchService.
+        await reloadConceptRules()
         installedPacks = await pm.installedPacks()
         notifyPacksChanged()
+    }
+
+    /// Reloads data-driven Phase 1 concept rules (bundled defaults + `concept_rules.json`) into `ResearchService` (S-3).
+    func reloadConceptRules() async {
+        guard let pm = packManager, let service else { return }
+        let rules = await pm.loadConceptRules()
+        await service.setConceptRules(rules)
     }
 
     func ensureDefaultPackIfNeeded() async {
@@ -248,12 +261,16 @@ final class DocsManager {
             )
         }
         await service.setEnabled(enabled)
+        let cachedToolchain = detectedToolchainVersion
+        let hasCompletedDetection = toolchainDetectionCompleted
+        let provider: (@Sendable () -> GoVersion?)? = hasCompletedDetection ? { @Sendable in cachedToolchain } : nil
         do {
             return try await service.search(
                 query: query,
                 projectRoot: projectRoot,
                 explicitVersionOverride: explicitVersion,
-                editorContext: editorContext
+                editorContext: editorContext,
+                toolchainVersionProvider: provider
             )
         } catch is CancellationError {
             return DocsAnswer(

@@ -172,6 +172,47 @@ public actor DocsPackManager {
         packDirectory(for: goVersion).appendingPathComponent("index.sqlite")
     }
 
+    /// Global user/app-extensible concept rules JSON path (S-3).
+    public func conceptRulesURL() -> URL {
+        rootDirectory.appendingPathComponent("concept_rules.json")
+    }
+
+    /// Per-pack optional concept rules JSON path (S-3).
+    public func packConceptRulesURL(for goVersion: String) -> URL {
+        packDirectory(for: goVersion).appendingPathComponent("concept_rules.json")
+    }
+
+    /// Loads data-driven Phase 1 concept rules: bundled defaults + global `concept_rules.json` + optional per-pack `concept_rules.json` (R-1, S-3).
+    public func loadConceptRules(forGoVersion goVersion: String? = nil) -> [DocsConceptRule] {
+        var rules = BundledGoCorpus.defaultConceptRules
+        rules.append(contentsOf: Self.decodeConceptRules(at: conceptRulesURL()))
+        if let goVersion {
+            rules.append(contentsOf: Self.decodeConceptRules(at: packConceptRulesURL(for: goVersion)))
+        }
+        return rules
+    }
+
+    /// Loads only the per-pack custom concept rules, if any (S-3).
+    public func loadPackConceptRules(forGoVersion goVersion: String) -> [DocsConceptRule] {
+        Self.decodeConceptRules(at: packConceptRulesURL(for: goVersion))
+    }
+
+    /// Persists custom global concept rules to `concept_rules.json` so rules can be extended without code changes (S-3).
+    public func saveCustomConceptRules(_ rules: [DocsConceptRule]) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(rules)
+        try data.write(to: conceptRulesURL(), options: .atomic)
+    }
+
+    private static func decodeConceptRules(at url: URL) -> [DocsConceptRule] {
+        guard let data = try? Data(contentsOf: url),
+              let decoded = try? JSONDecoder().decode([DocsConceptRule].self, from: data) else {
+            return []
+        }
+        return decoded
+    }
+
     private func manifestURL(in dir: URL) -> URL {
         dir.appendingPathComponent("manifest.json")
     }
@@ -224,11 +265,50 @@ public actor DocsPackManager {
         return try DocsIndex(databaseURL: url, readOnly: true)
     }
 
+    /// Migrates existing v1/v2 installed packs (including GOROOT-imported packs) in place to schema v3 (S-1):
+    /// adds missing columns, accurately tags bundled complement chunks with `.bundledCurated` provenance while
+    /// preserving `.officialExtracted` on real GOROOT chunks, checkpoints WAL, and bumps `manifest.schemaVersion`.
+    @discardableResult
+    public func migrateLegacyPacksIfNeeded() throws -> Int {
+        let fm = FileManager.default
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        var migratedCount = 0
+
+        for var pack in installedPacks() {
+            guard pack.schemaVersion < DocsPackManifest.currentSchemaVersion else { continue }
+            guard !inFlightVersions.contains(pack.goVersion) else { continue }
+
+            let dir = packDirectory(for: pack.goVersion)
+            let dbURL = dir.appendingPathComponent("index.sqlite")
+            guard fm.fileExists(atPath: dbURL.path) else { continue }
+
+            let bundled = BundledGoCorpus.chunks(forGoVersion: pack.goVersion)
+            let bundledHashes = Set(bundled.map(\.contentHash))
+            let bundledNonStdlibIDs = Set(bundled.filter { $0.source != .stdlib }.map(\.stableID))
+
+            let idx = try DocsIndex(databaseURL: dbURL, readOnly: false)
+            defer { idx.close() }
+            _ = try idx.migrateBundledProvenance(
+                bundledContentHashes: bundledHashes,
+                bundledNonStdlibStableIDs: bundledNonStdlibIDs
+            )
+            try idx.checkpointWAL()
+
+            pack.schemaVersion = DocsPackManifest.currentSchemaVersion
+            pack.sizeBytes = Self.directorySizeBytes(dir)
+            try encoder.encode(pack).write(to: manifestURL(in: dir), options: .atomic)
+            migratedCount += 1
+        }
+        return migratedCount
+    }
+
     /// Ensures the bundled default Go documentation pack is installed (and migrated if schema changed) offline (Q-1).
     @discardableResult
     public func ensureBundledPackInstalled(
         goVersion: String = BundledGoCorpus.defaultVersion
     ) async throws -> DocsPackManifest {
+        _ = try? migrateLegacyPacksIfNeeded()
         if let existing = manifest(for: goVersion),
            existing.schemaVersion >= DocsPackManifest.currentSchemaVersion {
             return existing

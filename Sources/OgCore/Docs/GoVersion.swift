@@ -90,7 +90,7 @@ public struct ResolvedGoVersion: Sendable, Hashable, Codable {
 public enum GoVersionResolver {
     public static func resolve(
         projectRoot: URL?,
-        toolchainVersionProvider: (() -> GoVersion?)? = nil
+        toolchainVersionProvider: (@Sendable () -> GoVersion?)? = nil
     ) -> ResolvedGoVersion? {
         if let root = projectRoot {
             if let v = findDirectiveWalkingUp(from: root, fileName: "go.mod") {
@@ -100,7 +100,36 @@ public enum GoVersionResolver {
                 return ResolvedGoVersion(version: v, source: .goWork)
             }
         }
-        let detected = toolchainVersionProvider?() ?? detectInstalledToolchainVersion()
+        // S-2: when an explicit provider is supplied (e.g. cached UI value), never fall through to blocking detection.
+        let detected: GoVersion? = if let provider = toolchainVersionProvider {
+            provider()
+        } else {
+            detectInstalledToolchainVersion()
+        }
+        if let v = detected {
+            return ResolvedGoVersion(version: v, source: .toolchain)
+        }
+        return nil
+    }
+
+    /// Async non-blocking version resolution (S-2: uses `detectInstalledToolchainVersionAsync` instead of semaphore wait).
+    public static func resolveAsync(
+        projectRoot: URL?,
+        toolchainVersionProvider: (@Sendable () -> GoVersion?)? = nil
+    ) async -> ResolvedGoVersion? {
+        if let root = projectRoot {
+            if let v = findDirectiveWalkingUp(from: root, fileName: "go.mod") {
+                return ResolvedGoVersion(version: v, source: .goMod)
+            }
+            if let v = findDirectiveWalkingUp(from: root, fileName: "go.work") {
+                return ResolvedGoVersion(version: v, source: .goWork)
+            }
+        }
+        let detected: GoVersion? = if let provider = toolchainVersionProvider {
+            provider()
+        } else {
+            await detectInstalledToolchainVersionAsync()
+        }
         if let v = detected {
             return ResolvedGoVersion(version: v, source: .toolchain)
         }
