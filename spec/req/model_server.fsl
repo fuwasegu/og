@@ -6,9 +6,11 @@
 //         to a server started outside og.
 //   D-10: the model is chosen in og's settings.
 //
-// ASSUME-1 (confirmed by default 2026-11-09): one server for the whole app, started
-//   when AI completion is enabled (including at launch) and stopped when it is
-//   disabled or the app quits.
+// ASSUME-1 (confirmed 2026-11-09, scoped 2026-11-26): one inline-completion server
+//   for the whole app, started when AI completion is enabled (including at launch)
+//   and stopped when it is disabled or the app quits. Offline Go Docs lookup
+//   (`spec/req/research.fsl`) is modeled separately; Phase 2 research models will
+//   run under the same D-9 (og-owned loopback) contract without sharing this slot.
 // ASSUME-2: an unexpected exit is restarted automatically; after MAXR consecutive
 //   failures og stops retrying and shows an error until the user retries.
 // ASSUME-3: completion requests are sent only while the server is ready; while it

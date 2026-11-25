@@ -21,8 +21,21 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     private let actionButton = NSButton(title: "Restart", target: nil, action: nil)
     private let logView = NSTextView()
 
+    // Offline Go Docs (FR-19, FR-20, FR-23, FR-24, FR-29, Q-4, L-9)
+    private let docsEnabled = NSButton(checkboxWithTitle: "Enable offline Go Docs lookup (local-only; independent of inline AI completion)", target: nil, action: nil)
+    private let docsBatchPolicy = NSPopUpButton()
+    private let docsVersionCombo = NSComboBox()
+    private let docsInstallButton = NSButton(title: "Add / Update Pack", target: nil, action: nil)
+    private let docsImportGorootButton = NSButton(title: "Import GOROOT…", target: nil, action: nil)
+    private let docsDeleteButton = NSButton(title: "Delete Pack", target: nil, action: nil)
+    private let docsCancelButton = NSButton(title: "Cancel Batch", target: nil, action: nil)
+    private let docsLicenseButton = NSButton(title: "BSD License…", target: nil, action: nil)
+    private let docsPacksLabel = NSTextField(wrappingLabelWithString: "")
+    private let docsProgressBar = NSProgressIndicator()
+    private let docsProgressLabel = NSTextField(labelWithString: "")
+
     private init() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 520), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 680), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         w.title = "Settings"
         super.init(window: w)
         build()
@@ -30,6 +43,12 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         w.center()
         NotificationCenter.default.addObserver(forName: .ogModelServerChanged, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.refreshStatus() }
+        }
+        NotificationCenter.default.addObserver(forName: .ogDocsChanged, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshDocs() }
+        }
+        NotificationCenter.default.addObserver(forName: .ogDocsBatchProgressChanged, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshDocs() }
         }
     }
 
@@ -95,10 +114,45 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         hint.textColor = .secondaryLabelColor
 
         let statusRow = NSStackView(views: [status, NSView(), actionButton])
+
+        // Offline Go Docs controls (FR-19, FR-20, FR-23, FR-24, FR-29, L-9)
+        docsEnabled.target = self
+        docsEnabled.action = #selector(docsEnabledChanged)
+        for p in DocsBatchRunPolicy.allCases { docsBatchPolicy.addItem(withTitle: p.title) }
+        docsBatchPolicy.target = self
+        docsBatchPolicy.action = #selector(docsPolicyChanged)
+        docsVersionCombo.isEditable = true
+        docsVersionCombo.completes = false
+        docsVersionCombo.placeholderString = "go1.23"
+        docsVersionCombo.widthAnchor.constraint(equalToConstant: 96).isActive = true
+        docsInstallButton.target = self
+        docsInstallButton.action = #selector(docsInstallClicked)
+        docsImportGorootButton.target = self
+        docsImportGorootButton.action = #selector(docsImportGorootClicked)
+        docsDeleteButton.target = self
+        docsDeleteButton.action = #selector(docsDeleteClicked)
+        docsCancelButton.target = self
+        docsCancelButton.action = #selector(docsCancelClicked)
+        docsLicenseButton.target = self
+        docsLicenseButton.action = #selector(docsLicenseClicked)
+        docsPacksLabel.font = Theme.smallFont
+        docsPacksLabel.textColor = Theme.secondaryText
+        docsProgressBar.isIndeterminate = false
+        docsProgressBar.minValue = 0
+        docsProgressBar.maxValue = 1
+        docsProgressBar.controlSize = .small
+        docsProgressLabel.font = Theme.smallFont
+        docsProgressLabel.textColor = Theme.secondaryText
+        let docsButtons = NSStackView(views: [docsVersionCombo, docsInstallButton, docsImportGorootButton, docsDeleteButton, docsCancelButton, docsLicenseButton])
+        docsButtons.orientation = .horizontal
+        docsButtons.spacing = 6
+
         let stack = NSStackView(views: [
             row("Theme", themePopup), row("Font", fontFamily), NSStackView(views: [fontLabel, fontSize]), fontPreview,
             reopen, NSBox(),
-            aiEnabled, row("Backend", backend), row("Model", model), customRow, hint, statusRow, logScroll
+            aiEnabled, row("Backend", backend), row("Model", model), customRow, hint, statusRow, logScroll,
+            NSBox(),
+            docsEnabled, row("Indexing", docsBatchPolicy), docsButtons, docsPacksLabel, docsProgressBar, docsProgressLabel
         ])
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -106,7 +160,17 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
         statusRow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
         logScroll.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
-        window?.contentView = stack
+        docsProgressBar.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
+        docsPacksLabel.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
+        let scroll = NSScrollView()
+        scroll.documentView = stack
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            stack.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor)
+        ])
+        window?.contentView = scroll
     }
 
     private func load() {
@@ -125,6 +189,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         custom.stringValue = cfg.customCommand
         updateRows()
         refreshStatus()
+        refreshDocs()
     }
 
     private func fillModels(for b: ModelBackend) {
@@ -219,5 +284,161 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
 
     @objc private func reopenChanged() {
         UserDefaults.standard.set(reopen.state == .on, forKey: "og.reopenLast")
+    }
+
+    // MARK: - Offline Go Docs Actions (FR-19, FR-20, FR-23, FR-24, FR-29)
+
+    private func refreshDocs() {
+        let d = DocsManager.shared
+        docsEnabled.state = d.enabled ? .on : .off
+        docsBatchPolicy.selectItem(at: DocsBatchRunPolicy.allCases.firstIndex(of: d.batchPolicy) ?? 0)
+
+        let packs = d.installedPacks
+        // L-9: populate combo dynamically from installed packs, cached toolchain version, and bundled default.
+        var versions: [String] = []
+        for p in packs where !versions.contains(p.goVersion) { versions.append(p.goVersion) }
+        if let detected = d.detectedToolchainVersion?.minorKey, !versions.contains(detected) {
+            versions.append(detected)
+        }
+        if !versions.contains(BundledGoCorpus.defaultVersion) {
+            versions.append(BundledGoCorpus.defaultVersion)
+        }
+        let currentSelection = docsVersionCombo.stringValue.trimmingCharacters(in: .whitespaces)
+        docsVersionCombo.removeAllItems()
+        docsVersionCombo.addItems(withObjectValues: versions.sorted(by: >).map { "go\($0)" })
+        if currentSelection.isEmpty {
+            docsVersionCombo.stringValue = "go\(BundledGoCorpus.defaultVersion)"
+        }
+
+        if packs.isEmpty {
+            docsPacksLabel.stringValue = "Installed packs: none (enabling installs bundled go\(BundledGoCorpus.defaultVersion) core pack offline)"
+        } else {
+            let lines = packs.map { p in
+                let kb = max(1, p.sizeBytes / 1024)
+                let mode = p.status == .ready ? "ready (FTS + semantic)" : "FTS-only"
+                let legacyNote = p.needsReimport ? " — legacy v1 schema: re-import recommended" : ""
+                return "• go\(p.goVersion): \(p.chunkCount) chunks, \(kb) KB [\(mode)]\(legacyNote)"
+            }
+            docsPacksLabel.stringValue = "Installed packs:\n" + lines.joined(separator: "\n")
+        }
+
+        if let p = d.activeProgress {
+            docsProgressBar.doubleValue = p.fractionCompleted
+            let estKB = max(1, p.estimatedBytes / 1024)
+            let isRunning = p.phase == .extracting || p.phase == .buildingFTS || p.phase == .embedding || p.phase == .activating
+            docsCancelButton.isEnabled = isRunning
+            docsProgressLabel.stringValue = "Batch go\(p.goVersion): \(p.phase.rawValue) (\(p.processedChunks)/\(p.totalChunks) chunks, est. \(estKB) KB, reused \(p.reusedVectors))"
+        } else if let err = d.lastError {
+            docsProgressBar.doubleValue = 0
+            docsCancelButton.isEnabled = false
+            docsProgressLabel.stringValue = "Docs error: \(err)"
+        } else {
+            docsProgressBar.doubleValue = 0
+            docsCancelButton.isEnabled = false
+            docsProgressLabel.stringValue = "Batch: idle"
+        }
+    }
+
+    private var knownDocsVersions: Set<String> {
+        let d = DocsManager.shared
+        var versions = Set(d.installedPacks.map(\.goVersion))
+        if let detected = d.detectedToolchainVersion?.minorKey {
+            versions.insert(detected)
+        }
+        versions.insert(BundledGoCorpus.defaultVersion)
+        return versions
+    }
+
+    private func parsedSelectedDocsVersion() -> String? {
+        let raw = docsVersionCombo.stringValue.trimmingCharacters(in: .whitespaces)
+        return GoVersion(parsing: raw)?.minorKey
+    }
+
+    private func showDocsAlert(message: String, info: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = message
+        alert.informativeText = info
+        alert.addButton(withTitle: "OK")
+        if let w = window { alert.beginSheetModal(for: w, completionHandler: nil) } else { alert.runModal() }
+    }
+
+    @objc private func docsEnabledChanged() {
+        DocsManager.shared.enabled = docsEnabled.state == .on
+        refreshDocs()
+    }
+
+    @objc private func docsPolicyChanged() {
+        DocsManager.shared.batchPolicy = DocsBatchRunPolicy.allCases[max(0, docsBatchPolicy.indexOfSelectedItem)]
+    }
+
+    @objc private func docsInstallClicked() {
+        guard let ver = parsedSelectedDocsVersion() else {
+            showDocsAlert(
+                message: "Invalid Go Version",
+                info: "Enter a valid Go version such as go\(BundledGoCorpus.defaultVersion)."
+            )
+            return
+        }
+        // R-3: require explicit confirmation before creating a bundled-excerpt pack for an unverified version.
+        if !knownDocsVersions.contains(ver) {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Create pack for unverified Go version go\(ver)?"
+            alert.informativeText = "go\(ver) was not detected among installed packs or your local Go toolchain. Bundled excerpts are curated for go\(BundledGoCorpus.defaultVersion); for an accurate pack of another Go version, use \"Import GOROOT…\" instead. Continue anyway?"
+            alert.addButton(withTitle: "Cancel")
+            alert.addButton(withTitle: "Create Pack")
+            let proceed: (NSApplication.ModalResponse) -> Void = { response in
+                if response == .alertSecondButtonReturn {
+                    DocsManager.shared.startBundledPackIngestion(goVersion: ver)
+                }
+            }
+            if let w = window {
+                alert.beginSheetModal(for: w, completionHandler: proceed)
+            } else {
+                proceed(alert.runModal())
+            }
+            return
+        }
+        DocsManager.shared.startBundledPackIngestion(goVersion: ver)
+    }
+
+    @objc private func docsImportGorootClicked() {
+        guard let ver = parsedSelectedDocsVersion() else {
+            showDocsAlert(
+                message: "Invalid Go Version",
+                info: "Enter the Go version matching the GOROOT you are importing (e.g. go\(BundledGoCorpus.defaultVersion))."
+            )
+            return
+        }
+        Task { @MainActor [weak self] in
+            let detected = await GoVersionResolver.detectGorootAsync()
+            guard self != nil else { return }
+            let panel = NSOpenPanel()
+            panel.canChooseDirectories = true
+            panel.canChooseFiles = false
+            panel.message = "Choose a local GOROOT directory (containing src/) for go\(ver)"
+            if let detected { panel.directoryURL = detected }
+            if panel.runModal() == .OK, let url = panel.url {
+                DocsManager.shared.startGorootIngestion(goroot: url, goVersion: ver)
+            }
+        }
+    }
+
+    @objc private func docsDeleteClicked() {
+        guard let ver = parsedSelectedDocsVersion() else { return }
+        DocsManager.shared.deletePack(goVersion: ver)
+    }
+
+    @objc private func docsCancelClicked() {
+        DocsManager.shared.cancelActiveBatch()
+    }
+
+    @objc private func docsLicenseClicked() {
+        let alert = NSAlert()
+        alert.messageText = "Go Documentation License (BSD-3-Clause)"
+        alert.informativeText = DocsLicense.goBSD3Clause
+        alert.addButton(withTitle: "OK")
+        if let w = window { alert.beginSheetModal(for: w, completionHandler: nil) } else { alert.runModal() }
     }
 }

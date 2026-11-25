@@ -26,6 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         DebugDriver.startIfRequested()
         ModelServerManager.shared.startIfEnabled()
+        DocsManager.shared.startIfEnabled()
         // First launch: setup assistant on top of the welcome window (never during headless self-tests,
         // unless OG_ONBOARDING=1 asks for it).
         let forced = ProcessInfo.processInfo.environment["OG_ONBOARDING"] == "1"
@@ -38,6 +39,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         ModelServerManager.shared.shutdownForQuit()
+        DocsManager.shared.shutdownForQuit()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }

@@ -90,6 +90,7 @@ enum MainMenu {
             item("Run", #selector(P.ogShowRun(_:)), "4"),
             item("Debug", #selector(P.ogShowDebug(_:)), "5"),
             item("Problems", #selector(P.ogShowProblems(_:)), "6"),
+            item("Docs", #selector(P.ogShowDocs(_:)), "7"),
             item("Commit", #selector(P.ogShowCommit(_:)), "0"),
             item("Terminal", #selector(P.ogShowTerminal(_:)), fkey(12), [.option]),
             item("Hide Bottom Panel", #selector(P.ogToggleBottomPanel(_:)), "j"),

@@ -372,6 +372,21 @@ enum DebugDriver {
             guard let ed = project?.editorArea.current else { return }
             ed.debugAcceptCompletion(matching: arg)
             try? await Task.sleep(nanoseconds: 300_000_000)
+        case "docsver":
+            // docsver <1.21|1.23|auto>: override target Go version in the Docs panel.
+            guard let dp = project?.bottomPanel.docsPanel else { return }
+            dp.debugSetVersion(arg == "auto" || arg.isEmpty ? nil : arg)
+        case "docs":
+            // docs <query>: open Docs bottom tab, run offline search, and print summary.
+            guard let p = project else { return }
+            p.bottomPanel.show(.docs)
+            _ = await p.bottomPanel.docsPanel.debugSearch(arg)
+            print("docs: \(p.bottomPanel.docsPanel.debugSummary())")
+        case "docsinsert":
+            // docsinsert: insert the first grounded, version-gated card into the current editor.
+            guard let dp = project?.bottomPanel.docsPanel else { return }
+            let ok = await dp.debugInsertFirstCard()
+            print("docsinsert: \(ok)")
         case "log":
             print(arg)
         case "dump":

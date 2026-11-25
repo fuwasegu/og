@@ -23,11 +23,13 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
     private let size = NSPopUpButton()
     private let preview = NSTextView()
 
-    // AI
+    // AI & Offline Go Docs
     private let aiOn = NSButton(checkboxWithTitle: "Turn on inline AI completion", target: nil, action: nil)
     private let backend = NSPopUpButton()
     private let model = NSPopUpButton()
     private let aiNote = NSTextField(wrappingLabelWithString: "")
+    private let docsOn = NSButton(checkboxWithTitle: "Enable offline Go Docs lookup (local-only bundled pack, no network needed)", target: nil, action: nil)
+    private let docsNote = NSTextField(wrappingLabelWithString: "")
 
     private init() {
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 480), styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
@@ -119,6 +121,10 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
         model.action = #selector(aiChanged)
         aiNote.font = Theme.smallFont
         aiNote.textColor = Theme.secondaryText
+        docsOn.target = self
+        docsOn.action = #selector(aiChanged)
+        docsNote.font = Theme.smallFont
+        docsNote.textColor = Theme.secondaryText
     }
 
     private func show(_ s: Step) {
@@ -306,6 +312,7 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
     private func aiPage() -> NSView {
         let m = ModelServerManager.shared
         aiOn.state = m.enabled ? .on : .off
+        docsOn.state = DocsManager.shared.enabled ? .on : .off
         let cfg = m.config
         backend.selectItem(at: cfg.backend == .mlx ? 1 : 0)
         fillModels(selecting: cfg.model)
@@ -318,13 +325,14 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
             return NSStackView(views: [t, v])
         }
         return vstack([
-            title("AI completion"),
-            body("og can suggest the rest of a line as you type, like ghost text. It is off by default: og is built for writing code yourself, and you decide whether a model helps."),
-            body("It runs a small coding model on this Mac. og starts and stops the model server itself, binds it to 127.0.0.1, and your code never leaves the machine."),
+            title("AI completion & offline Go Docs"),
+            body("Both features are opt-in and independent. Everything stays on this Mac (127.0.0.1 only; zero cloud requests)."),
             aiOn,
             row("Engine", backend),
             row("Model", model),
-            aiNote
+            aiNote,
+            docsOn,
+            docsNote
         ], spacing: 10)
     }
 
@@ -348,6 +356,11 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
             ? "\(tool) found. The model (about 1–5 GB) downloads the first time the server starts."
             : "\(tool) was not found. Install it with “\(install)”, then turn this on in Settings."
         aiNote.textColor = found ? Theme.secondaryText : Theme.warning
+        let est = DocsPackManager.estimateBatch(chunks: BundledGoCorpus.chunks(), includesEmbeddings: false)
+        let kb = max(1, est.estimatedBytes / 1024)
+        docsNote.stringValue = docsOn.state == .on
+            ? "Will index bundled go\(BundledGoCorpus.defaultVersion) core docs (\(est.chunkCount) chunks, ~\(kb) KB) in background. Open with ⌘7."
+            : "Off by default. Turn on anytime in Settings or the Docs panel (⌘7)."
     }
 
     @objc private func backendPicked() {
@@ -371,6 +384,7 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
         } else if m.enabled {
             m.enabled = false
         }
+        DocsManager.shared.enabled = docsOn.state == .on
     }
 
     private func donePage() -> NSView {

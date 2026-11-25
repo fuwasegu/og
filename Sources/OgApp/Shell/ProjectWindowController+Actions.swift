@@ -87,6 +87,11 @@ extension ProjectWindowController: NSMenuItemValidation {
     @objc func ogShowRun(_ sender: Any?) { bottomPanel.show(.run) }
     @objc func ogShowDebug(_ sender: Any?) { bottomPanel.show(.debug) }
     @objc func ogShowProblems(_ sender: Any?) { bottomPanel.show(.problems) }
+    @objc func ogShowDocs(_ sender: Any?) {
+        let sel = editor.map { ($0.document.storage.string as NSString).substring(with: $0.textView.selectedRange()) } ?? ""
+        bottomPanel.show(.docs)
+        bottomPanel.docsPanel.focusSearch(prefill: sel.contains("\n") ? nil : sel)
+    }
     @objc func ogShowCommit(_ sender: Any?) { bottomPanel.show(.git); bottomPanel.gitPanel.focusCommit() }
 
     @objc func ogShowTerminal(_ sender: Any?) {

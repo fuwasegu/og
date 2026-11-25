@@ -1,5 +1,6 @@
 // Foundation helpers for tests live here (AGENTS.md: never import Foundation and Testing in one file).
 import Foundation
+import SQLite3
 @testable import OgCore
 
 // MARK: - Postfix
@@ -203,3 +204,334 @@ func applyEdits(_ text: String, _ edits: [(range: NSRange, text: String)]) -> St
     for e in edits.sorted(by: { $0.range.location > $1.range.location }) { m.replaceCharacters(in: e.range, with: e.text) }
     return m as String
 }
+
+// MARK: - Offline Go Docs (DocsResearchTests)
+
+/// Deterministic in-memory embedder for testing batch ingestion, cancel/resume, incremental diffs,
+/// and cross-version vector reuse without any network or external model server.
+final class CountingFakeEmbedder: DocsEmbedder, @unchecked Sendable {
+    let descriptor: EmbeddingModelDescriptor
+    private let lock = NSLock()
+    private var _callCount = 0
+    private var _cancelManager: DocsPackManager?
+    private var _cancelAfter: Int?
+    private var _cancelVersion: String?
+    private var _deleteInsteadOfCancel = false
+
+    init(id: String = "fake-embed", version: String = "v1") {
+        self.descriptor = EmbeddingModelDescriptor(id: id, version: version)
+    }
+
+    var callCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _callCount
+    }
+
+    func resetCount() {
+        lock.lock()
+        _callCount = 0
+        lock.unlock()
+    }
+
+    func configureCancel(manager: DocsPackManager, goVersion: String, afterCalls: Int) {
+        lock.lock()
+        _cancelManager = manager
+        _cancelVersion = goVersion
+        _cancelAfter = afterCalls
+        _deleteInsteadOfCancel = false
+        lock.unlock()
+    }
+
+    func configureDelete(manager: DocsPackManager, goVersion: String, afterCalls: Int) {
+        lock.lock()
+        _cancelManager = manager
+        _cancelVersion = goVersion
+        _cancelAfter = afterCalls
+        _deleteInsteadOfCancel = true
+        lock.unlock()
+    }
+
+    func clearCancel() {
+        lock.lock()
+        _cancelManager = nil
+        _cancelVersion = nil
+        _cancelAfter = nil
+        _deleteInsteadOfCancel = false
+        lock.unlock()
+    }
+
+    private func recordCallAndTakeCancelTarget() -> (DocsPackManager, String, Bool)? {
+        lock.lock()
+        defer { lock.unlock() }
+        _callCount += 1
+        let count = _callCount
+        if let mgr = _cancelManager, let ver = _cancelVersion, let limit = _cancelAfter, count >= limit {
+            _cancelAfter = nil
+            return (mgr, ver, _deleteInsteadOfCancel)
+        }
+        return nil
+    }
+
+    func embed(_ text: String) async throws -> [Float] {
+        if let (mgr, ver, shouldDelete) = recordCallAndTakeCancelTarget() {
+            if shouldDelete {
+                _ = try? await mgr.deletePack(goVersion: ver)
+            } else {
+                await mgr.requestCancel(goVersion: ver)
+            }
+        }
+
+        // Deterministic 8-dim bag-of-bytes vector (normalized).
+        var v = Array(repeating: Float(0), count: 8)
+        for (idx, b) in text.utf8.enumerated() {
+            v[idx % 8] += Float(b) / 255.0
+        }
+        let norm = sqrt(v.reduce(0) { $0 + $1 * $1 })
+        if norm > 0 { v = v.map { $0 / norm } }
+        return v
+    }
+}
+
+/// Embedder that throws on demand to test error propagation and `.failed` progress emission (M-16).
+final class FailingFakeEmbedder: DocsEmbedder, @unchecked Sendable {
+    let descriptor = EmbeddingModelDescriptor(id: "fail-embed", version: "v1")
+    func embed(_ text: String) async throws -> [Float] {
+        throw DocsStorageError.embeddingFailed("injected embedder failure")
+    }
+}
+
+/// Embedder that pauses briefly so concurrent re-entry and GC safety tests can overlap (H-8, H-9).
+final class SlowFakeEmbedder: DocsEmbedder, @unchecked Sendable {
+    let descriptor: EmbeddingModelDescriptor
+    let delayNs: UInt64
+    init(id: String = "slow-embed", version: String = "v1", delayNs: UInt64 = 30_000_000) {
+        self.descriptor = EmbeddingModelDescriptor(id: id, version: version)
+        self.delayNs = delayNs
+    }
+    func embed(_ text: String) async throws -> [Float] {
+        try await Task.sleep(nanoseconds: delayNs)
+        var v = Array(repeating: Float(0), count: 8)
+        for (idx, b) in text.utf8.enumerated() { v[idx % 8] += Float(b) / 255.0 }
+        let norm = sqrt(v.reduce(0) { $0 + $1 * $1 })
+        if norm > 0 { v = v.map { $0 / norm } }
+        return v
+    }
+}
+
+/// Deterministic keyword-aware embedder for verifying real semantic retrieval and M-1 anti-hallucination gating.
+final class SemanticTopicEmbedder: DocsEmbedder, @unchecked Sendable {
+    let descriptor: EmbeddingModelDescriptor
+    init(id: String = "topic-embed", version: String = "v1") {
+        self.descriptor = EmbeddingModelDescriptor(id: id, version: version)
+    }
+    func embed(_ text: String) async throws -> [Float] {
+        let lower = text.lowercased()
+        // 4 orthogonal topic dimensions: [bufio/line, json, timeout, regexp] + [noise]
+        var v: [Float] = [0.0, 0.0, 0.0, 0.0, 0.01]
+        if lower.contains("scanner") || lower.contains("bufio") || lower.contains("line") || lower.contains("行") { v[0] = 1.0 }
+        if lower.contains("json") || lower.contains("marshal") || lower.contains("encoder") || lower.contains("indent") { v[1] = 1.0 }
+        if lower.contains("timeout") || lower.contains("context") || lower.contains("deadline") || lower.contains("タイムアウト") { v[2] = 1.0 }
+        if lower.contains("regexp") || lower.contains("regex") || lower.contains("正規表現") { v[3] = 1.0 }
+        let norm = sqrt(v.reduce(0) { $0 + $1 * $1 })
+        return norm > 0 ? v.map { $0 / norm } : v
+    }
+}
+
+func makeDocsPackManager(in dir: TempDir) throws -> DocsPackManager {
+    try DocsPackManager(rootDirectory: dir.subdir("docs-packs"))
+}
+
+func reopenDocsPackManager(at rootURL: URL) throws -> DocsPackManager {
+    try DocsPackManager(rootDirectory: rootURL)
+}
+
+func stringContains(_ haystack: String, _ needle: String) -> Bool {
+    haystack.contains(needle)
+}
+
+func pathExists(_ url: URL) -> Bool {
+    FileManager.default.fileExists(atPath: url.path)
+}
+
+func writeConceptRulesJSON(_ rules: [DocsConceptRule], to url: URL) throws {
+    let data = try JSONEncoder().encode(rules)
+    try data.write(to: url, options: .atomic)
+}
+
+func writeRawText(_ text: String, to url: URL) throws {
+    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try text.write(to: url, atomically: true, encoding: .utf8)
+}
+
+/// Creates a genuine legacy schema v1 pack (no `document_id`, no `provenance`, `schemaVersion == 1`) for T-1 testing.
+func createLegacyV1Pack(in rootURL: URL, goVersion: String) throws {
+    let packDir = rootURL.appendingPathComponent("packs/go\(goVersion)", isDirectory: true)
+    try FileManager.default.createDirectory(at: packDir, withIntermediateDirectories: true)
+    let dbURL = packDir.appendingPathComponent("index.sqlite")
+
+    var db: OpaquePointer?
+    guard sqlite3_open_v2(dbURL.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK, let db else {
+        throw DocsStorageError.sqlite("unable to create legacy v1 db")
+    }
+    defer { sqlite3_close(db) }
+
+    let ddl = """
+    CREATE TABLE chunks (
+        stable_id TEXT PRIMARY KEY,
+        go_version TEXT NOT NULL,
+        source TEXT NOT NULL,
+        package_name TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        title TEXT NOT NULL,
+        anchor TEXT NOT NULL,
+        since TEXT,
+        summary TEXT NOT NULL,
+        signature TEXT,
+        example TEXT,
+        body TEXT NOT NULL,
+        search_aliases TEXT NOT NULL,
+        content_hash TEXT NOT NULL
+    );
+    """
+    var err: UnsafeMutablePointer<CChar>?
+    if sqlite3_exec(db, ddl, nil, nil, &err) != SQLITE_OK {
+        let msg = err.map { String(cString: $0) } ?? "v1 ddl failed"
+        sqlite3_free(err)
+        throw DocsStorageError.sqlite(msg)
+    }
+
+    let manifest = DocsPackManifest(
+        goVersion: goVersion,
+        createdAt: "2026-01-01T00:00:00Z",
+        chunkCount: 0,
+        status: .indexingFTSOnly,
+        schemaVersion: 1
+    )
+    try JSONEncoder().encode(manifest).write(to: packDir.appendingPathComponent("manifest.json"), options: .atomic)
+}
+
+/// Creates a corrupt legacy v2 pack (`index.sqlite` contains non-SQLite garbage bytes) for T-2 error isolation testing.
+func createCorruptLegacyV2Pack(in rootURL: URL, goVersion: String) throws {
+    let packDir = rootURL.appendingPathComponent("packs/go\(goVersion)", isDirectory: true)
+    try FileManager.default.createDirectory(at: packDir, withIntermediateDirectories: true)
+    try Data("not a valid sqlite database file".utf8).write(to: packDir.appendingPathComponent("index.sqlite"))
+    let manifest = DocsPackManifest(
+        goVersion: goVersion,
+        createdAt: "2026-01-01T00:00:00Z",
+        chunkCount: 1,
+        status: .indexingFTSOnly,
+        schemaVersion: 2
+    )
+    try JSONEncoder().encode(manifest).write(to: packDir.appendingPathComponent("manifest.json"), options: .atomic)
+}
+
+/// Creates a genuine legacy schema v2 pack on disk (without the `provenance` column) for S-1 migration testing.
+func createLegacyV2Pack(in rootURL: URL, goVersion: String, chunks: [DocsChunk]) throws {
+    let packDir = rootURL.appendingPathComponent("packs/go\(goVersion)", isDirectory: true)
+    try FileManager.default.createDirectory(at: packDir, withIntermediateDirectories: true)
+    let dbURL = packDir.appendingPathComponent("index.sqlite")
+
+    var db: OpaquePointer?
+    guard sqlite3_open_v2(dbURL.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK, let db else {
+        throw DocsStorageError.sqlite("unable to create legacy v2 db")
+    }
+    defer { sqlite3_close(db) }
+
+    let ddl = """
+    CREATE TABLE chunks (
+        stable_id TEXT PRIMARY KEY,
+        go_version TEXT NOT NULL,
+        source TEXT NOT NULL,
+        package_name TEXT NOT NULL,
+        document_id TEXT NOT NULL DEFAULT '',
+        symbol TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        title TEXT NOT NULL,
+        anchor TEXT NOT NULL,
+        since TEXT,
+        summary TEXT NOT NULL,
+        signature TEXT,
+        example TEXT,
+        body TEXT NOT NULL,
+        search_aliases TEXT NOT NULL,
+        content_hash TEXT NOT NULL
+    );
+    CREATE VIRTUAL TABLE chunks_fts USING fts5(
+        stable_id UNINDEXED, title, package_name, symbol, summary, body, search_aliases, tokenize = 'unicode61'
+    );
+    CREATE TABLE pack_vector_refs (
+        stable_id TEXT PRIMARY KEY, content_hash TEXT NOT NULL, model_id TEXT NOT NULL, model_version TEXT NOT NULL
+    );
+    """
+    var err: UnsafeMutablePointer<CChar>?
+    if sqlite3_exec(db, ddl, nil, nil, &err) != SQLITE_OK {
+        let msg = err.map { String(cString: $0) } ?? "ddl failed"
+        sqlite3_free(err)
+        throw DocsStorageError.sqlite(msg)
+    }
+
+    let insert = """
+    INSERT INTO chunks (
+        stable_id, go_version, source, package_name, document_id, symbol, kind,
+        title, anchor, since, summary, signature, example, body, search_aliases, content_hash
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16);
+    """
+    var stmt: OpaquePointer?
+    guard sqlite3_prepare_v2(db, insert, -1, &stmt, nil) == SQLITE_OK, let stmt else {
+        throw DocsStorageError.sqlite("prepare failed")
+    }
+    defer { sqlite3_finalize(stmt) }
+    let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+    for c in chunks {
+        sqlite3_reset(stmt)
+        let aliasesJSON = (try? JSONEncoder().encode(c.searchAliases)).flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+        let values: [String?] = [
+            c.stableID, c.goVersion, c.source.rawValue, c.packageName, c.documentID,
+            c.symbol, c.kind.rawValue, c.title, c.anchor, c.since,
+            c.summary, c.signature, c.example, c.body, aliasesJSON, c.contentHash
+        ]
+        for (i, val) in values.enumerated() {
+            if let val {
+                _ = val.withCString { sqlite3_bind_text(stmt, Int32(i + 1), $0, -1, transient) }
+            } else {
+                sqlite3_bind_null(stmt, Int32(i + 1))
+            }
+        }
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DocsStorageError.sqlite("insert failed")
+        }
+    }
+
+    let manifest = DocsPackManifest(
+        goVersion: goVersion,
+        createdAt: "2026-01-01T00:00:00Z",
+        chunkCount: chunks.count,
+        status: .indexingFTSOnly,
+        schemaVersion: 2
+    )
+    let data = try JSONEncoder().encode(manifest)
+    try data.write(to: packDir.appendingPathComponent("manifest.json"), options: .atomic)
+}
+
+func recordProgress(_ box: ProgressRecorder, _ progress: DocsBatchProgress) {
+    box.append(progress)
+}
+
+final class ProgressRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var items: [DocsBatchProgress] = []
+    func append(_ p: DocsBatchProgress) {
+        lock.lock()
+        items.append(p)
+        lock.unlock()
+    }
+    var phases: [DocsBatchPhase] {
+        lock.lock()
+        defer { lock.unlock() }
+        return items.map(\.phase)
+    }
+}
+
+

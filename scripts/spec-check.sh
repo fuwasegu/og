@@ -12,7 +12,7 @@ run() {
   printf '%-48s %s\n' "$label" "$r"
   case "$r" in ok|verified|proved|refines) ;; *) fail=1 ;; esac
 }
-depth_for() { case "$1" in *design/refactor.fsl) echo 12 ;; *) echo 8 ;; esac; }
+depth_for() { case "$1" in *design/refactor.fsl|*design/research.fsl) echo 12 ;; *) echo 8 ;; esac; }
 
 for f in spec/req/*.fsl spec/design/*.fsl; do
   case "$f" in *_refines_*) continue ;; esac
