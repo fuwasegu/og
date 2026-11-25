@@ -1,7 +1,7 @@
 import AppKit
 
 enum BottomTab: Int, CaseIterable {
-    case terminal, run, debug, problems, git, find
+    case terminal, run, debug, problems, git, find, docs
 
     var title: String {
         switch self {
@@ -11,6 +11,7 @@ enum BottomTab: Int, CaseIterable {
         case .problems: return "Problems"
         case .git: return "Commit"
         case .find: return "Find"
+        case .docs: return "Docs"
         }
     }
 }
@@ -25,6 +26,7 @@ final class BottomPanelController: NSViewController {
     let problemsPanel: ProblemsPanel
     let gitPanel: GitPanel
     let findPanel: FindPanel
+    let docsPanel: DocsPanel
     private let tabBar = NSStackView()
     private let container = NSView()
     private var buttons: [BottomTab: NSButton] = [:]
@@ -40,6 +42,7 @@ final class BottomPanelController: NSViewController {
         problemsPanel = ProblemsPanel(context: context)
         gitPanel = GitPanel(context: context)
         findPanel = FindPanel(context: context)
+        docsPanel = DocsPanel(context: context)
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -53,6 +56,7 @@ final class BottomPanelController: NSViewController {
         case .problems: return problemsPanel
         case .git: return gitPanel
         case .find: return findPanel
+        case .docs: return docsPanel
         }
     }
 

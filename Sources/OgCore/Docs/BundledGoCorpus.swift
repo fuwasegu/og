@@ -1,0 +1,676 @@
+import Foundation
+
+/// Built-in core Go documentation pack shipped inside `og` (Q-1 / Q-4).
+///
+/// Covers core Go language syntax, Effective Go idioms, and essential standard library
+/// symbols with accurate `since` versions so offline lookup (UC-1, UC-2, UC-3) and
+/// version gating work immediately even without network access or a local Go install.
+///
+/// All excerpts and signatures follow Go's official documentation (BSD-3-Clause, `DocsLicense.goBSD3Clause`).
+public enum BundledGoCorpus {
+    /// Default Go minor version for the bundled core pack.
+    public static let defaultVersion = "1.23"
+
+    /// Generates the core Go documentation chunks stamped for `goVersion`.
+    /// Because `DocsChunk.contentHash` excludes `goVersion`, unchanged entries across
+    /// versions share the same vector key in `SharedVectorStore` (FR-30, FR-31).
+    public static func chunks(forGoVersion goVersion: String = defaultVersion) -> [DocsChunk] {
+        var items: [DocsChunk] = [
+            // MARK: - UC-1: Language Spec & Effective Go (for loops, control flow, error handling)
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .spec,
+                packageName: "",
+                symbol: "for",
+                kind: .syntax,
+                title: "For statements (classic 3-clause, condition-only, infinite)",
+                anchor: "#For_statements",
+                since: "1.0",
+                summary: "Go のループは for のみ。C 風 3 節（カウンタ）、条件のみ（while 相当）、条件省略（無限ループ）の 3 形式＋for range を使う。",
+                signature: "for init; cond; post { ... }  |  for cond { ... }  |  for { ... }",
+                example: """
+                for i := 0; i < 5; i++ {
+                \tfmt.Println(i)
+                }
+                """,
+                body: """
+                A "for" statement specifies repeated execution of a block. There are three core forms in all Go versions:
+                1. Single condition (`for cond { ... }`) — Go's equivalent of `while`.
+                2. Classic for clause (`for i := 0; i < n; i++ { ... }`) — index/counter loop.
+                3. Infinite loop (`for { ... }`) — exit with `break` or `return`.
+                Choose `for range` when iterating over slices, maps, strings, or channels.
+                """,
+                searchAliases: ["for ループ 書き方", "ループ", "繰り返し", "while", "繰り返し処理", "for loop", "syntax"]
+            ),
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .guide,
+                packageName: "",
+                symbol: "for range",
+                kind: .guide,
+                title: "Effective Go: For (iterating slices, maps, strings, channels)",
+                anchor: "#for",
+                since: "1.0",
+                summary: "スライス・マップ・文字列・チャネルの走査には for range を使う。不要な値やインデックスはブランク識別子 `_` で捨てる。",
+                signature: "for idx, val := range collection { ... }",
+                example: """
+                for i, v := range items {
+                \tfmt.Printf("%d: %v\\n", i, v)
+                }
+                """,
+                body: """
+                Effective Go recommends `for range` for iterating over arrays, slices, strings, maps, and channels.
+                Use `for _, v := range xs` when you only need the value, and `for i := range xs` when you only need the index or key.
+                For strings, `range` decodes UTF-8 runes rather than raw bytes.
+                """,
+                searchAliases: ["for ループ 書き方", "for range", "配列 ループ", "スライス 反復", "マップ 反復", "foreach", "effective go for"]
+            ),
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .spec,
+                packageName: "",
+                symbol: "for range int",
+                kind: .syntax,
+                title: "For statements with range over integer (Go 1.22+)",
+                anchor: "#For_range",
+                since: "1.22",
+                summary: "Go 1.22 以降では整数 n に対して `for i := range n` で 0 から n-1 まで反復できる。",
+                signature: "for i := range n { ... }  // Go 1.22+",
+                example: """
+                for i := range 10 {
+                \tfmt.Println(i)
+                }
+                """,
+                body: """
+                Starting in Go 1.22, a `for` statement with a `range` clause may iterate over an integer value `n`, producing values 0 through n-1.
+                In Go 1.21 and earlier, use the classic `for i := 0; i < n; i++` form instead.
+                """,
+                searchAliases: ["for ループ 書き方", "整数 range", "range over int", "回数 ループ", "for range 10", "go 1.22"]
+            ),
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .spec,
+                packageName: "",
+                symbol: "for range func",
+                kind: .syntax,
+                title: "For statements with range over function iterators (Go 1.23+)",
+                anchor: "#For_range",
+                since: "1.23",
+                summary: "Go 1.23 以降では `iter.Seq` / `iter.Seq2` などのイテレータ関数を `for v := range seq` で直接反復できる。",
+                signature: "for v := range seq { ... }  // Go 1.23+, iter.Seq[V]",
+                example: """
+                for v := range slices.Values(items) {
+                \tfmt.Println(v)
+                }
+                """,
+                body: """
+                Starting in Go 1.23, `for range` supports function iterators matching `func(func() bool)`, `func(func(K) bool)` (`iter.Seq`), and `func(func(K, V) bool)` (`iter.Seq2`).
+                """,
+                searchAliases: ["for ループ 書き方", "イテレータ", "range over func", "iter.Seq", "go 1.23"]
+            ),
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .spec,
+                packageName: "",
+                symbol: "switch",
+                kind: .syntax,
+                title: "Switch statements (expression switch and type switch)",
+                anchor: "#Switch_statements",
+                since: "1.0",
+                summary: "Go の switch は自動で break する（fallthrough は明示が必要）。条件式なし switch は長い if-else の代わりに使える。",
+                signature: "switch expr { case v1: ... default: ... }",
+                example: """
+                switch status {
+                case "ok":
+                \tfmt.Println("success")
+                default:
+                \tfmt.Println("other")
+                }
+                """,
+                body: """
+                Switch statements provide multi-way execution. Cases do not fall through automatically.
+                A tagless `switch { case cond: ... }` is an idiomatic replacement for long if-else-if chains.
+                A type switch `switch v := x.(type)` branches on the dynamic type of an interface value.
+                """,
+                searchAliases: ["switch 書き方", "条件分岐", "type switch", "型スイッチ"]
+            ),
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .guide,
+                packageName: "",
+                symbol: "defer",
+                kind: .guide,
+                title: "Effective Go: Defer (cleanup on function return)",
+                anchor: "#defer",
+                since: "1.0",
+                summary: "ファイルやロックの解放には `defer` を使い、リソース取得の直後に解放処理を記述する（LIFO 順で実行）。",
+                signature: "defer f.Close()",
+                example: """
+                f, err := os.Open(path)
+                if err != nil {
+                \treturn err
+                }
+                defer f.Close()
+                """,
+                body: """
+                Go's `defer` statement schedules a function call to be run immediately before the surrounding function returns.
+                Deferred calls execute in LIFO order and are evaluated when the `defer` statement runs.
+                Use `defer` right after checking an acquisition error so resources are never leaked.
+                """,
+                searchAliases: ["defer 書き方", "後処理", "リソース解放", "ファイル 閉じる", "finally"]
+            ),
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .guide,
+                packageName: "",
+                symbol: "error wrapping",
+                kind: .guide,
+                title: "Error wrapping with fmt.Errorf (%w), errors.Is, and errors.As",
+                anchor: "#errors",
+                since: "1.13",
+                summary: "呼び出し元がエラー種別を判定できる必要がある場合は `fmt.Errorf(\"...: %w\", err)` でラップし、`errors.Is` / `errors.As` で検査する。",
+                signature: "fmt.Errorf(\"context: %w\", err)",
+                example: """
+                if err != nil {
+                \treturn fmt.Errorf("read config: %w", err)
+                }
+                """,
+                body: """
+                Wrap errors with `%w` when callers should be able to match the underlying error using `errors.Is` or `errors.As`.
+                Use `%v` instead if you intentionally want to hide implementation details at a package boundary.
+                """,
+                searchAliases: ["エラー ラップ", "エラーハンドリング", "fmt.Errorf", "errors.Is", "errors.As", "wrap error"]
+            ),
+
+            // MARK: - UC-2 & UC-3: Standard Library (bufio, encoding/json, slices, maps, context, regexp, etc.)
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .stdlib,
+                packageName: "bufio",
+                symbol: "Scanner",
+                kind: .type,
+                title: "bufio.Scanner — read input line by line",
+                anchor: "bufio.Scanner",
+                since: "1.1",
+                summary: "ファイルや io.Reader を 1 行ずつ読む標準の手段。`scanner.Scan()` ループの後に必ず `scanner.Err()` を確認する。",
+                signature: "func NewScanner(r io.Reader) *Scanner",
+                example: """
+                f, err := os.Open("input.txt")
+                if err != nil {
+                \treturn err
+                }
+                defer f.Close()
+
+                scanner := bufio.NewScanner(f)
+                for scanner.Scan() {
+                \tline := scanner.Text()
+                \tfmt.Println(line)
+                }
+                if err := scanner.Err(); err != nil {
+                \treturn err
+                }
+                """,
+                body: """
+                Scanner provides a convenient interface for reading data such as a file of newline-delimited lines of text.
+                Successive calls to the Scan method step through the tokens of a file, splitting on lines by default (ScanLines).
+                Always check `scanner.Err()` after the loop finishes. Default maximum token size is 64 KiB; call `scanner.Buffer` for longer lines.
+                """,
+                searchAliases: ["ファイルを1行ずつ読みたい", "1行ずつ読む", "行単位 読み込み", "テキストファイル 読む", "read file line by line", "bufio.Scanner", "scanner"]
+            ),
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .stdlib,
+                packageName: "os",
+                symbol: "ReadFile",
+                kind: .function,
+                title: "os.ReadFile — read entire file into memory",
+                anchor: "os.ReadFile",
+                since: "1.16",
+                summary: "小さいファイルを丸ごとバイト列として読み込むなら `os.ReadFile` が最も簡潔。大きいファイルを 1 行ずつ読む場合は `bufio.Scanner` を使う。",
+                signature: "func ReadFile(name string) ([]byte, error)",
+                example: """
+                data, err := os.ReadFile("input.txt")
+                if err != nil {
+                \treturn err
+                }
+                fmt.Println(string(data))
+                """,
+                body: """
+                ReadFile reads the named file and returns the contents. A successful call returns err == nil, not err == EOF.
+                Replaced the deprecated `ioutil.ReadFile` in Go 1.16.
+                """,
+                searchAliases: ["ファイル 読み込み", "ファイル 全部 読む", "read file", "os.ReadFile"]
+            ),
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .stdlib,
+                packageName: "os",
+                symbol: "WriteFile",
+                kind: .function,
+                title: "os.WriteFile — write bytes to a file",
+                anchor: "os.WriteFile",
+                since: "1.16",
+                summary: "バイト列をファイルに書き出す標準関数。既存ファイルは上書き（切り詰め）される。",
+                signature: "func WriteFile(name string, data []byte, perm FileMode) error",
+                example: """
+                if err := os.WriteFile("out.txt", []byte("hello\\n"), 0o644); err != nil {
+                \treturn err
+                }
+                """,
+                body: """
+                WriteFile writes data to the named file, creating it if necessary. If the file does not exist, WriteFile creates it with permissions perm; otherwise WriteFile truncates it before writing.
+                """,
+                searchAliases: ["ファイル 書き込み", "ファイル 保存", "write file", "os.WriteFile"]
+            ),
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .stdlib,
+                packageName: "encoding/json",
+                symbol: "MarshalIndent",
+                kind: .function,
+                title: "encoding/json.MarshalIndent — pretty-print JSON bytes",
+                anchor: "encoding/json.MarshalIndent",
+                since: "1.0",
+                summary: "構造体やマップをインデント付きで整形した JSON（`[]byte`）に変換する標準関数。",
+                signature: "func MarshalIndent(v any, prefix, indent string) ([]byte, error)",
+                example: """
+                b, err := json.MarshalIndent(v, "", "  ")
+                if err != nil {
+                \treturn err
+                }
+                fmt.Println(string(b))
+                """,
+                body: """
+                MarshalIndent is like Marshal but applies Indent to format the output.
+                Each JSON element in the output begins on a new line beginning with prefix followed by one or more copies of indent according to the indentation nesting.
+                """,
+                searchAliases: ["JSON を整形して出したい", "JSON 整形", "JSON きれいに", "pretty print json", "indent json", "json.MarshalIndent"]
+            ),
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .stdlib,
+                packageName: "encoding/json",
+                symbol: "Encoder",
+                kind: .type,
+                title: "encoding/json.Encoder — stream JSON to an io.Writer (with SetIndent)",
+                anchor: "encoding/json.Encoder",
+                since: "1.0",
+                summary: "`io.Writer`（標準出力・HTTP レスポンス・ファイル等）へ直接 JSON を書き出す。`enc.SetIndent(\"\", \"  \")` で整形出力もできる。",
+                signature: "func NewEncoder(w io.Writer) *Encoder  // enc.SetIndent(prefix, indent); enc.Encode(v)",
+                example: """
+                enc := json.NewEncoder(os.Stdout)
+                enc.SetIndent("", "  ")
+                if err := enc.Encode(v); err != nil {
+                \treturn err
+                }
+                """,
+                body: """
+                An Encoder writes JSON values to an output stream (`io.Writer`).
+                Call `enc.SetIndent("", "  ")` before `enc.Encode(v)` to emit pretty-printed JSON directly to the writer without buffering an intermediate byte slice.
+                """,
+                searchAliases: ["json.Encoder", "json.Encoder どう使う", "JSON を整形して出したい", "JSON 整形", "JSON 書き出し", "SetIndent", "Encode"]
+            ),
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .stdlib,
+                packageName: "encoding/json",
+                symbol: "Unmarshal",
+                kind: .function,
+                title: "encoding/json.Unmarshal — parse JSON bytes into a struct or map",
+                anchor: "encoding/json.Unmarshal",
+                since: "1.0",
+                summary: "JSON バイト列を構造体ポインタ（`&dst`）へデコードする標準関数。フィールドには `json:\"name\"` タグを付ける。",
+                signature: "func Unmarshal(data []byte, v any) error",
+                example: """
+                var cfg Config
+                if err := json.Unmarshal(data, &cfg); err != nil {
+                \treturn err
+                }
+                """,
+                body: """
+                Unmarshal parses the JSON-encoded data and stores the result in the value pointed to by v.
+                Struct fields must be exported (capitalized) to be populated by `encoding/json`.
+                """,
+                searchAliases: ["JSON パース", "JSON 読み込み", "JSON デコード", "parse json", "json.Unmarshal"]
+            ),
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .stdlib,
+                packageName: "slices",
+                symbol: "Compact",
+                kind: .function,
+                title: "slices.Compact — deduplicate consecutive equal elements (sort + compact)",
+                anchor: "slices.Compact",
+                since: "1.21",
+                summary: "標準ライブラリ `slices` でスライスの重複を取り除く場合、`slices.Sort` してから `slices.Compact` を呼ぶ（順序維持が必要なら `map[T]struct{}` を使う）。",
+                signature: "func Compact[S ~[]E, E comparable](s S) S",
+                example: """
+                slices.Sort(items)
+                items = slices.Compact(items)
+                """,
+                body: """
+                Compact replaces consecutive runs of equal elements with a single copy.
+                Because it only removes adjacent duplicates, sort the slice first with `slices.Sort(items)` when order does not need to be preserved.
+                To remove duplicates while preserving original order, track seen elements with `seen := make(map[T]struct{})`.
+                """,
+                searchAliases: ["重複を取り除きたい", "重複削除", "ユニーク", "deduplicate", "unique slice", "slices.Compact", "slices"]
+            ),
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .guide,
+                packageName: "",
+                symbol: "deduplicate map pattern",
+                kind: .guide,
+                title: "Order-preserving deduplication with map[T]struct{} (Set idiom)",
+                anchor: "#maps",
+                since: "1.0",
+                summary: "元の順序を保ったまま重複を取り除く場合や Go 1.20 以前では、`map[T]struct{}` を集合（Set）として使うのが Go の標準イディオム。",
+                signature: "seen := make(map[T]struct{}, len(items))",
+                example: """
+                seen := make(map[string]struct{}, len(items))
+                out := make([]string, 0, len(items))
+                for _, v := range items {
+                \tif _, ok := seen[v]; !ok {
+                \t\tseen[v] = struct{}{}
+                \t\tout = append(out, v)
+                \t}
+                }
+                """,
+                body: """
+                Go does not have a built-in set type; `map[T]struct{}` (zero-byte value) is the idiomatic set representation.
+                Use this pattern to deduplicate a slice while preserving first-seen order in any Go version.
+                """,
+                searchAliases: ["重複を取り除きたい", "重複削除", "Set 集合", "順序維持 重複", "deduplicate", "unique"]
+            ),
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .stdlib,
+                packageName: "slices",
+                symbol: "Sort",
+                kind: .function,
+                title: "slices.Sort & slices.SortFunc — sort a slice in place",
+                anchor: "slices.Sort",
+                since: "1.21",
+                summary: "スライスの昇順ソートは `slices.Sort`、カスタム比較は `slices.SortFunc` を使う（`sort.Slice` より型安全で高速）。",
+                signature: "func Sort[S ~[]E, E cmp.Ordered](x S)",
+                example: """
+                slices.Sort(nums)
+                """,
+                body: """
+                Sort sorts a slice of any ordered type in ascending order. For custom ordering or structs, use `slices.SortFunc` with `cmp.Compare`.
+                """,
+                searchAliases: ["ソート", "並べ替え", "sort slice", "slices.Sort"]
+            ),
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .stdlib,
+                packageName: "context",
+                symbol: "WithTimeout",
+                kind: .function,
+                title: "context.WithTimeout — attach a timeout / deadline to an operation",
+                anchor: "context.WithTimeout",
+                since: "1.7",
+                summary: "処理にタイムアウトを付ける標準の手段。返される `cancel` 関数はリーク防止のため必ず `defer cancel()` する。",
+                signature: "func WithTimeout(parent Context, timeout time.Duration) (Context, CancelFunc)",
+                example: """
+                ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+                defer cancel()
+
+                req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+                if err != nil {
+                \treturn err
+                }
+                """,
+                body: """
+                WithTimeout returns a copy of parent with a deadline of `time.Now().Add(timeout)`.
+                Canceling this context releases resources associated with it, so code should call `defer cancel()` as soon as the operations running in this Context complete.
+                Pass `ctx` as the first argument to downstream I/O, HTTP, database, and `exec.CommandContext` calls.
+                """,
+                searchAliases: ["処理にタイムアウトを付けたい", "タイムアウトを付けたい", "タイムアウト", "キャンセル", "deadline", "timeout", "context.WithTimeout"]
+            ),
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .stdlib,
+                packageName: "regexp",
+                symbol: "Compile",
+                kind: .function,
+                title: "regexp — regular expression matching in the standard library",
+                anchor: "regexp.Compile",
+                since: "1.0",
+                summary: "標準ライブラリに正規表現パッケージ `regexp` が**ある**（RE2 構文・線形時間保証）。固定パターンは `regexp.MustCompile` をパッケージ変数で 1 回だけコンパイルする。",
+                signature: "func Compile(expr string) (*Regexp, error)  |  func MustCompile(str string) *Regexp",
+                example: """
+                re := regexp.MustCompile(`^[a-z]+\\d+$`)
+                matched := re.MatchString("item42")
+                """,
+                body: """
+                Package `regexp` implements regular expression search in the Go standard library using RE2 syntax (guaranteed O(n) time, no backreferences).
+                Use `regexp.Compile` for dynamic patterns and `regexp.MustCompile` for constant patterns initialized once.
+                """,
+                searchAliases: ["標準ライブラリに正規表現ある", "正規表現", "regex", "regexp", "パターンマッチ", "MatchString"]
+            ),
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .stdlib,
+                packageName: "strings",
+                symbol: "Builder",
+                kind: .type,
+                title: "strings.Builder — efficiently build strings without repeated allocation",
+                anchor: "strings.Builder",
+                since: "1.10",
+                summary: "ループ内で文字列を連結するなら `+` ではなく `strings.Builder` を使う。",
+                signature: "var b strings.Builder; b.WriteString(s); b.String()",
+                example: """
+                var b strings.Builder
+                for _, part := range parts {
+                \tb.WriteString(part)
+                }
+                result := b.String()
+                """,
+                body: """
+                A Builder is used to efficiently build a string using Write methods. It minimizes memory copying.
+                The zero value is ready to use.
+                """,
+                searchAliases: ["文字列 連結", "文字列 結合", "string builder", "strings.Builder"]
+            ),
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .stdlib,
+                packageName: "strconv",
+                symbol: "Atoi",
+                kind: .function,
+                title: "strconv.Atoi & strconv.Itoa — convert between string and int",
+                anchor: "strconv.Atoi",
+                since: "1.0",
+                summary: "文字列と int の相互変換は `strconv.Atoi`（文字列→int）と `strconv.Itoa`（int→文字列）を使う。",
+                signature: "func Atoi(s string) (int, error)  |  func Itoa(i int) string",
+                example: """
+                n, err := strconv.Atoi("42")
+                if err != nil {
+                \treturn err
+                }
+                s := strconv.Itoa(n)
+                """,
+                body: """
+                Atoi is equivalent to ParseInt(s, 10, 0), converted to type int. Itoa is equivalent to FormatInt(int64(i), 10).
+                """,
+                searchAliases: ["文字列 数値 変換", "int string 変換", "parse int", "strconv.Atoi", "strconv.Itoa"]
+            ),
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .stdlib,
+                packageName: "time",
+                symbol: "Format",
+                kind: .method,
+                title: "time.Time.Format & time.Parse — format and parse timestamps",
+                anchor: "time.Time.Format",
+                since: "1.0",
+                summary: "Go の日時フォーマットは `YYYY-MM-DD` ではなく基準日時 `2006-01-02 15:04:05`（または `time.RFC3339` / `time.DateTime`）をレイアウトに使う。",
+                signature: "func (t Time) Format(layout string) string  |  func Parse(layout, value string) (Time, error)",
+                example: """
+                now := time.Now()
+                fmt.Println(now.Format(time.RFC3339))
+                """,
+                body: """
+                Format returns a textual representation of the time value formatted according to the reference time `Mon Jan 2 15:04:05 MST 2006`.
+                Standard layout constants include `time.RFC3339`, and since Go 1.20 `time.DateTime`, `time.DateOnly`, and `time.TimeOnly`.
+                """,
+                searchAliases: ["日時 フォーマット", "日付 文字列", "時間 パース", "date format", "time.Format", "time.Parse"]
+            ),
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .stdlib,
+                packageName: "sync",
+                symbol: "WaitGroup",
+                kind: .type,
+                title: "sync.WaitGroup — wait for a collection of goroutines to finish",
+                anchor: "sync.WaitGroup",
+                since: "1.0",
+                summary: "複数の goroutine の完了を待つ標準の仕組み。`wg.Add(1)` は goroutine 起動前に呼び、goroutine 内で `defer wg.Done()` する。",
+                signature: "var wg sync.WaitGroup; wg.Add(1); defer wg.Done(); wg.Wait()",
+                example: """
+                var wg sync.WaitGroup
+                for _, job := range jobs {
+                \twg.Add(1)
+                \tgo func() {
+                \t\tdefer wg.Done()
+                \t\tprocess(job)
+                \t}()
+                }
+                wg.Wait()
+                """,
+                body: """
+                A WaitGroup waits for a collection of goroutines to finish. The main goroutine calls Add to set the number of goroutines to wait for, each goroutine calls Done when finished, and Wait blocks until all goroutines have finished.
+                """,
+                searchAliases: ["goroutine 待つ", "並行処理 完了待ち", "sync.WaitGroup", "WaitGroup"]
+            ),
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .stdlib,
+                packageName: "net/http",
+                symbol: "Client",
+                kind: .type,
+                title: "net/http.Client — make HTTP requests with timeout and context",
+                anchor: "net/http.Client",
+                since: "1.0",
+                summary: "HTTP リクエストを送る場合はデフォルトの `http.Get` ではなく、タイムアウト付き `http.Client` と `http.NewRequestWithContext` を使い、`resp.Body.Close()` を defer する。",
+                signature: "client := &http.Client{Timeout: 10 * time.Second}",
+                example: """
+                client := &http.Client{Timeout: 10 * time.Second}
+                req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+                if err != nil {
+                \treturn err
+                }
+                resp, err := client.Do(req)
+                if err != nil {
+                \treturn err
+                }
+                defer resp.Body.Close()
+                """,
+                body: """
+                A Client is an HTTP client. Always set a Timeout or pass a context with deadline, and always close `resp.Body` when `err == nil`.
+                """,
+                searchAliases: ["HTTP リクエスト", "http client", "API 呼び出し", "net/http.Client", "http.Get"]
+            ),
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .stdlib,
+                packageName: "path/filepath",
+                symbol: "WalkDir",
+                kind: .function,
+                title: "path/filepath.WalkDir — recursively traverse a directory tree",
+                anchor: "path/filepath.WalkDir",
+                since: "1.16",
+                summary: "ディレクトリを再帰的に走査する標準関数。旧 `filepath.Walk` より高速（不要な `Lstat` を避ける）。",
+                signature: "func WalkDir(root string, fn fs.WalkDirFunc) error",
+                example: """
+                err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+                \tif err != nil {
+                \t\treturn err
+                \t}
+                \tif !d.IsDir() {
+                \t\tfmt.Println(path)
+                \t}
+                \treturn nil
+                })
+                """,
+                body: """
+                WalkDir walks the file tree rooted at root, calling fn for each file or directory in the tree, including root.
+                """,
+                searchAliases: ["ディレクトリ 再帰", "ファイル一覧", "walk directory", "filepath.WalkDir"]
+            ),
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .stdlib,
+                packageName: "maps",
+                symbol: "Keys",
+                kind: .function,
+                title: "maps.Keys & maps.Collect — collect map keys as an iterator/slice (Go 1.23+)",
+                anchor: "maps.Keys",
+                since: "1.23",
+                summary: "Go 1.23 以降では `slices.Collect(maps.Keys(m))` でマップのキー一覧をスライス化できる（1.22 以前は `for k := range m` で append）。",
+                signature: "func Keys[Map ~map[K]V, K comparable, V any](m Map) iter.Seq[K]  // Go 1.23+",
+                example: """
+                keys := slices.Collect(maps.Keys(m))
+                """,
+                body: """
+                Keys returns an iterator over keys in m. Combine with `slices.Collect` or `slices.Sorted` to obtain a slice of keys.
+                """,
+                searchAliases: ["マップ キー 一覧", "map keys", "maps.Keys", "go 1.23"]
+            ),
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .release,
+                packageName: "",
+                symbol: "Go 1.22 release notes",
+                kind: .releaseNote,
+                title: "Go 1.22: range over integers and per-iteration loop variables",
+                anchor: "#go1.22",
+                since: "1.22",
+                summary: "Go 1.22 で `for i := range n`（整数 range）とループ変数のイテレーション毎スコープが導入された。",
+                signature: "for i := range 10 { ... }",
+                example: """
+                for i := range 10 {
+                \tfmt.Println(i)
+                }
+                """,
+                body: """
+                Go 1.22 introduced two major `for` loop improvements:
+                1. Variables declared by a `for` loop are created once per iteration, eliminating accidental closure capture bugs.
+                2. `for` loops may range over integers (`for i := range 10`).
+                """,
+                searchAliases: ["range over int いつから", "整数 range いつから", "go 1.22", "ループ変数"]
+            )
+        ]
+
+        // Preserve deterministic ordering by stableID.
+        items.sort { $0.stableID < $1.stableID }
+        return items
+    }
+}

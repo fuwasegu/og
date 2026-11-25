@@ -203,3 +203,92 @@ func applyEdits(_ text: String, _ edits: [(range: NSRange, text: String)]) -> St
     for e in edits.sorted(by: { $0.range.location > $1.range.location }) { m.replaceCharacters(in: e.range, with: e.text) }
     return m as String
 }
+
+// MARK: - Offline Go Docs (DocsResearchTests)
+
+/// Deterministic in-memory embedder for testing batch ingestion, cancel/resume, incremental diffs,
+/// and cross-version vector reuse without any network or external model server.
+final class CountingFakeEmbedder: DocsEmbedder, @unchecked Sendable {
+    let descriptor: EmbeddingModelDescriptor
+    private let lock = NSLock()
+    private var _callCount = 0
+    private var _cancelManager: DocsPackManager?
+    private var _cancelAfter: Int?
+    private var _cancelVersion: String?
+
+    init(id: String = "fake-embed", version: String = "v1") {
+        self.descriptor = EmbeddingModelDescriptor(id: id, version: version)
+    }
+
+    var callCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _callCount
+    }
+
+    func resetCount() {
+        lock.lock()
+        _callCount = 0
+        lock.unlock()
+    }
+
+    func configureCancel(manager: DocsPackManager, goVersion: String, afterCalls: Int) {
+        lock.lock()
+        _cancelManager = manager
+        _cancelVersion = goVersion
+        _cancelAfter = afterCalls
+        lock.unlock()
+    }
+
+    func clearCancel() {
+        lock.lock()
+        _cancelManager = nil
+        _cancelVersion = nil
+        _cancelAfter = nil
+        lock.unlock()
+    }
+
+    private func recordCallAndTakeCancelTarget() -> (DocsPackManager, String)? {
+        lock.lock()
+        defer { lock.unlock() }
+        _callCount += 1
+        let count = _callCount
+        if let mgr = _cancelManager, let ver = _cancelVersion, let limit = _cancelAfter, count >= limit {
+            _cancelAfter = nil
+            return (mgr, ver)
+        }
+        return nil
+    }
+
+    func embed(_ text: String) async throws -> [Float] {
+        if let (mgr, ver) = recordCallAndTakeCancelTarget() {
+            await mgr.requestCancel(goVersion: ver)
+        }
+
+        // Deterministic 8-dim bag-of-bytes vector (normalized).
+        var v = Array(repeating: Float(0), count: 8)
+        for (idx, b) in text.utf8.enumerated() {
+            v[idx % 8] += Float(b) / 255.0
+        }
+        let norm = sqrt(v.reduce(0) { $0 + $1 * $1 })
+        if norm > 0 { v = v.map { $0 / norm } }
+        return v
+    }
+}
+
+func makeDocsPackManager(in dir: TempDir) throws -> DocsPackManager {
+    try DocsPackManager(rootDirectory: dir.subdir("docs-packs"))
+}
+
+func appendURLPath(_ base: URL, _ component: String) -> URL {
+    base.appendingPathComponent(component)
+}
+
+func countLines(_ text: String) -> Int {
+    text.components(separatedBy: "\n").count
+}
+
+func stringContains(_ haystack: String, _ needle: String) -> Bool {
+    haystack.contains(needle)
+}
+

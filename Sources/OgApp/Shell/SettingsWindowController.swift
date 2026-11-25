@@ -21,8 +21,21 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     private let actionButton = NSButton(title: "Restart", target: nil, action: nil)
     private let logView = NSTextView()
 
+    // Offline Go Docs (FR-19, FR-20, FR-23, FR-24, FR-29, Q-4)
+    private let docsEnabled = NSButton(checkboxWithTitle: "Enable offline Go Docs lookup (local-only; independent of inline AI completion)", target: nil, action: nil)
+    private let docsBatchPolicy = NSPopUpButton()
+    private let docsVersionPopup = NSPopUpButton()
+    private let docsInstallButton = NSButton(title: "Add / Update Pack", target: nil, action: nil)
+    private let docsImportGorootButton = NSButton(title: "Import GOROOT…", target: nil, action: nil)
+    private let docsDeleteButton = NSButton(title: "Delete Pack", target: nil, action: nil)
+    private let docsCancelButton = NSButton(title: "Cancel Batch", target: nil, action: nil)
+    private let docsLicenseButton = NSButton(title: "BSD License…", target: nil, action: nil)
+    private let docsPacksLabel = NSTextField(wrappingLabelWithString: "")
+    private let docsProgressBar = NSProgressIndicator()
+    private let docsProgressLabel = NSTextField(labelWithString: "")
+
     private init() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 520), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 680), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         w.title = "Settings"
         super.init(window: w)
         build()
@@ -30,6 +43,9 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         w.center()
         NotificationCenter.default.addObserver(forName: .ogModelServerChanged, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.refreshStatus() }
+        }
+        NotificationCenter.default.addObserver(forName: .ogDocsChanged, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshDocs() }
         }
     }
 
@@ -95,10 +111,43 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         hint.textColor = .secondaryLabelColor
 
         let statusRow = NSStackView(views: [status, NSView(), actionButton])
+
+        // Offline Go Docs controls (FR-19, FR-20, FR-23, FR-24, FR-29)
+        docsEnabled.target = self
+        docsEnabled.action = #selector(docsEnabledChanged)
+        for p in DocsBatchRunPolicy.allCases { docsBatchPolicy.addItem(withTitle: p.title) }
+        docsBatchPolicy.target = self
+        docsBatchPolicy.action = #selector(docsPolicyChanged)
+        for ver in ["1.24", "1.23", "1.22", "1.21"] { docsVersionPopup.addItem(withTitle: "go\(ver)") }
+        docsVersionPopup.selectItem(withTitle: "go\(BundledGoCorpus.defaultVersion)")
+        docsInstallButton.target = self
+        docsInstallButton.action = #selector(docsInstallClicked)
+        docsImportGorootButton.target = self
+        docsImportGorootButton.action = #selector(docsImportGorootClicked)
+        docsDeleteButton.target = self
+        docsDeleteButton.action = #selector(docsDeleteClicked)
+        docsCancelButton.target = self
+        docsCancelButton.action = #selector(docsCancelClicked)
+        docsLicenseButton.target = self
+        docsLicenseButton.action = #selector(docsLicenseClicked)
+        docsPacksLabel.font = Theme.smallFont
+        docsPacksLabel.textColor = Theme.secondaryText
+        docsProgressBar.isIndeterminate = false
+        docsProgressBar.minValue = 0
+        docsProgressBar.maxValue = 1
+        docsProgressBar.controlSize = .small
+        docsProgressLabel.font = Theme.smallFont
+        docsProgressLabel.textColor = Theme.secondaryText
+        let docsButtons = NSStackView(views: [docsVersionPopup, docsInstallButton, docsImportGorootButton, docsDeleteButton, docsCancelButton, docsLicenseButton])
+        docsButtons.orientation = .horizontal
+        docsButtons.spacing = 6
+
         let stack = NSStackView(views: [
             row("Theme", themePopup), row("Font", fontFamily), NSStackView(views: [fontLabel, fontSize]), fontPreview,
             reopen, NSBox(),
-            aiEnabled, row("Backend", backend), row("Model", model), customRow, hint, statusRow, logScroll
+            aiEnabled, row("Backend", backend), row("Model", model), customRow, hint, statusRow, logScroll,
+            NSBox(),
+            docsEnabled, row("Indexing", docsBatchPolicy), docsButtons, docsPacksLabel, docsProgressBar, docsProgressLabel
         ])
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -106,7 +155,17 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
         statusRow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
         logScroll.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
-        window?.contentView = stack
+        docsProgressBar.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
+        docsPacksLabel.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
+        let scroll = NSScrollView()
+        scroll.documentView = stack
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            stack.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor)
+        ])
+        window?.contentView = scroll
     }
 
     private func load() {
@@ -125,6 +184,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         custom.stringValue = cfg.customCommand
         updateRows()
         refreshStatus()
+        refreshDocs()
     }
 
     private func fillModels(for b: ModelBackend) {
@@ -219,5 +279,86 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
 
     @objc private func reopenChanged() {
         UserDefaults.standard.set(reopen.state == .on, forKey: "og.reopenLast")
+    }
+
+    // MARK: - Offline Go Docs Actions (FR-19, FR-20, FR-23, FR-24, FR-29)
+
+    private func refreshDocs() {
+        let d = DocsManager.shared
+        docsEnabled.state = d.enabled ? .on : .off
+        docsBatchPolicy.selectItem(at: DocsBatchRunPolicy.allCases.firstIndex(of: d.batchPolicy) ?? 0)
+
+        let packs = d.installedPacks
+        if packs.isEmpty {
+            docsPacksLabel.stringValue = "Installed packs: none (enabling installs bundled go\(BundledGoCorpus.defaultVersion) core pack offline)"
+        } else {
+            let lines = packs.map { p in
+                let kb = max(1, p.sizeBytes / 1024)
+                let mode = p.status == .ready ? "ready (FTS + semantic)" : "FTS-only"
+                return "• go\(p.goVersion): \(p.chunkCount) chunks, \(kb) KB [\(mode)]"
+            }
+            docsPacksLabel.stringValue = "Installed packs:\n" + lines.joined(separator: "\n")
+        }
+
+        if let p = d.activeProgress {
+            docsProgressBar.doubleValue = p.fractionCompleted
+            let estKB = max(1, p.estimatedBytes / 1024)
+            let isRunning = p.phase == .extracting || p.phase == .buildingFTS || p.phase == .embedding || p.phase == .activating
+            docsCancelButton.isEnabled = isRunning
+            docsProgressLabel.stringValue = "Batch go\(p.goVersion): \(p.phase.rawValue) (\(p.processedChunks)/\(p.totalChunks) chunks, est. \(estKB) KB, reused \(p.reusedVectors))"
+        } else if let err = d.lastError {
+            docsProgressBar.doubleValue = 0
+            docsCancelButton.isEnabled = false
+            docsProgressLabel.stringValue = "Docs error: \(err)"
+        } else {
+            docsProgressBar.doubleValue = 0
+            docsCancelButton.isEnabled = false
+            docsProgressLabel.stringValue = "Batch: idle"
+        }
+    }
+
+    private var selectedDocsVersion: String {
+        let raw = docsVersionPopup.titleOfSelectedItem ?? "go\(BundledGoCorpus.defaultVersion)"
+        return raw.hasPrefix("go") ? String(raw.dropFirst(2)) : raw
+    }
+
+    @objc private func docsEnabledChanged() {
+        DocsManager.shared.enabled = docsEnabled.state == .on
+        refreshDocs()
+    }
+
+    @objc private func docsPolicyChanged() {
+        DocsManager.shared.batchPolicy = DocsBatchRunPolicy.allCases[max(0, docsBatchPolicy.indexOfSelectedItem)]
+    }
+
+    @objc private func docsInstallClicked() {
+        DocsManager.shared.startBundledPackIngestion(goVersion: selectedDocsVersion)
+    }
+
+    @objc private func docsImportGorootClicked() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.message = "Choose a local GOROOT directory (containing src/)"
+        if let goroot = GoVersionResolver.detectGoroot() { panel.directoryURL = goroot }
+        if panel.runModal() == .OK, let url = panel.url {
+            DocsManager.shared.startGorootIngestion(goroot: url, goVersion: selectedDocsVersion)
+        }
+    }
+
+    @objc private func docsDeleteClicked() {
+        DocsManager.shared.deletePack(goVersion: selectedDocsVersion)
+    }
+
+    @objc private func docsCancelClicked() {
+        DocsManager.shared.cancelActiveBatch()
+    }
+
+    @objc private func docsLicenseClicked() {
+        let alert = NSAlert()
+        alert.messageText = "Go Documentation License (BSD-3-Clause)"
+        alert.informativeText = DocsLicense.goBSD3Clause
+        alert.addButton(withTitle: "OK")
+        if let w = window { alert.beginSheetModal(for: w, completionHandler: nil) } else { alert.runModal() }
     }
 }

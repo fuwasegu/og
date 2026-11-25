@@ -1,0 +1,32 @@
+// ResearchDesign ⊑ Research
+// Staging phases (start, pause, resume, embed compute/reuse, abort) and loopback validation
+// refine the requirements-level pack activation and grounded lookup contract.
+refinement ResearchRefinesReq {
+  impl ResearchDesign
+  abs  Research
+  maps auto
+
+  map pack_state[v: GoVer] =
+    if pack_state[v] == DReady then Ready
+    else if pack_state[v] == DFTSOnly then IndexingFTSOnly
+    else Missing
+
+  map answer_kind =
+    if answer_kind == DGroundedCards then GroundedCards
+    else if answer_kind == DGroundedNotFound then GroundedNotFound
+    else if answer_kind == DMissingPack then MissingPack
+    else NoAnswer
+
+  action set_endpoint(h)            -> stutter
+  action batch_start(v)             -> stutter
+  action batch_build_fts_initial(v) -> publish_fts_pack(v)
+  action batch_build_fts_update(v)  -> stutter
+  action batch_pause()              -> stutter
+  action batch_resume()             -> stutter
+  action batch_embed_reuse(v)       -> stutter
+  action batch_embed_compute(v)     -> stutter
+  action batch_commit(v)            -> complete_pack(v)
+  action batch_abort()              -> stutter
+  action query_found()              -> query_found(Local)
+  action query_not_found()          -> query_not_found(Local)
+}

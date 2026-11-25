@@ -32,6 +32,7 @@ FSL で表せるのは、操作の順序や組み合わせで壊れうる部分�
 | Git | VCS-1, VCS-2, VCS-3 | `req/vcs.fsl` |
 | 補完 | GO-1（Tab の優先順位）, GO-5 | `req/completion.fsl` |
 | AI サーバー | AI-1〜AI-6 | `req/model_server.fsl` |
+| Go 調べ物（Docs） | DOC-1〜DOC-9 | `req/research.fsl` |
 | テストで確認 | WS-2, WS-3, FT-1, FT-3, ED-4, ED-5 | UI テスト |
 | テストで確認 | NAV-1〜NAV-6, LSP-3 | gopls 結合テスト（読み取りのみ） |
 | テストで確認 | TERM-1, GO-1〜GO-4 の変換内容 | ユニットテスト |
@@ -50,6 +51,7 @@ FSL で表せるのは、操作の順序や組み合わせで壊れうる部分�
 - VCS-1 ツリー上の状態表示、VCS-2 差分ガター、VCS-3 commit・ブランチ・stash
 - GO-1 Postfix 補完、GO-2 Struct タグ生成、GO-3 Table Test 生成、GO-4 implements 表示、GO-5 ローカル AI 補完
 - AI-1 有効化で起動、AI-2 無効化・終了で停止、AI-3 準備完了の判定、AI-4 異常終了の自動再起動と上限、AI-5 手動の再試行、AI-6 モデルの切り替え
+- DOC-1 オプトイン（補完と独立）、DOC-2 対象 Go バージョンの自動決定とバージョンゲート、DOC-3 パック取り込みのステージングと原子的切替、DOC-4 中断・再開・差分更新とモデル変更時の再構築、DOC-5 共有ベクトルストアによるバージョン間再利用、DOC-6 loopback 完結（NeverLeavesMachine）、DOC-7 根拠チャンク限定・出典とバージョン付与・ハルシネーション禁止、DOC-8 LLM なし（FTS 抜粋）での成立、DOC-9 バージョンゲート通過済みカードのみの挿入
 - NFR-1 WebView なし、NFR-2 120 fps と表示行だけの描画、NFR-3 Swift 6 の厳格な並行性チェック
 
 ## 設計層
@@ -65,6 +67,7 @@ FSL で表せるのは、操作の順序や組み合わせで壊れうる部分�
 | Git | `design/vcs.fsl` | `design/vcs_refines_req.fsl` | refines |
 | 補完 | `design/completion.fsl` | `design/completion_refines_req.fsl` | refines |
 | AI サーバー | `design/model_server.fsl` | `design/model_server_refines_req.fsl` | refines |
+| Go 調べ物（Docs） | `design/research.fsl` | `design/research_refines_req.fsl` | refines |
 
 ```sh
 fslc refine spec/design/workspace.fsl spec/req/workspace.fsl spec/design/workspace_refines_req.fsl
