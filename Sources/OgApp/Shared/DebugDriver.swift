@@ -385,7 +385,7 @@ enum DebugDriver {
         case "docsinsert":
             // docsinsert: insert the first grounded, version-gated card into the current editor.
             guard let dp = project?.bottomPanel.docsPanel else { return }
-            let ok = dp.debugInsertFirstCard()
+            let ok = await dp.debugInsertFirstCard()
             print("docsinsert: \(ok)")
         case "log":
             print(arg)

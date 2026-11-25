@@ -3,7 +3,7 @@ import Testing
 
 @Suite("GoVersion & VersionGate")
 struct GoVersionTests {
-    @Test("Resolves version priority: go.mod > go.work > toolchain (FR-2)")
+    @Test("Resolves version priority: go.mod > go.work > toolchain, walking up parents (FR-2, L-4)")
     func resolvesVersionOrder() {
         let dir = TempDir()
         defer { dir.cleanup() }
@@ -14,15 +14,31 @@ struct GoVersionTests {
         #expect(fromWork?.source == .goWork)
 
         _ = dir.file("go.mod", "module example.com/app\n\ngo 1.21.4 // pinned\n")
-        let fromMod = GoVersionResolver.resolve(projectRoot: dir.url, toolchainVersionProvider: { GoVersion(major: 1, minor: 23) })
-        #expect(fromMod?.version == GoVersion(major: 1, minor: 21, patch: 4))
-        #expect(fromMod?.source == .goMod)
+        let sub = dir.subdir("cmd/server")
+        let fromParentMod = GoVersionResolver.resolve(projectRoot: sub, toolchainVersionProvider: { GoVersion(major: 1, minor: 23) })
+        #expect(fromParentMod?.version == GoVersion(major: 1, minor: 21, patch: 4))
+        #expect(fromParentMod?.source == .goMod)
+
+        let tcDir = TempDir()
+        defer { tcDir.cleanup() }
+        _ = tcDir.file("go.mod", "module example.com/tc\n\ntoolchain go1.23.2\n")
+        let fromDirectiveToolchain = GoVersionResolver.resolve(projectRoot: tcDir.url, toolchainVersionProvider: { GoVersion(major: 1, minor: 21) })
+        #expect(fromDirectiveToolchain?.version == GoVersion(major: 1, minor: 23, patch: 2))
 
         let emptyDir = TempDir()
         defer { emptyDir.cleanup() }
         let fromToolchain = GoVersionResolver.resolve(projectRoot: emptyDir.url, toolchainVersionProvider: { GoVersion(major: 1, minor: 23, patch: 1) })
         #expect(fromToolchain?.version == GoVersion(major: 1, minor: 23, patch: 1))
         #expect(fromToolchain?.source == .toolchain)
+    }
+
+    @Test("Strictly rejects malformed version strings like 1.x.3 (L-4)")
+    func rejectsMalformedVersions() {
+        #expect(GoVersion(parsing: "1.x.3") == nil)
+        #expect(GoVersion(parsing: "go1.2.3.4") == nil)
+        #expect(GoVersion(parsing: "abc") == nil)
+        #expect(GoVersion(parsing: "go1.22") == GoVersion(major: 1, minor: 22, patch: 0))
+        #expect(GoVersion(parsing: "go version go1.23.4 darwin/arm64") == GoVersion(major: 1, minor: 23, patch: 4))
     }
 
     @Test("Version gate blocks newer features and never guesses unknown since (FR-8, FR-10)")
@@ -40,132 +56,258 @@ struct GoVersionTests {
     }
 }
 
-@Suite("DocsCorpus Extraction & Diffing")
+@Suite("DocsCorpus Extraction, Build Filters & Stable IDs")
 struct DocsCorpusTests {
-    @Test("Extracts stdlib GoDoc, attaches Example* to parent symbol, and skips internal/ (FR-4-1, FR-7)")
-    func extractsStdlibAndExamples() {
+    @Test("Extracts const/var, multiline func, interface methods, builtin, exact Example*, and respects build tags (H-1, M-12..14, L-6)")
+    func extractsRichStdlibDeclarations() {
         let dir = TempDir()
         defer { dir.cleanup() }
 
         let src = dir.subdir("src")
+        _ = dir.file("src/io/io.go", """
+        // Package io provides basic interfaces to I/O primitives.
+        package io
+
+        // EOF is the error returned by Read when no more input is available.
+        var EOF = errors.New("EOF")
+
+        // Seek whence values.
+        const (
+        \t// SeekStart means relative to the origin of the file.
+        \tSeekStart   = 0
+        \tSeekCurrent = 1 // relative to current offset
+        \tprivateConst = 9
+        )
+
+        // Reader is the interface that wraps the basic Read method.
+        type Reader interface {
+        \tRead(p []byte) (n int, err error)
+        }
+
+        // CopyBuffer copies from src to dst using the provided buffer.
+        func CopyBuffer(
+        \tdst Writer,
+        \tsrc Reader,
+        \tbuf []byte,
+        ) (written int64, err error) {
+        \treturn 0, nil
+        }
+        """)
         _ = dir.file("src/bufio/scan.go", """
         // Package bufio implements buffered I/O.
         package bufio
 
-        // Scanner provides a convenient interface for reading lines.
+        // Scanner reads lines from an io.Reader.
         type Scanner struct{}
-
-        // NewScanner returns a new Scanner to read from r.
-        func NewScanner(r any) *Scanner { return nil }
 
         // Scan advances the Scanner to the next token.
         func (s *Scanner) Scan() bool { return false }
 
-        func helperUnexported() {}
+        // Err returns the first non-EOF error.
+        func (s *Scanner) Err() error { return nil }
         """)
         _ = dir.file("src/bufio/example_test.go", """
         package bufio_test
 
         func ExampleScanner() {
+        \t// brace in comment } and raw string `}` and rune '}'
+        \tconst raw = `hello { world }`
+        \t_ = '}'
         \ts := bufio.NewScanner(r)
         \tfor s.Scan() {
         \t\tfmt.Println(s.Text())
         \t}
         }
         """)
+        _ = dir.file("src/builtin/builtin.go", """
+        // Package builtin provides documentation for Go's predeclared identifiers.
+        package builtin
+
+        // Len returns the length of v.
+        func Len(v any) int
+        """)
+        _ = dir.file("src/os/proc_windows.go", """
+        package os
+        // WindowsOnly should be excluded on darwin.
+        func WindowsOnly() {}
+        """)
+        _ = dir.file("src/os/gen.go", """
+        //go:build ignore
+
+        package os
+        // IgnoredGen should be excluded.
+        func IgnoredGen() {}
+        """)
         _ = dir.file("src/internal/secret/secret.go", """
         package secret
-        // Secret should never be extracted.
         func Secret() {}
         """)
 
         let chunks = DocsCorpusExtractor.extractStdlib(fromGorootSrc: src, goVersion: "1.23")
-        #expect(chunks.contains { $0.packageName == "bufio" && $0.kind == .package })
-        #expect(chunks.contains { $0.packageName == "bufio" && $0.symbol == "NewScanner" && $0.kind == .function })
-        #expect(chunks.contains { $0.packageName == "bufio" && $0.symbol == "Scanner.Scan" && $0.kind == .method })
-        #expect(!chunks.contains { $0.symbol == "helperUnexported" })
-        #expect(!chunks.contains { $0.packageName.contains("internal") })
 
+        // H-1: const and var extracted
+        let eof = chunks.first { $0.packageName == "io" && $0.symbol == "EOF" }
+        #expect(eof?.kind == .variable)
+        let seekStart = chunks.first { $0.packageName == "io" && $0.symbol == "SeekStart" }
+        #expect(seekStart?.kind == .constant)
+        let seekCur = chunks.first { $0.packageName == "io" && $0.symbol == "SeekCurrent" }
+        #expect(seekCur?.kind == .constant && stringContains(seekCur?.body ?? "", "relative to current offset"))
+        #expect(!chunks.contains { $0.symbol == "privateConst" })
+
+        // M-14: multiline func signature & interface method set preserved
+        let copyBuf = chunks.first { $0.packageName == "io" && $0.symbol == "CopyBuffer" }
+        #expect(stringContains(copyBuf?.signature ?? "", "(written int64, err error)"))
+        let reader = chunks.first { $0.packageName == "io" && $0.symbol == "Reader" }
+        #expect(stringContains(reader?.signature ?? "", "Read(p []byte) (n int, err error)"))
+
+        // M-12: raw string/rune/comment braces handled AND type Example is NOT blindly inherited by unrelated methods
         let scannerType = chunks.first { $0.packageName == "bufio" && $0.symbol == "Scanner" }
-        #expect(scannerType?.example != nil)
         #expect(stringContains(scannerType?.example ?? "", "bufio.NewScanner"))
+        let errMethod = chunks.first { $0.packageName == "bufio" && $0.symbol == "Scanner.Err" }
+        #expect(errMethod?.example == nil)
+
+        // L-6: builtin included; M-13: windows & //go:build ignore & internal excluded
+        #expect(chunks.contains { $0.packageName == "builtin" && $0.symbol == "Len" })
+        #expect(!chunks.contains { $0.symbol == "WindowsOnly" })
+        #expect(!chunks.contains { $0.symbol == "IgnoredGen" })
+        #expect(!chunks.contains { $0.packageName.contains("internal") })
     }
 
-    @Test("Strips Hugo front matter and shortcodes from official guides (FR-4-3)")
-    func stripsHugoMarkup() {
-        let raw = """
+    @Test("Preserves paired shortcode prose, ignores # inside code fences, and avoids cross-doc/duplicate heading collisions (H-6, M-10, M-11)")
+    func markdownExtractionPreservesProseAndUniqueIDs() {
+        let doc1 = """
         ---
         title: Effective Go
         ---
-        {{< note >}}ignored shortcode{{< /note >}}
         ## For {#for}
-        The Go for loop unifies for and while.
-        ```go
-        for i := 0; i < 3; i++ {
-        \tfmt.Println(i)
-        }
+        {{< note >}}Important prose inside shortcode.{{< /note >}}
+        ```bash
+        # this comment is inside a fence and not a heading
+        echo ok
         ```
+        ##### Sub detail
+        Deep section body.
+
+        ## For
+        Second section with the same heading.
         """
-        let chunks = DocsCorpusExtractor.extractGuideMarkdown(text: raw, documentTitle: "Effective Go", goVersion: "1.23")
-        #expect(chunks.count == 1)
-        #expect(chunks[0].anchor == "#For")
-        #expect(!stringContains(chunks[0].body, "title: Effective Go"))
-        #expect(!stringContains(chunks[0].body, "{{<"))
-        #expect(stringContains(chunks[0].example ?? "", "for i := 0"))
+        let doc2 = """
+        ## For
+        Tutorial for loop explanation.
+        """
+        let c1 = DocsCorpusExtractor.extractGuideMarkdown(text: doc1, documentTitle: "Effective Go", documentID: "effective_go", goVersion: "1.23")
+        let c2 = DocsCorpusExtractor.extractGuideMarkdown(text: doc2, documentTitle: "Go Tutorial", documentID: "tutorial", goVersion: "1.23")
+
+        // M-10: inner prose of paired shortcode preserved, tags removed
+        #expect(c1.count == 3) // For, Sub detail (H5), For (#For-2)
+        #expect(stringContains(c1[0].body, "Important prose inside shortcode."))
+        #expect(!stringContains(c1[0].body, "{{<"))
+        // M-11: fenced `# comment` stays inside first section rather than creating a new chunk
+        #expect(stringContains(c1[0].body, "# this comment is inside a fence"))
+        #expect(c1[1].symbol == "Sub detail")
+        #expect(c1[2].anchor == "#For-2")
+
+        // H-6: Effective Go `## For` and Tutorial `## For` have distinct stable IDs
+        #expect(c1[0].stableID != c2[0].stableID)
     }
 
-    @Test("Stable ID and content hash are Go-version independent; diff classifies changes (FR-31)")
-    func stableIDAndDiff() {
-        let v22 = BundledGoCorpus.chunks(forGoVersion: "1.22")
-        let v23 = BundledGoCorpus.chunks(forGoVersion: "1.23")
-        #expect(v22.count == v23.count)
-        for (a, b) in zip(v22, v23) {
-            #expect(a.stableID == b.stableID)
-            #expect(a.contentHash == b.contentHash)
-        }
+    @Test("contentHash tracks summary & searchAliases (M-8) and aliases with spaces round-trip losslessly (L-1, H-7)")
+    func hashIncludesEmbeddingInputsAndAliasesRoundTrip() throws {
+        let a = DocsChunk(
+            goVersion: "1.23", source: .guide, packageName: "", documentID: "g",
+            symbol: "for", kind: .guide, title: "For", anchor: "#for",
+            summary: "Original summary", body: "Body", searchAliases: ["for loop", "range over int"]
+        )
+        let b = DocsChunk(
+            goVersion: "1.23", source: .guide, packageName: "", documentID: "g",
+            symbol: "for", kind: .guide, title: "For", anchor: "#for",
+            summary: "Changed summary", body: "Body", searchAliases: ["for loop", "range over int"]
+        )
+        let c = DocsChunk(
+            goVersion: "1.23", source: .guide, packageName: "", documentID: "g",
+            symbol: "for", kind: .guide, title: "For", anchor: "#for",
+            summary: "Original summary", body: "Body", searchAliases: ["for loop", "new alias"]
+        )
+        #expect(a.contentHash != b.contentHash)
+        #expect(a.contentHash != c.contentHash)
 
-        let prevMap = [
-            "a": "h1",
-            "b": "h2",
-            "c": "h3"
-        ]
-        let c1 = DocsChunk(goVersion: "1.23", source: .stdlib, packageName: "p", symbol: "A", kind: .function, title: "A", anchor: "p.A", summary: "s", body: "b")
-        let diff = DocsChunkDiff.compute(previous: prevMap, next: [c1])
-        #expect(diff.added.count == 1)
-        #expect(diff.removed == ["a", "b", "c"])
+        // L-1 & H-7: SQLite round-trip preserves aliases with spaces and stored contentHash verbatim
+        let dir = TempDir()
+        defer { dir.cleanup() }
+        let idx = try DocsIndex(databaseURL: dir.url.appendingPathComponent("idx.sqlite"))
+        defer { idx.close() }
+        try idx.replaceAllChunks([a])
+        let restored = try idx.chunk(forStableID: a.stableID)
+        #expect(restored?.searchAliases == ["for loop", "range over int"])
+        #expect(restored?.contentHash == a.contentHash)
     }
 }
 
-@Suite("Ingestion Batch, Resumability, Incremental Diff & Shared Vector Store")
+@Suite("Ingestion Batch, Concurrency Guards, WAL, GC & Shared Vector Store")
 struct DocsBatchTests {
-    @Test("Atomic swap failure leaves existing active pack intact (FR-6, FR-22)")
+    @Test("Atomic swap failure leaves existing active pack intact and emits .failed (FR-6, FR-22, M-16)")
     func swapFailurePreservesActivePack() async throws {
         let dir = TempDir()
         defer { dir.cleanup() }
         let mgr = try makeDocsPackManager(in: dir)
 
         let v1Chunks = Array(BundledGoCorpus.chunks(forGoVersion: "1.23").prefix(5))
-        let r1 = try await mgr.ingest(goVersion: "1.23", chunks: v1Chunks, embedder: nil)
-        #expect(!r1.cancelled)
+        _ = try await mgr.ingest(goVersion: "1.23", chunks: v1Chunks, embedder: nil)
         #expect(await mgr.manifest(for: "1.23")?.chunkCount == 5)
 
+        let rec = ProgressRecorder()
         let v2Chunks = Array(BundledGoCorpus.chunks(forGoVersion: "1.23").prefix(10))
         var threw = false
         do {
-            _ = try await mgr.ingest(goVersion: "1.23", chunks: v2Chunks, embedder: nil, simulateSwapFailure: true)
+            _ = try await mgr.ingest(goVersion: "1.23", chunks: v2Chunks, embedder: nil, simulateSwapFailure: true) { p in
+                recordProgress(rec, p)
+            }
         } catch {
             threw = true
         }
         #expect(threw)
-        // Old active pack of 5 chunks remains intact and readable.
+        #expect(rec.phases.last == .failed)
         #expect(await mgr.manifest(for: "1.23")?.chunkCount == 5)
-        let idx = try await mgr.openIndex(for: "1.23")
-        #expect(try idx?.chunkCount() == 5)
-        idx?.close()
+
+        // M-16: embedder exception also emits `.failed`
+        let failRec = ProgressRecorder()
+        var embedFailed = false
+        do {
+            _ = try await mgr.ingest(goVersion: "1.23", chunks: v1Chunks, embedder: FailingFakeEmbedder()) { p in
+                recordProgress(failRec, p)
+            }
+        } catch {
+            embedFailed = true
+        }
+        #expect(embedFailed)
+        #expect(failRec.phases.last == .failed)
     }
 
-    @Test("Batch supports progress, cancellation, and resume computing only remaining chunks (FR-23, FR-25)")
-    func batchCancelAndResume() async throws {
+    @Test("Concurrent re-entrant ingest for the same version is rejected (H-8)")
+    func rejectsReentrantIngest() async throws {
+        let dir = TempDir()
+        defer { dir.cleanup() }
+        let mgr = try makeDocsPackManager(in: dir)
+        let chunks = Array(BundledGoCorpus.chunks(forGoVersion: "1.23").prefix(4))
+        let slow = SlowFakeEmbedder(delayNs: 40_000_000)
+
+        let first = Task {
+            try await mgr.ingest(goVersion: "1.23", chunks: chunks, embedder: slow)
+        }
+        try await Task.sleep(nanoseconds: 20_000_000)
+        var rejected = false
+        do {
+            _ = try await mgr.ingest(goVersion: "1.23", chunks: chunks, embedder: slow)
+        } catch DocsStorageError.batchAlreadyRunning(let ver) {
+            rejected = (ver == "1.23")
+        }
+        #expect(rejected)
+        let report = try await first.value
+        #expect(!report.cancelled)
+    }
+
+    @Test("Batch supports cancel/resume (FR-23, FR-25), WAL-complete initial FTS snapshot (M-7), and GC preserves paused staging vectors (H-9)")
+    func batchCancelResumeAndGCProtection() async throws {
         let dir = TempDir()
         defer { dir.cleanup() }
         let mgr = try makeDocsPackManager(in: dir)
@@ -177,10 +319,18 @@ struct DocsBatchTests {
         let first = try await mgr.ingest(goVersion: "1.23", chunks: chunks, embedder: embedder)
         #expect(first.cancelled)
         #expect(first.computedVectors == 3)
-        // FR-28: initial FTS-only snapshot is already searchable while embeddings were interrupted.
+        // M-7 & FR-28: initial FTS-only snapshot has all 8 chunks readable immediately after WAL checkpoint.
         #expect(await mgr.manifest(for: "1.23")?.status == .indexingFTSOnly)
+        let ftsIdx = try await mgr.openIndex(for: "1.23")
+        #expect(try ftsIdx?.chunkCount() == 8)
+        ftsIdx?.close()
 
-        // Resume: only the remaining 5 chunks should invoke embedder.embed(_:).
+        // H-9: running GC while 1.23 has paused staging checkpoint MUST keep those 3 checkpointed vectors!
+        let gcDuringPaused = try await mgr.garbageCollectSharedVectors()
+        #expect(gcDuringPaused == 0)
+        #expect(try await mgr.sharedVectorStore.count() == 3)
+
+        // Resume: only the remaining 5 chunks call embedder.embed(_:)
         embedder.clearCancel()
         embedder.resetCount()
         let resumed = try await mgr.ingest(goVersion: "1.23", chunks: chunks, embedder: embedder)
@@ -191,32 +341,23 @@ struct DocsBatchTests {
         #expect(embedder.callCount == 5)
     }
 
-    @Test("Incremental update re-embeds only changed chunks; model switch invalidates semantic readiness (FR-26, FR-27)")
-    func incrementalUpdateAndModelSwitch() async throws {
+    @Test("Incremental diff updates only changed chunks (M-9) and model switch persists across restarts (FR-27, M-15)")
+    func incrementalDiffAndPersistentModelSwitch() async throws {
         let dir = TempDir()
         defer { dir.cleanup() }
         let mgr = try makeDocsPackManager(in: dir)
         let base = Array(BundledGoCorpus.chunks(forGoVersion: "1.23").prefix(6))
         let embedderV1 = CountingFakeEmbedder(id: "embed-m", version: "v1")
 
-        let initReport = try await mgr.ingest(goVersion: "1.23", chunks: base, embedder: embedderV1)
-        #expect(initReport.computedVectors == 6)
+        _ = try await mgr.ingest(goVersion: "1.23", chunks: base, embedder: embedderV1)
 
-        // Modify 1 chunk and delete 1 chunk.
         var updated = Array(base.dropLast())
         updated[0] = DocsChunk(
-            goVersion: "1.23",
-            source: updated[0].source,
-            packageName: updated[0].packageName,
-            symbol: updated[0].symbol,
-            kind: updated[0].kind,
-            title: updated[0].title,
-            anchor: updated[0].anchor,
-            since: updated[0].since,
-            summary: updated[0].summary + " (revised)",
-            signature: updated[0].signature,
-            example: updated[0].example,
-            body: updated[0].body + "\nRevised detail."
+            goVersion: "1.23", source: updated[0].source, packageName: updated[0].packageName,
+            documentID: updated[0].documentID, symbol: updated[0].symbol, kind: updated[0].kind,
+            title: updated[0].title, anchor: updated[0].anchor, since: updated[0].since,
+            summary: updated[0].summary + " (revised)", signature: updated[0].signature,
+            example: updated[0].example, body: updated[0].body + "\nRevised detail."
         )
 
         embedderV1.resetCount()
@@ -228,48 +369,78 @@ struct DocsBatchTests {
         #expect(diffReport.reusedVectors == 4)
         #expect(embedderV1.callCount == 1)
 
-        // FR-27: switching embedding model demotes Ready pack to FTS-only until rebuilt.
+        // M-15: switching model clears pack vector refs, demotes manifest, and persists selection across restart.
         let needsRebuild = try await mgr.selectEmbeddingModel(EmbeddingModelDescriptor(id: "embed-m", version: "v2"))
         #expect(needsRebuild)
-        #expect(await mgr.manifest(for: "1.23")?.status == .indexingFTSOnly)
+        let mAfter = await mgr.manifest(for: "1.23")
+        #expect(mAfter?.status == .indexingFTSOnly)
+        #expect(mAfter?.embeddingModelID == nil)
+
+        let reopened = try reopenDocsPackManager(at: await mgr.rootDirectory)
+        #expect(await reopened.currentEmbeddingModel() == EmbeddingModelDescriptor(id: "embed-m", version: "v2"))
+        let reopenedIdx = try await reopened.openIndex(for: "1.23")
+        #expect(try reopenedIdx?.vectorReferences().isEmpty == true)
+        reopenedIdx?.close()
     }
 
-    @Test("New Go version pack reuses unchanged chunk vectors from SharedVectorStore and GC reclaims orphans (FR-30, FR-31)")
-    func crossVersionSharedVectorReuseAndGC() async throws {
+    @Test("Cross-version real-diff corpus reuses unchanged vectors and recomputes only changed chunks (H-3, FR-30, FR-31)")
+    func crossVersionRealDiffVectorReuseAndGC() async throws {
         let dir = TempDir()
         defer { dir.cleanup() }
         let mgr = try makeDocsPackManager(in: dir)
         let embedder = CountingFakeEmbedder(id: "shared-embed", version: "v1")
 
-        let chunks122 = BundledGoCorpus.chunks(forGoVersion: "1.22")
-        let r122 = try await mgr.ingest(goVersion: "1.22", chunks: chunks122, embedder: embedder)
-        #expect(r122.computedVectors == chunks122.count)
-        #expect(r122.reusedVectors == 0)
+        // Build two realistic GOROOT trees where 1 package changes between Go 1.22 and Go 1.23.
+        let g122 = TempDir()
+        let g123 = TempDir()
+        defer { g122.cleanup(); g123.cleanup() }
 
-        // Now ingest Go 1.23 with identical chunk contents -> 100% vector reuse, 0 recomputations!
+        let sharedBufio = """
+        // Package bufio implements buffered I/O.
+        package bufio
+        // Scanner provides an interface for reading lines.
+        type Scanner struct{}
+        // NewScanner returns a new Scanner to read from r.
+        func NewScanner(r any) *Scanner { return nil }
+        """
+        _ = g122.file("src/bufio/scan.go", sharedBufio)
+        _ = g123.file("src/bufio/scan.go", sharedBufio)
+
+        _ = g122.file("src/slices/slices.go", """
+        // Package slices defines slice helpers.
+        package slices
+        // Compact replaces consecutive runs of equal elements.
+        func Compact[S ~[]E, E comparable](s S) S { return s }
+        """)
+        _ = g123.file("src/slices/slices.go", """
+        // Package slices defines slice helpers.
+        package slices
+        // Compact replaces consecutive runs of equal elements (Go 1.23 zeroing note).
+        func Compact[S ~[]E, E comparable](s S) S { return s }
+        """)
+
+        let c122 = DocsCorpusExtractor.extractStdlib(fromGorootSrc: g122.url.appendingPathComponent("src"), goVersion: "1.22")
+        let r122 = try await mgr.ingest(goVersion: "1.22", chunks: c122, embedder: embedder)
+        #expect(r122.computedVectors == c122.count)
+
         embedder.resetCount()
-        let chunks123 = BundledGoCorpus.chunks(forGoVersion: "1.23")
-        let r123 = try await mgr.ingest(goVersion: "1.23", chunks: chunks123, embedder: embedder)
-        #expect(r123.computedVectors == 0)
-        #expect(r123.reusedVectors == chunks123.count)
-        #expect(embedder.callCount == 0)
+        let c123 = DocsCorpusExtractor.extractStdlib(fromGorootSrc: g123.url.appendingPathComponent("src"), goVersion: "1.23")
+        let r123 = try await mgr.ingest(goVersion: "1.23", chunks: c123, embedder: embedder)
+        // Only the 1 modified slices.Compact chunk is recomputed; all unchanged chunks are reused!
+        #expect(r123.computedVectors == 1)
+        #expect(r123.reusedVectors == c123.count - 1)
+        #expect(embedder.callCount == 1)
 
-        let storedBefore = try await mgr.sharedVectorStore.count()
-        #expect(storedBefore == chunks122.count)
-
-        // Deleting 1.22 keeps vectors referenced by 1.23.
-        let gcAfterFirstDelete = try await mgr.deletePack(goVersion: "1.22")
-        #expect(gcAfterFirstDelete == 0)
-        #expect(try await mgr.sharedVectorStore.count() == chunks123.count)
-
-        // Deleting 1.23 too makes all vectors unreferenced -> reclaimed by GC.
-        let gcAfterSecondDelete = try await mgr.deletePack(goVersion: "1.23")
-        #expect(gcAfterSecondDelete == chunks123.count)
+        // Delete 1.22 -> only the old slices.Compact vector becomes orphan and is reclaimed.
+        let gc1 = try await mgr.deletePack(goVersion: "1.22")
+        #expect(gc1 == 1)
+        let gc2 = try await mgr.deletePack(goVersion: "1.23")
+        #expect(gc2 == c123.count)
         #expect(try await mgr.sharedVectorStore.count() == 0)
     }
 }
 
-@Suite("Loopback Privacy & Golden Queries (Issue #18 §8.3)")
+@Suite("Real GOROOT Integration, Semantic Search, Loopback & Golden Queries")
 struct DocsGoldenQueryTests {
     @Test("NeverLeavesMachine: refuses non-loopback endpoints (FR-16, DOC-6)")
     func enforcesLoopbackOnly() async throws {
@@ -295,36 +466,141 @@ struct DocsGoldenQueryTests {
         #expect(await svc.currentEndpoint() == nil)
     }
 
-    @Test("Opt-in disabled state and missing pack never silently answer from another Go version (DOC-1, DOC-2, §7.4)")
-    func optInAndMissingPackGuard() async throws {
-        let dir = TempDir()
-        defer { dir.cleanup() }
-        let mgr = try makeDocsPackManager(in: dir)
-        _ = try await mgr.ensureBundledPackInstalled(goVersion: "1.23")
-
-        // Disabled by default (opt-in)
-        let svc = ResearchService(packManager: mgr, enabled: false)
-        let disabledAnswer = try await svc.search(query: "ファイルを1行ずつ読みたい")
-        #expect(disabledAnswer.status == .disabled)
-        #expect(disabledAnswer.cards.isEmpty)
-
-        // Enable, but project pins go 1.21 while only go 1.23 pack is installed -> MissingPack (no silent fallback!)
-        await svc.setEnabled(true)
+    @Test("Integration (§8.2, H-3): English-only GOROOT extraction -> ingestion -> Japanese & symbol lookup without bundled aliases")
+    func realGorootEnglishOnlyIntegration() async throws {
+        let goroot = TempDir()
+        let packDir = TempDir()
         let proj = TempDir()
-        defer { proj.cleanup() }
-        _ = proj.file("go.mod", "module example.com/legacy\n\ngo 1.21\n")
+        defer { goroot.cleanup(); packDir.cleanup(); proj.cleanup() }
+        _ = proj.file("go.mod", "module example.com/real\n\ngo 1.23\n")
 
-        let missing = try await svc.search(query: "for ループの書き方", projectRoot: proj.url)
-        if case .missingPack(let req, let installed) = missing.status {
-            #expect(req.minorKey == "1.21")
-            #expect(installed == ["1.23"])
-        } else {
-            Issue.record("Expected .missingPack for go 1.21 when only 1.23 pack is installed")
+        _ = goroot.file("src/bufio/scan.go", """
+        // Package bufio implements buffered I/O.
+        package bufio
+        // Scanner provides a convenient interface for reading data such as a file of newline-delimited lines of text.
+        type Scanner struct{}
+        // NewScanner returns a new Scanner to read from r.
+        func NewScanner(r any) *Scanner { return nil }
+        """)
+        _ = goroot.file("src/bufio/example_test.go", """
+        package bufio_test
+        func ExampleScanner() {
+        \tscanner := bufio.NewScanner(r)
+        \tfor scanner.Scan() {
+        \t\tfmt.Println(scanner.Text())
+        \t}
         }
-        #expect(missing.cards.isEmpty)
+        """)
+        _ = goroot.file("src/encoding/json/encode.go", """
+        // Package json implements encoding and decoding of JSON.
+        package json
+        // MarshalIndent is like Marshal but applies Indent to format the output.
+        func MarshalIndent(v any, prefix, indent string) ([]byte, error) { return nil, nil }
+        // An Encoder writes JSON values to an output stream. Call SetIndent to indent output.
+        type Encoder struct{}
+        """)
+        _ = goroot.file("src/context/context.go", """
+        // Package context defines the Context type, which carries deadlines and cancellation signals.
+        package context
+        // WithTimeout returns WithDeadline(parent, time.Now().Add(timeout)).
+        func WithTimeout(parent Context, timeout any) (Context, func()) { return nil, nil }
+        """)
+        _ = goroot.file("src/regexp/regexp.go", """
+        // Package regexp implements regular expression search.
+        package regexp
+        // Compile parses a regular expression and returns a Regexp object.
+        func Compile(expr string) (*Regexp, error) { return nil, nil }
+        """)
+        _ = goroot.file("src/io/io.go", """
+        // Package io provides basic interfaces to I/O primitives.
+        package io
+        // EOF is the error returned by Read when no more input is available.
+        var EOF = errors.New("EOF")
+        """)
+        _ = goroot.file("src/net/http/method.go", """
+        package http
+        // Common HTTP methods.
+        const (
+        \tMethodGet  = "GET"
+        \tMethodPost = "POST"
+        )
+        """)
+
+        // Extract purely from English Go sources (NO BundledGoCorpus, NO Japanese aliases!)
+        let extracted = DocsCorpusExtractor.extractStdlib(
+            fromGorootSrc: goroot.url.appendingPathComponent("src"),
+            goVersion: "1.23"
+        )
+        let mgr = try makeDocsPackManager(in: packDir)
+        _ = try await mgr.ingest(goVersion: "1.23", chunks: extracted, embedder: nil)
+        let svc = ResearchService(packManager: mgr, enabled: true)
+
+        // Japanese intent queries work against pure English GoDoc via router expansion!
+        let r1 = try await svc.search(query: "ファイルを1行ずつ読みたい", projectRoot: proj.url)
+        #expect(r1.status == .found && r1.cards.first?.packageName == "bufio" && r1.cards.first?.symbol == "Scanner")
+
+        let r2 = try await svc.search(query: "JSON を整形して出したい", projectRoot: proj.url)
+        #expect(r2.status == .found && r2.cards.contains { $0.packageName == "encoding/json" && ($0.symbol == "MarshalIndent" || $0.symbol == "Encoder") })
+
+        let r3 = try await svc.search(query: "処理にタイムアウトを付けたい", projectRoot: proj.url)
+        #expect(r3.status == .found && r3.cards.first?.packageName == "context" && r3.cards.first?.symbol == "WithTimeout")
+
+        let r4 = try await svc.search(query: "標準ライブラリに正規表現ある？", projectRoot: proj.url)
+        #expect(r4.status == .found && r4.cards.first?.packageName == "regexp")
+
+        // Extracted const/var symbols are directly searchable (H-1)
+        let rEOF = try await svc.search(query: "io.EOF", projectRoot: proj.url)
+        #expect(rEOF.status == .found && rEOF.cards.first?.symbol == "EOF")
+
+        let rMethod = try await svc.search(query: "http.MethodGet", projectRoot: proj.url)
+        #expect(rMethod.status == .found && rMethod.cards.first?.symbol == "MethodGet")
     }
 
-    @Test("Golden queries (§8.3): UC-1, UC-2, UC-3, version gate, citations, and anti-hallucination offline without LLM")
+    @Test("Semantic retrieval integration, model switch demotion, and anti-hallucination gating (M-1, M-2, L-12)")
+    func semanticSearchAndEdgeCases() async throws {
+        let dir = TempDir()
+        let proj = TempDir()
+        defer { dir.cleanup(); proj.cleanup() }
+        _ = proj.file("go.mod", "module example.com/sem\n\ngo 1.23\n")
+
+        let mgr = try makeDocsPackManager(in: dir)
+        let embedder = SemanticTopicEmbedder(id: "topic-embed", version: "v1")
+        _ = try await mgr.ingest(goVersion: "1.23", chunks: BundledGoCorpus.chunks(forGoVersion: "1.23"), embedder: embedder)
+
+        let svc = ResearchService(packManager: mgr, enabled: true)
+        await svc.setEmbedder(embedder)
+
+        // Ready pack + matching embedder -> hybridSemantic mode
+        let hybrid = try await svc.search(query: "read file line by line", projectRoot: proj.url)
+        #expect(hybrid.status == .found)
+        #expect(hybrid.searchMode == .hybridSemantic)
+        #expect(hybrid.language == .english)
+        #expect(stringContains(hybrid.conclusion, "Found for go1.23"))
+        #expect(hybrid.cards.first?.symbol == "Scanner")
+
+        // M-1: even with semantic search active, a non-existent feature existence query MUST return .notFound!
+        let fakeExistence = try await svc.search(query: "標準ライブラリに量子テレポーテーション制御ある？", projectRoot: proj.url)
+        #expect(fakeExistence.status == .notFound)
+        #expect(fakeExistence.cards.isEmpty)
+
+        // L-12: empty query returns gentle notFound with 0 cards
+        let empty = try await svc.search(query: "   ", projectRoot: proj.url)
+        #expect(empty.status == .notFound && empty.cards.isEmpty)
+
+        // L-12: editorContext provides a weak local ranking signal without external calls
+        let ctx = DocsEditorContext.parse(goSource: "package main\nimport (\n\t\"encoding/json\"\n)\n")
+        #expect(ctx.packageName == "main" && ctx.importedPackages == ["encoding/json"])
+        let withCtx = try await svc.search(query: "JSON を整形して出したい", projectRoot: proj.url, editorContext: ctx)
+        #expect(withCtx.status == .found && withCtx.cards.first?.packageName == "encoding/json")
+
+        // M-2 & FR-27: switching embedding model immediately drops searchMode back to .ftsOnly
+        _ = try await mgr.selectEmbeddingModel(EmbeddingModelDescriptor(id: "topic-embed", version: "v2"))
+        let afterSwitch = try await svc.search(query: "read file line by line", projectRoot: proj.url)
+        #expect(afterSwitch.status == .found)
+        #expect(afterSwitch.searchMode == .ftsOnly)
+    }
+
+    @Test("Golden queries (§8.3): UC-1, UC-2, UC-3, version gate, citations, and snippet formatting (L-11)")
     func goldenQueries() async throws {
         let dir = TempDir()
         defer { dir.cleanup() }
@@ -355,6 +631,12 @@ struct DocsGoldenQueryTests {
             #expect(card.goVersion == "1.21")
         }
 
+        // L-7: Go 1.21 pack does not contain Go 1.22 release notes
+        let idx121 = try await mgr.openIndex(for: "1.21")
+        let chunks121 = try idx121?.allChunks() ?? []
+        idx121?.close()
+        #expect(!chunks121.contains { $0.source == .release && $0.since == "1.22" })
+
         // Same query on Go 1.23: integer range (1.22+) is allowed.
         let for123 = try await svc.search(query: "for ループの書き方", projectRoot: proj123.url)
         #expect(for123.status == .found)
@@ -367,8 +649,8 @@ struct DocsGoldenQueryTests {
         #expect(readLine.cards.first?.symbol == "Scanner")
         #expect(readLine.cards.first?.canInsert == true)
         if let top = readLine.cards.first {
-            let snippet = DocsCodeInserter.prepareSnippet(from: top, targetVersion: GoVersion(major: 1, minor: 23))
-            #expect(snippet != nil && stringContains(snippet ?? "", "bufio.NewScanner"))
+            let prepared = await DocsCodeInserter.prepareSnippetAsync(from: top, targetVersion: GoVersion(major: 1, minor: 23))
+            #expect(prepared != nil && stringContains(prepared?.code ?? "", "bufio.NewScanner"))
         }
 
         // 3. 「JSON を整形して出したい」 -> json.MarshalIndent / json.Encoder (SetIndent)
@@ -407,5 +689,21 @@ struct DocsGoldenQueryTests {
         #expect(nonexistent.cards.isEmpty)
         #expect(stringContains(nonexistent.conclusion, "見つかりませんでした"))
         #expect(stringContains(nonexistent.searchedScope, "Go 1.23"))
+
+        // Opt-in disabled & missing pack guard
+        await svc.setEnabled(false)
+        let disabledAns = try await svc.search(query: "ファイルを1行ずつ読みたい", projectRoot: proj123.url)
+        #expect(disabledAns.status == .disabled && disabledAns.cards.isEmpty)
+        await svc.setEnabled(true)
+
+        let proj120 = TempDir()
+        defer { proj120.cleanup() }
+        _ = proj120.file("go.mod", "module example.com/v120\n\ngo 1.20\n")
+        let missing = try await svc.search(query: "for ループの書き方", projectRoot: proj120.url)
+        if case .missingPack(let req, _) = missing.status {
+            #expect(req.minorKey == "1.20")
+        } else {
+            Issue.record("Expected .missingPack for go 1.20")
+        }
     }
 }

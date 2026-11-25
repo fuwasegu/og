@@ -21,10 +21,10 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     private let actionButton = NSButton(title: "Restart", target: nil, action: nil)
     private let logView = NSTextView()
 
-    // Offline Go Docs (FR-19, FR-20, FR-23, FR-24, FR-29, Q-4)
+    // Offline Go Docs (FR-19, FR-20, FR-23, FR-24, FR-29, Q-4, L-9)
     private let docsEnabled = NSButton(checkboxWithTitle: "Enable offline Go Docs lookup (local-only; independent of inline AI completion)", target: nil, action: nil)
     private let docsBatchPolicy = NSPopUpButton()
-    private let docsVersionPopup = NSPopUpButton()
+    private let docsVersionCombo = NSComboBox()
     private let docsInstallButton = NSButton(title: "Add / Update Pack", target: nil, action: nil)
     private let docsImportGorootButton = NSButton(title: "Import GOROOT…", target: nil, action: nil)
     private let docsDeleteButton = NSButton(title: "Delete Pack", target: nil, action: nil)
@@ -45,6 +45,9 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
             MainActor.assumeIsolated { self?.refreshStatus() }
         }
         NotificationCenter.default.addObserver(forName: .ogDocsChanged, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshDocs() }
+        }
+        NotificationCenter.default.addObserver(forName: .ogDocsBatchProgressChanged, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.refreshDocs() }
         }
     }
@@ -112,14 +115,16 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
 
         let statusRow = NSStackView(views: [status, NSView(), actionButton])
 
-        // Offline Go Docs controls (FR-19, FR-20, FR-23, FR-24, FR-29)
+        // Offline Go Docs controls (FR-19, FR-20, FR-23, FR-24, FR-29, L-9)
         docsEnabled.target = self
         docsEnabled.action = #selector(docsEnabledChanged)
         for p in DocsBatchRunPolicy.allCases { docsBatchPolicy.addItem(withTitle: p.title) }
         docsBatchPolicy.target = self
         docsBatchPolicy.action = #selector(docsPolicyChanged)
-        for ver in ["1.24", "1.23", "1.22", "1.21"] { docsVersionPopup.addItem(withTitle: "go\(ver)") }
-        docsVersionPopup.selectItem(withTitle: "go\(BundledGoCorpus.defaultVersion)")
+        docsVersionCombo.isEditable = true
+        docsVersionCombo.completes = false
+        docsVersionCombo.placeholderString = "go1.23"
+        docsVersionCombo.widthAnchor.constraint(equalToConstant: 96).isActive = true
         docsInstallButton.target = self
         docsInstallButton.action = #selector(docsInstallClicked)
         docsImportGorootButton.target = self
@@ -138,7 +143,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         docsProgressBar.controlSize = .small
         docsProgressLabel.font = Theme.smallFont
         docsProgressLabel.textColor = Theme.secondaryText
-        let docsButtons = NSStackView(views: [docsVersionPopup, docsInstallButton, docsImportGorootButton, docsDeleteButton, docsCancelButton, docsLicenseButton])
+        let docsButtons = NSStackView(views: [docsVersionCombo, docsInstallButton, docsImportGorootButton, docsDeleteButton, docsCancelButton, docsLicenseButton])
         docsButtons.orientation = .horizontal
         docsButtons.spacing = 6
 
@@ -289,6 +294,22 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         docsBatchPolicy.selectItem(at: DocsBatchRunPolicy.allCases.firstIndex(of: d.batchPolicy) ?? 0)
 
         let packs = d.installedPacks
+        // L-9: populate combo dynamically from installed packs, cached toolchain version, and bundled default.
+        var versions: [String] = []
+        for p in packs where !versions.contains(p.goVersion) { versions.append(p.goVersion) }
+        if let detected = d.detectedToolchainVersion?.minorKey, !versions.contains(detected) {
+            versions.append(detected)
+        }
+        if !versions.contains(BundledGoCorpus.defaultVersion) {
+            versions.append(BundledGoCorpus.defaultVersion)
+        }
+        let currentSelection = docsVersionCombo.stringValue.trimmingCharacters(in: .whitespaces)
+        docsVersionCombo.removeAllItems()
+        docsVersionCombo.addItems(withObjectValues: versions.sorted(by: >).map { "go\($0)" })
+        if currentSelection.isEmpty {
+            docsVersionCombo.stringValue = "go\(BundledGoCorpus.defaultVersion)"
+        }
+
         if packs.isEmpty {
             docsPacksLabel.stringValue = "Installed packs: none (enabling installs bundled go\(BundledGoCorpus.defaultVersion) core pack offline)"
         } else {
@@ -318,8 +339,9 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     }
 
     private var selectedDocsVersion: String {
-        let raw = docsVersionPopup.titleOfSelectedItem ?? "go\(BundledGoCorpus.defaultVersion)"
-        return raw.hasPrefix("go") ? String(raw.dropFirst(2)) : raw
+        let raw = docsVersionCombo.stringValue.trimmingCharacters(in: .whitespaces)
+        if let parsed = GoVersion(parsing: raw) { return parsed.minorKey }
+        return BundledGoCorpus.defaultVersion
     }
 
     @objc private func docsEnabledChanged() {

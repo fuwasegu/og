@@ -6,22 +6,26 @@ import Foundation
 /// symbols with accurate `since` versions so offline lookup (UC-1, UC-2, UC-3) and
 /// version gating work immediately even without network access or a local Go install.
 ///
+/// `searchAliases` use general domain vocabulary only — never verbatim test queries (H-2).
+/// Release notes newer than the requested pack version are omitted (L-7).
+///
 /// All excerpts and signatures follow Go's official documentation (BSD-3-Clause, `DocsLicense.goBSD3Clause`).
 public enum BundledGoCorpus {
     /// Default Go minor version for the bundled core pack.
     public static let defaultVersion = "1.23"
 
     /// Generates the core Go documentation chunks stamped for `goVersion`.
-    /// Because `DocsChunk.contentHash` excludes `goVersion`, unchanged entries across
-    /// versions share the same vector key in `SharedVectorStore` (FR-30, FR-31).
     public static func chunks(forGoVersion goVersion: String = defaultVersion) -> [DocsChunk] {
+        let targetVer = GoVersion(parsing: goVersion)
+
         var items: [DocsChunk] = [
-            // MARK: - UC-1: Language Spec & Effective Go (for loops, control flow, error handling)
+            // MARK: - UC-1: Language Spec & Effective Go (control flow & idioms)
 
             DocsChunk(
                 goVersion: goVersion,
                 source: .spec,
                 packageName: "",
+                documentID: "go_spec",
                 symbol: "for",
                 kind: .syntax,
                 title: "For statements (classic 3-clause, condition-only, infinite)",
@@ -41,13 +45,14 @@ public enum BundledGoCorpus {
                 3. Infinite loop (`for { ... }`) — exit with `break` or `return`.
                 Choose `for range` when iterating over slices, maps, strings, or channels.
                 """,
-                searchAliases: ["for ループ 書き方", "ループ", "繰り返し", "while", "繰り返し処理", "for loop", "syntax"]
+                searchAliases: ["for", "loop", "while", "ループ", "繰り返し", "反復"]
             ),
 
             DocsChunk(
                 goVersion: goVersion,
                 source: .guide,
                 packageName: "",
+                documentID: "effective_go",
                 symbol: "for range",
                 kind: .guide,
                 title: "Effective Go: For (iterating slices, maps, strings, channels)",
@@ -65,17 +70,18 @@ public enum BundledGoCorpus {
                 Use `for _, v := range xs` when you only need the value, and `for i := range xs` when you only need the index or key.
                 For strings, `range` decodes UTF-8 runes rather than raw bytes.
                 """,
-                searchAliases: ["for ループ 書き方", "for range", "配列 ループ", "スライス 反復", "マップ 反復", "foreach", "effective go for"]
+                searchAliases: ["for", "range", "foreach", "iterate", "ループ", "走査", "反復"]
             ),
 
             DocsChunk(
                 goVersion: goVersion,
                 source: .spec,
                 packageName: "",
+                documentID: "go_spec",
                 symbol: "for range int",
                 kind: .syntax,
                 title: "For statements with range over integer (Go 1.22+)",
-                anchor: "#For_range",
+                anchor: "#For_range_int",
                 since: "1.22",
                 summary: "Go 1.22 以降では整数 n に対して `for i := range n` で 0 から n-1 まで反復できる。",
                 signature: "for i := range n { ... }  // Go 1.22+",
@@ -88,17 +94,18 @@ public enum BundledGoCorpus {
                 Starting in Go 1.22, a `for` statement with a `range` clause may iterate over an integer value `n`, producing values 0 through n-1.
                 In Go 1.21 and earlier, use the classic `for i := 0; i < n; i++` form instead.
                 """,
-                searchAliases: ["for ループ 書き方", "整数 range", "range over int", "回数 ループ", "for range 10", "go 1.22"]
+                searchAliases: ["for", "range", "integer", "整数", "ループ"]
             ),
 
             DocsChunk(
                 goVersion: goVersion,
                 source: .spec,
                 packageName: "",
+                documentID: "go_spec",
                 symbol: "for range func",
                 kind: .syntax,
                 title: "For statements with range over function iterators (Go 1.23+)",
-                anchor: "#For_range",
+                anchor: "#For_range_func",
                 since: "1.23",
                 summary: "Go 1.23 以降では `iter.Seq` / `iter.Seq2` などのイテレータ関数を `for v := range seq` で直接反復できる。",
                 signature: "for v := range seq { ... }  // Go 1.23+, iter.Seq[V]",
@@ -110,13 +117,14 @@ public enum BundledGoCorpus {
                 body: """
                 Starting in Go 1.23, `for range` supports function iterators matching `func(func() bool)`, `func(func(K) bool)` (`iter.Seq`), and `func(func(K, V) bool)` (`iter.Seq2`).
                 """,
-                searchAliases: ["for ループ 書き方", "イテレータ", "range over func", "iter.Seq", "go 1.23"]
+                searchAliases: ["for", "range", "iterator", "iter.Seq", "イテレータ"]
             ),
 
             DocsChunk(
                 goVersion: goVersion,
                 source: .spec,
                 packageName: "",
+                documentID: "go_spec",
                 symbol: "switch",
                 kind: .syntax,
                 title: "Switch statements (expression switch and type switch)",
@@ -137,13 +145,14 @@ public enum BundledGoCorpus {
                 A tagless `switch { case cond: ... }` is an idiomatic replacement for long if-else-if chains.
                 A type switch `switch v := x.(type)` branches on the dynamic type of an interface value.
                 """,
-                searchAliases: ["switch 書き方", "条件分岐", "type switch", "型スイッチ"]
+                searchAliases: ["switch", "branch", "条件分岐", "型スイッチ"]
             ),
 
             DocsChunk(
                 goVersion: goVersion,
                 source: .guide,
                 packageName: "",
+                documentID: "effective_go",
                 symbol: "defer",
                 kind: .guide,
                 title: "Effective Go: Defer (cleanup on function return)",
@@ -163,13 +172,14 @@ public enum BundledGoCorpus {
                 Deferred calls execute in LIFO order and are evaluated when the `defer` statement runs.
                 Use `defer` right after checking an acquisition error so resources are never leaked.
                 """,
-                searchAliases: ["defer 書き方", "後処理", "リソース解放", "ファイル 閉じる", "finally"]
+                searchAliases: ["defer", "cleanup", "finally", "後処理", "リソース解放"]
             ),
 
             DocsChunk(
                 goVersion: goVersion,
                 source: .guide,
                 packageName: "",
+                documentID: "effective_go",
                 symbol: "error wrapping",
                 kind: .guide,
                 title: "Error wrapping with fmt.Errorf (%w), errors.Is, and errors.As",
@@ -186,10 +196,10 @@ public enum BundledGoCorpus {
                 Wrap errors with `%w` when callers should be able to match the underlying error using `errors.Is` or `errors.As`.
                 Use `%v` instead if you intentionally want to hide implementation details at a package boundary.
                 """,
-                searchAliases: ["エラー ラップ", "エラーハンドリング", "fmt.Errorf", "errors.Is", "errors.As", "wrap error"]
+                searchAliases: ["error", "wrap", "Errorf", "errors.Is", "errors.As", "エラー", "ラップ"]
             ),
 
-            // MARK: - UC-2 & UC-3: Standard Library (bufio, encoding/json, slices, maps, context, regexp, etc.)
+            // MARK: - UC-2 & UC-3: Standard Library
 
             DocsChunk(
                 goVersion: goVersion,
@@ -223,7 +233,7 @@ public enum BundledGoCorpus {
                 Successive calls to the Scan method step through the tokens of a file, splitting on lines by default (ScanLines).
                 Always check `scanner.Err()` after the loop finishes. Default maximum token size is 64 KiB; call `scanner.Buffer` for longer lines.
                 """,
-                searchAliases: ["ファイルを1行ずつ読みたい", "1行ずつ読む", "行単位 読み込み", "テキストファイル 読む", "read file line by line", "bufio.Scanner", "scanner"]
+                searchAliases: ["bufio", "Scanner", "ScanLines", "行単位", "テキスト読込"]
             ),
 
             DocsChunk(
@@ -248,7 +258,7 @@ public enum BundledGoCorpus {
                 ReadFile reads the named file and returns the contents. A successful call returns err == nil, not err == EOF.
                 Replaced the deprecated `ioutil.ReadFile` in Go 1.16.
                 """,
-                searchAliases: ["ファイル 読み込み", "ファイル 全部 読む", "read file", "os.ReadFile"]
+                searchAliases: ["os", "ReadFile", "ファイル読込"]
             ),
 
             DocsChunk(
@@ -270,7 +280,7 @@ public enum BundledGoCorpus {
                 body: """
                 WriteFile writes data to the named file, creating it if necessary. If the file does not exist, WriteFile creates it with permissions perm; otherwise WriteFile truncates it before writing.
                 """,
-                searchAliases: ["ファイル 書き込み", "ファイル 保存", "write file", "os.WriteFile"]
+                searchAliases: ["os", "WriteFile", "ファイル書込"]
             ),
 
             DocsChunk(
@@ -295,7 +305,7 @@ public enum BundledGoCorpus {
                 MarshalIndent is like Marshal but applies Indent to format the output.
                 Each JSON element in the output begins on a new line beginning with prefix followed by one or more copies of indent according to the indentation nesting.
                 """,
-                searchAliases: ["JSON を整形して出したい", "JSON 整形", "JSON きれいに", "pretty print json", "indent json", "json.MarshalIndent"]
+                searchAliases: ["json", "MarshalIndent", "indent", "整形"]
             ),
 
             DocsChunk(
@@ -320,7 +330,7 @@ public enum BundledGoCorpus {
                 An Encoder writes JSON values to an output stream (`io.Writer`).
                 Call `enc.SetIndent("", "  ")` before `enc.Encode(v)` to emit pretty-printed JSON directly to the writer without buffering an intermediate byte slice.
                 """,
-                searchAliases: ["json.Encoder", "json.Encoder どう使う", "JSON を整形して出したい", "JSON 整形", "JSON 書き出し", "SetIndent", "Encode"]
+                searchAliases: ["json", "Encoder", "SetIndent", "Encode", "整形"]
             ),
 
             DocsChunk(
@@ -344,7 +354,7 @@ public enum BundledGoCorpus {
                 Unmarshal parses the JSON-encoded data and stores the result in the value pointed to by v.
                 Struct fields must be exported (capitalized) to be populated by `encoding/json`.
                 """,
-                searchAliases: ["JSON パース", "JSON 読み込み", "JSON デコード", "parse json", "json.Unmarshal"]
+                searchAliases: ["json", "Unmarshal", "parse", "デコード"]
             ),
 
             DocsChunk(
@@ -367,13 +377,14 @@ public enum BundledGoCorpus {
                 Because it only removes adjacent duplicates, sort the slice first with `slices.Sort(items)` when order does not need to be preserved.
                 To remove duplicates while preserving original order, track seen elements with `seen := make(map[T]struct{})`.
                 """,
-                searchAliases: ["重複を取り除きたい", "重複削除", "ユニーク", "deduplicate", "unique slice", "slices.Compact", "slices"]
+                searchAliases: ["slices", "Compact", "deduplicate", "unique", "重複"]
             ),
 
             DocsChunk(
                 goVersion: goVersion,
                 source: .guide,
                 packageName: "",
+                documentID: "effective_go",
                 symbol: "deduplicate map pattern",
                 kind: .guide,
                 title: "Order-preserving deduplication with map[T]struct{} (Set idiom)",
@@ -395,7 +406,7 @@ public enum BundledGoCorpus {
                 Go does not have a built-in set type; `map[T]struct{}` (zero-byte value) is the idiomatic set representation.
                 Use this pattern to deduplicate a slice while preserving first-seen order in any Go version.
                 """,
-                searchAliases: ["重複を取り除きたい", "重複削除", "Set 集合", "順序維持 重複", "deduplicate", "unique"]
+                searchAliases: ["map", "set", "deduplicate", "unique", "重複", "集合"]
             ),
 
             DocsChunk(
@@ -415,7 +426,7 @@ public enum BundledGoCorpus {
                 body: """
                 Sort sorts a slice of any ordered type in ascending order. For custom ordering or structs, use `slices.SortFunc` with `cmp.Compare`.
                 """,
-                searchAliases: ["ソート", "並べ替え", "sort slice", "slices.Sort"]
+                searchAliases: ["slices", "Sort", "SortFunc", "ソート", "並べ替え"]
             ),
 
             DocsChunk(
@@ -443,7 +454,7 @@ public enum BundledGoCorpus {
                 Canceling this context releases resources associated with it, so code should call `defer cancel()` as soon as the operations running in this Context complete.
                 Pass `ctx` as the first argument to downstream I/O, HTTP, database, and `exec.CommandContext` calls.
                 """,
-                searchAliases: ["処理にタイムアウトを付けたい", "タイムアウトを付けたい", "タイムアウト", "キャンセル", "deadline", "timeout", "context.WithTimeout"]
+                searchAliases: ["context", "WithTimeout", "deadline", "timeout", "タイムアウト"]
             ),
 
             DocsChunk(
@@ -455,7 +466,7 @@ public enum BundledGoCorpus {
                 title: "regexp — regular expression matching in the standard library",
                 anchor: "regexp.Compile",
                 since: "1.0",
-                summary: "標準ライブラリに正規表現パッケージ `regexp` が**ある**（RE2 構文・線形時間保証）。固定パターンは `regexp.MustCompile` をパッケージ変数で 1 回だけコンパイルする。",
+                summary: "標準ライブラリに正規表現パッケージ `regexp` がある（RE2 構文・線形時間保証）。固定パターンは `regexp.MustCompile` をパッケージ変数で 1 回だけコンパイルする。",
                 signature: "func Compile(expr string) (*Regexp, error)  |  func MustCompile(str string) *Regexp",
                 example: """
                 re := regexp.MustCompile(`^[a-z]+\\d+$`)
@@ -465,7 +476,29 @@ public enum BundledGoCorpus {
                 Package `regexp` implements regular expression search in the Go standard library using RE2 syntax (guaranteed O(n) time, no backreferences).
                 Use `regexp.Compile` for dynamic patterns and `regexp.MustCompile` for constant patterns initialized once.
                 """,
-                searchAliases: ["標準ライブラリに正規表現ある", "正規表現", "regex", "regexp", "パターンマッチ", "MatchString"]
+                searchAliases: ["regexp", "regex", "Compile", "MatchString", "正規表現"]
+            ),
+
+            DocsChunk(
+                goVersion: goVersion,
+                source: .stdlib,
+                packageName: "io",
+                symbol: "EOF",
+                kind: .variable,
+                title: "io.EOF — end-of-input sentinel error",
+                anchor: "io.EOF",
+                since: "1.0",
+                summary: "ストリームの正常な終端を表す標準のセンチネルエラー。`errors.Is(err, io.EOF)` で判定する。",
+                signature: "var EOF = errors.New(\"EOF\")",
+                example: """
+                if errors.Is(err, io.EOF) {
+                \tbreak
+                }
+                """,
+                body: """
+                EOF is the error returned by Read when no more input is available.
+                """,
+                searchAliases: ["io", "EOF", "終端"]
             ),
 
             DocsChunk(
@@ -490,7 +523,7 @@ public enum BundledGoCorpus {
                 A Builder is used to efficiently build a string using Write methods. It minimizes memory copying.
                 The zero value is ready to use.
                 """,
-                searchAliases: ["文字列 連結", "文字列 結合", "string builder", "strings.Builder"]
+                searchAliases: ["strings", "Builder", "concat", "文字列連結"]
             ),
 
             DocsChunk(
@@ -514,7 +547,7 @@ public enum BundledGoCorpus {
                 body: """
                 Atoi is equivalent to ParseInt(s, 10, 0), converted to type int. Itoa is equivalent to FormatInt(int64(i), 10).
                 """,
-                searchAliases: ["文字列 数値 変換", "int string 変換", "parse int", "strconv.Atoi", "strconv.Itoa"]
+                searchAliases: ["strconv", "Atoi", "Itoa", "数値変換"]
             ),
 
             DocsChunk(
@@ -536,7 +569,7 @@ public enum BundledGoCorpus {
                 Format returns a textual representation of the time value formatted according to the reference time `Mon Jan 2 15:04:05 MST 2006`.
                 Standard layout constants include `time.RFC3339`, and since Go 1.20 `time.DateTime`, `time.DateOnly`, and `time.TimeOnly`.
                 """,
-                searchAliases: ["日時 フォーマット", "日付 文字列", "時間 パース", "date format", "time.Format", "time.Parse"]
+                searchAliases: ["time", "Format", "Parse", "RFC3339", "日時"]
             ),
 
             DocsChunk(
@@ -564,7 +597,7 @@ public enum BundledGoCorpus {
                 body: """
                 A WaitGroup waits for a collection of goroutines to finish. The main goroutine calls Add to set the number of goroutines to wait for, each goroutine calls Done when finished, and Wait blocks until all goroutines have finished.
                 """,
-                searchAliases: ["goroutine 待つ", "並行処理 完了待ち", "sync.WaitGroup", "WaitGroup"]
+                searchAliases: ["sync", "WaitGroup", "goroutine", "並行処理"]
             ),
 
             DocsChunk(
@@ -593,7 +626,7 @@ public enum BundledGoCorpus {
                 body: """
                 A Client is an HTTP client. Always set a Timeout or pass a context with deadline, and always close `resp.Body` when `err == nil`.
                 """,
-                searchAliases: ["HTTP リクエスト", "http client", "API 呼び出し", "net/http.Client", "http.Get"]
+                searchAliases: ["net/http", "Client", "HTTP", "request"]
             ),
 
             DocsChunk(
@@ -621,7 +654,7 @@ public enum BundledGoCorpus {
                 body: """
                 WalkDir walks the file tree rooted at root, calling fn for each file or directory in the tree, including root.
                 """,
-                searchAliases: ["ディレクトリ 再帰", "ファイル一覧", "walk directory", "filepath.WalkDir"]
+                searchAliases: ["filepath", "WalkDir", "walk", "ディレクトリ走査"]
             ),
 
             DocsChunk(
@@ -641,13 +674,17 @@ public enum BundledGoCorpus {
                 body: """
                 Keys returns an iterator over keys in m. Combine with `slices.Collect` or `slices.Sorted` to obtain a slice of keys.
                 """,
-                searchAliases: ["マップ キー 一覧", "map keys", "maps.Keys", "go 1.23"]
-            ),
+                searchAliases: ["maps", "Keys", "Collect", "マップ"]
+            )
+        ]
 
-            DocsChunk(
+        // L-7: Only include release notes whose version is <= the pack's target Go version.
+        if targetVer.map({ $0.isAtLeast(GoVersion(major: 1, minor: 22)) }) ?? true {
+            items.append(DocsChunk(
                 goVersion: goVersion,
                 source: .release,
                 packageName: "",
+                documentID: "go1.22_release_notes",
                 symbol: "Go 1.22 release notes",
                 kind: .releaseNote,
                 title: "Go 1.22: range over integers and per-iteration loop variables",
@@ -665,11 +702,10 @@ public enum BundledGoCorpus {
                 1. Variables declared by a `for` loop are created once per iteration, eliminating accidental closure capture bugs.
                 2. `for` loops may range over integers (`for i := range 10`).
                 """,
-                searchAliases: ["range over int いつから", "整数 range いつから", "go 1.22", "ループ変数"]
-            )
-        ]
+                searchAliases: ["release", "go1.22", "range", "ループ変数"]
+            ))
+        }
 
-        // Preserve deterministic ordering by stableID.
         items.sort { $0.stableID < $1.stableID }
         return items
     }

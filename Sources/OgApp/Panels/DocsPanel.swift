@@ -19,7 +19,8 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
     private var explicitVersion: GoVersion?
     private var lastAnswer: DocsAnswer?
     private var searchTask: Task<Void, Never>?
-    private var observer: NSObjectProtocol?
+    private var insertTask: Task<Void, Never>?
+    private var observers: [NSObjectProtocol] = []
 
     init(context: ProjectContext) {
         self.context = context
@@ -30,7 +31,7 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
 
     deinit {
         MainActor.assumeIsolated {
-            if let observer { NotificationCenter.default.removeObserver(observer) }
+            for o in observers { NotificationCenter.default.removeObserver(o) }
         }
     }
 
@@ -138,7 +139,8 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
 
         view = root
 
-        observer = NotificationCenter.default.addObserver(forName: .ogDocsChanged, object: nil, queue: .main) { [weak self] _ in
+        // M-4: separate pack/toggle changes from batch progress updates so progress never spams searches.
+        observers.append(NotificationCenter.default.addObserver(forName: .ogDocsChanged, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.refreshVersionPopup()
                 if let q = self?.queryField.stringValue, !q.trimmingCharacters(in: .whitespaces).isEmpty {
@@ -147,9 +149,25 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
                     self?.renderIdleOrStatus()
                 }
             }
-        }
+        })
+        observers.append(NotificationCenter.default.addObserver(forName: .ogDocsBatchProgressChanged, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.updateModeLabelForProgress()
+            }
+        })
         refreshVersionPopup()
         renderIdleOrStatus()
+    }
+
+    private func updateModeLabelForProgress() {
+        if let prog = DocsManager.shared.activeProgress,
+           prog.phase == .extracting || prog.phase == .buildingFTS || prog.phase == .embedding || prog.phase == .activating {
+            modeLabel.stringValue = "Indexing go\(prog.goVersion) (\(prog.processedChunks)/\(prog.totalChunks))"
+        } else if let a = lastAnswer {
+            modeLabel.stringValue = a.searchMode == .hybridSemantic ? "Hybrid" : "FTS5 のみ"
+        } else {
+            modeLabel.stringValue = DocsManager.shared.enabled ? "FTS5 のみ（ローカル完結）" : "Off"
+        }
     }
 
     // MARK: - Actions
@@ -190,7 +208,12 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
     @objc private func insertCardClicked(_ sender: NSButton) {
         let index = sender.tag
         guard let answer = lastAnswer, answer.cards.indices.contains(index) else { return }
-        insertCard(answer.cards[index], targetVersion: answer.targetVersion)
+        let card = answer.cards[index]
+        let targetVer = answer.targetVersion
+        insertTask?.cancel()
+        insertTask = Task { [weak self] in
+            _ = await self?.insertCardAsync(card, targetVersion: targetVer)
+        }
     }
 
     @objc private func copyCardClicked(_ sender: NSButton) {
@@ -246,21 +269,35 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
         return DocsEditorContext.parse(goSource: ed.document.text)
     }
 
+    /// M-3 & L-10: checks `.isGo`, runs `gofmt` off the main thread, then inserts safely via UTF-16 ranges.
     @discardableResult
-    private func insertCard(_ card: DocsAnswerCard, targetVersion: GoVersion?) -> Bool {
+    private func insertCardAsync(_ card: DocsAnswerCard, targetVersion: GoVersion?) async -> Bool {
         guard let editor = context.currentEditor else {
             context.setStatus("Open a Go file to insert the snippet.")
             return false
         }
-        guard let ver = targetVersion ?? GoVersion(parsing: card.goVersion),
-              let formatted = DocsCodeInserter.prepareSnippet(from: card, targetVersion: ver) else {
-            context.setStatus("Snippet cannot be inserted for \(targetVersion?.description ?? card.goVersion).")
+        guard editor.document.isGo else {
+            context.setStatus("Switch to a Go (.go) file before inserting a Go Docs snippet.")
+            return false
+        }
+        guard let ver = targetVersion ?? GoVersion(parsing: card.goVersion) else {
+            context.setStatus("Snippet cannot be inserted for unknown Go version.")
+            return false
+        }
+        let docVersionBefore = editor.document.version
+        guard let prepared = await DocsCodeInserter.prepareSnippetAsync(from: card, targetVersion: ver) else {
+            context.setStatus("Snippet cannot be inserted for \(ver.description).")
+            return false
+        }
+        guard !Task.isCancelled else { return false }
+        guard context.currentEditor === editor, editor.document.version == docVersionBefore else {
+            context.setStatus("Editor changed while formatting snippet; please try inserting again.")
             return false
         }
         // UTF-16 safe insertion via existing editor path (AGENTS.md §4-2), matching surrounding indentation.
         let range = editor.textView.selectedRange()
         let indent = indentationForInsertion(in: editor.document.storage.string, atUTF16Offset: range.location)
-        let indented = formatted
+        let indented = prepared.code
             .components(separatedBy: "\n")
             .map { $0.isEmpty ? "" : indent + $0 }
             .joined(separator: "\n")
@@ -271,7 +308,8 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
         editor.document.undoManager.endUndoGrouping()
         editor.document.undoManager.setActionName("Insert Go Docs Snippet")
         editor.focus()
-        context.setStatus("Inserted snippet (\(card.citation), go\(card.goVersion))")
+        let fmtNote = prepared.formattedByGofmt ? "" : " (unformatted: gofmt not found)"
+        context.setStatus("Inserted snippet (\(card.citation), go\(card.goVersion))\(fmtNote)")
         return true
     }
 
@@ -523,7 +561,8 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
         _ = view
         searchTask?.cancel()
         queryField.stringValue = query
-        DocsManager.shared.enabled = true
+        // M-6: use in-memory debug override so headless tests never persist opt-in to UserDefaults.
+        DocsManager.shared.debugEnabledOverride = true
         await DocsManager.shared.ensureBundledPackSync(
             goVersion: explicitVersion?.minorKey
                 ?? GoVersionResolver.resolve(projectRoot: context.root)?.version.minorKey
@@ -544,9 +583,9 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
     }
 
     @discardableResult
-    func debugInsertFirstCard() -> Bool {
+    func debugInsertFirstCard() async -> Bool {
         guard let answer = lastAnswer, let first = answer.cards.first else { return false }
-        return insertCard(first, targetVersion: answer.targetVersion)
+        return await insertCardAsync(first, targetVersion: answer.targetVersion)
     }
 
     func debugSummary() -> String {

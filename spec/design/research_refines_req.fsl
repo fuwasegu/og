@@ -1,6 +1,6 @@
 // ResearchDesign ⊑ Research
-// Staging phases (start, pause, resume, embed compute/reuse, abort) and loopback validation
-// refine the requirements-level pack activation and grounded lookup contract.
+// Chunk-level embedding progress, staged FTS rebuilds, and loopback validation
+// refine the requirements-level pack update, resume, reuse, and version-gate contract.
 refinement ResearchRefinesReq {
   impl ResearchDesign
   abs  Research
@@ -11,22 +11,28 @@ refinement ResearchRefinesReq {
     else if pack_state[v] == DFTSOnly then IndexingFTSOnly
     else Missing
 
+  map batch_state =
+    if stage_phase == DIdle then BIdle
+    else if batch_paused then BPaused
+    else BRunning
+
   map answer_kind =
     if answer_kind == DGroundedCards then GroundedCards
     else if answer_kind == DGroundedNotFound then GroundedNotFound
     else if answer_kind == DMissingPack then MissingPack
     else NoAnswer
 
-  action set_endpoint(h)            -> stutter
-  action batch_start(v)             -> stutter
-  action batch_build_fts_initial(v) -> publish_fts_pack(v)
-  action batch_build_fts_update(v)  -> stutter
-  action batch_pause()              -> stutter
-  action batch_resume()             -> stutter
-  action batch_embed_reuse(v)       -> stutter
-  action batch_embed_compute(v)     -> stutter
-  action batch_commit(v)            -> complete_pack(v)
-  action batch_abort()              -> stutter
-  action query_found()              -> query_found(Local)
-  action query_not_found()          -> query_not_found(Local)
+  action set_endpoint(h)                  -> stutter
+  action batch_start(v)                   -> start_batch(v)
+  action batch_build_fts_initial(v)       -> publish_fts_pack(v)
+  action batch_build_fts_update(v)        -> stutter
+  action batch_pause()                    -> pause_batch()
+  action batch_resume()                   -> resume_batch()
+  action batch_embed_chunk_reuse(v)       -> stutter
+  action batch_embed_chunk_compute(v)     -> stutter
+  action batch_commit_compute(v)          -> complete_batch_compute(v)
+  action batch_commit_reuse(v)            -> complete_batch_reuse(v)
+  action batch_abort()                    -> abort_batch()
+  action query_found(card_since, has_newer_feature) -> query_found(Local, card_since, has_newer_feature)
+  action query_not_found(has_newer_feature)         -> query_not_found(Local, has_newer_feature)
 }

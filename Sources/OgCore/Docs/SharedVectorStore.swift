@@ -38,15 +38,21 @@ public protocol DocsEmbedder: Sendable {
 }
 
 /// Loopback-only HTTP embedding client for local `llama-server` / OpenAI-compatible `/v1/embeddings` (FR-16, DES-1).
-/// Refuses non-loopback URLs at initialization (`NeverLeavesMachine`).
+/// Refuses non-loopback URLs at initialization (`NeverLeavesMachine`) and reuses a single URLSession (L-8).
 public final class LoopbackEmbeddingClient: DocsEmbedder, Sendable {
     public let endpoint: URL
     public let descriptor: EmbeddingModelDescriptor
+    private let session: URLSession
 
     public init?(endpoint: URL, descriptor: EmbeddingModelDescriptor) {
         guard LocalCompletionClient.isLoopback(endpoint) else { return nil }
         self.endpoint = endpoint
         self.descriptor = descriptor
+        self.session = URLSession(configuration: LocalCompletionClient.sessionConfiguration)
+    }
+
+    deinit {
+        session.finishTasksAndInvalidate()
     }
 
     public func embed(_ text: String) async throws -> [Float] {
@@ -56,8 +62,6 @@ public final class LoopbackEmbeddingClient: DocsEmbedder, Sendable {
         let body: [String: Any] = ["model": descriptor.id, "input": text]
         req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
 
-        let session = URLSession(configuration: LocalCompletionClient.sessionConfiguration)
-        defer { session.invalidateAndCancel() }
         let (data, response) = try await session.data(for: req)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             throw DocsStorageError.embeddingFailed("HTTP \(http.statusCode)")
@@ -78,6 +82,7 @@ public enum DocsStorageError: Error, LocalizedError, Sendable {
     case io(String)
     case embeddingFailed(String)
     case nonLoopbackEndpoint(String)
+    case batchAlreadyRunning(String)
 
     public var errorDescription: String? {
         switch self {
@@ -85,6 +90,7 @@ public enum DocsStorageError: Error, LocalizedError, Sendable {
         case .io(let msg): return "Storage I/O error: \(msg)"
         case .embeddingFailed(let msg): return "Embedding error: \(msg)"
         case .nonLoopbackEndpoint(let url): return "Refused non-loopback endpoint: \(url)"
+        case .batchAlreadyRunning(let ver): return "An ingestion batch for go\(ver) is already running."
         }
     }
 }
@@ -126,6 +132,7 @@ public actor SharedVectorStore {
             if let handle { sqlite3_close(handle) }
             throw DocsStorageError.sqlite(msg)
         }
+        sqlite3_busy_timeout(handle, 5000) // L-2
         self.box = SQLiteConnectionBox(handle)
         try Self.initializeSchema(db: handle)
     }
@@ -143,13 +150,7 @@ public actor SharedVectorStore {
             PRIMARY KEY (content_hash, model_id, model_version)
         );
         """
-        var errMsg: UnsafeMutablePointer<CChar>?
-        let rc = sqlite3_exec(db, sql, nil, nil, &errMsg)
-        if rc != SQLITE_OK {
-            let msg = errMsg.map { String(cString: $0) } ?? "schema error"
-            sqlite3_free(errMsg)
-            throw DocsStorageError.sqlite(msg)
-        }
+        try SQLiteHelpers.exec(db: db, sql: sql)
     }
 
     public func contains(_ key: SharedVectorKey) throws -> Bool {
@@ -163,7 +164,10 @@ public actor SharedVectorStore {
         SQLiteHelpers.bindText(stmt, index: 1, value: key.contentHash)
         SQLiteHelpers.bindText(stmt, index: 2, value: key.modelID)
         SQLiteHelpers.bindText(stmt, index: 3, value: key.modelVersion)
-        return sqlite3_step(stmt) == SQLITE_ROW
+        let rc = sqlite3_step(stmt)
+        if rc == SQLITE_ROW { return true }
+        if rc == SQLITE_DONE { return false }
+        throw DocsStorageError.sqlite(String(cString: sqlite3_errmsg(db))) // L-3
     }
 
     public func vector(for key: SharedVectorKey) throws -> [Float]? {
@@ -177,7 +181,11 @@ public actor SharedVectorStore {
         SQLiteHelpers.bindText(stmt, index: 1, value: key.contentHash)
         SQLiteHelpers.bindText(stmt, index: 2, value: key.modelID)
         SQLiteHelpers.bindText(stmt, index: 3, value: key.modelVersion)
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+        let rc = sqlite3_step(stmt)
+        if rc == SQLITE_DONE { return nil }
+        guard rc == SQLITE_ROW else {
+            throw DocsStorageError.sqlite(String(cString: sqlite3_errmsg(db))) // L-3
+        }
         let dim = Int(sqlite3_column_int(stmt, 0))
         guard let raw = sqlite3_column_blob(stmt, 1) else { return nil }
         let bytes = Int(sqlite3_column_bytes(stmt, 1))
@@ -219,11 +227,14 @@ public actor SharedVectorStore {
             throw DocsStorageError.sqlite(String(cString: sqlite3_errmsg(db)))
         }
         defer { sqlite3_finalize(stmt) }
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+        let rc = sqlite3_step(stmt)
+        guard rc == SQLITE_ROW else {
+            throw DocsStorageError.sqlite(String(cString: sqlite3_errmsg(db)))
+        }
         return Int(sqlite3_column_int64(stmt, 0))
     }
 
-    /// Removes vectors that are no longer referenced by any installed pack (FR-30 / FR-20).
+    /// Removes vectors that are no longer referenced by any active pack, staging checkpoint, or in-flight batch (FR-30, H-9).
     @discardableResult
     public func garbageCollect(referencedKeys: Set<SharedVectorKey>) throws -> Int {
         guard let db else { throw DocsStorageError.sqlite("database closed") }
@@ -265,12 +276,19 @@ public actor SharedVectorStore {
         }
         defer { sqlite3_finalize(stmt) }
         var keys: [SharedVectorKey] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            keys.append(SharedVectorKey(
-                contentHash: SQLiteHelpers.columnText(stmt, index: 0),
-                modelID: SQLiteHelpers.columnText(stmt, index: 1),
-                modelVersion: SQLiteHelpers.columnText(stmt, index: 2)
-            ))
+        while true {
+            let rc = sqlite3_step(stmt)
+            if rc == SQLITE_ROW {
+                keys.append(SharedVectorKey(
+                    contentHash: SQLiteHelpers.columnText(stmt, index: 0),
+                    modelID: SQLiteHelpers.columnText(stmt, index: 1),
+                    modelVersion: SQLiteHelpers.columnText(stmt, index: 2)
+                ))
+            } else if rc == SQLITE_DONE {
+                break
+            } else {
+                throw DocsStorageError.sqlite(String(cString: sqlite3_errmsg(db))) // L-3
+            }
         }
         return keys
     }

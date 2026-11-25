@@ -140,9 +140,37 @@ public struct DocsAnswer: Sendable, Hashable {
     }
 }
 
-/// Formats and validates a card snippet for insertion into a Go editor (UX-2, DOC-9).
+/// Formatted snippet ready for insertion, explicitly recording whether `gofmt` succeeded (L-11).
+public struct DocsPreparedSnippet: Sendable, Hashable {
+    public var code: String
+    public var formattedByGofmt: Bool
+
+    public init(code: String, formattedByGofmt: Bool) {
+        self.code = code
+        self.formattedByGofmt = formattedByGofmt
+    }
+}
+
+/// Formats and validates a card snippet for insertion into a Go editor (UX-2, DOC-9, M-3, L-11).
 public enum DocsCodeInserter {
-    /// Returns formatted Go code if the card is allowed for `targetVersion`, or `nil` if gated/empty.
+    /// Async preparation that runs `gofmt` off the caller/main thread so the UI never blocks (M-3).
+    public static func prepareSnippetAsync(
+        from card: DocsAnswerCard,
+        targetVersion: GoVersion,
+        locator: ToolLocator = .shared
+    ) async -> DocsPreparedSnippet? {
+        guard card.canInsert, let raw = card.example, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        guard GoVersionGate.evaluate(since: card.since, target: targetVersion) == .allowed else {
+            return nil
+        }
+        return await Task.detached(priority: .userInitiated) {
+            formatGoSnippetDetailed(raw, locator: locator)
+        }.value
+    }
+
+    /// Synchronous convenience helper (for unit tests and non-UI callers).
     public static func prepareSnippet(
         from card: DocsAnswerCard,
         targetVersion: GoVersion,
@@ -151,31 +179,33 @@ public enum DocsCodeInserter {
         guard card.canInsert, let raw = card.example, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return nil
         }
-        // Double-check version gate before insertion (DOC-9).
         guard GoVersionGate.evaluate(since: card.since, target: targetVersion) == .allowed else {
             return nil
         }
-        return formatGoSnippet(raw, locator: locator)
+        return formatGoSnippetDetailed(raw, locator: locator).code
     }
 
-    /// Runs `gofmt` if available on the machine; wraps statement snippets in a dummy function so `gofmt` accepts them.
-    public static func formatGoSnippet(_ snippet: String, locator: ToolLocator = .shared) -> String {
+    /// Runs `gofmt` if available; returns explicit `formattedByGofmt` status (L-11).
+    public static func formatGoSnippetDetailed(_ snippet: String, locator: ToolLocator = .shared) -> DocsPreparedSnippet {
         let trimmed = snippet.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "" }
+        guard !trimmed.isEmpty else { return DocsPreparedSnippet(code: "", formattedByGofmt: false) }
         guard let gofmt = locator.find("gofmt") else {
-            return normalizeIndentation(trimmed)
+            return DocsPreparedSnippet(code: normalizeIndentation(trimmed), formattedByGofmt: false)
         }
-        // If snippet looks like a full file or top-level declaration, format directly; else wrap in `func _()`.
         let isTopLevel = trimmed.hasPrefix("package ") || trimmed.hasPrefix("func ") || trimmed.hasPrefix("type ")
         if isTopLevel, let formatted = runGofmt(gofmt, input: trimmed, env: locator.environment) {
-            return formatted.trimmingCharacters(in: .newlines)
+            return DocsPreparedSnippet(code: formatted.trimmingCharacters(in: .newlines), formattedByGofmt: true)
         }
         let wrapped = "package _og\n\nfunc _() {\n" + trimmed + "\n}\n"
         if let formatted = runGofmt(gofmt, input: wrapped, env: locator.environment),
            let unwrapped = unwrapDummyFunc(formatted) {
-            return unwrapped
+            return DocsPreparedSnippet(code: unwrapped, formattedByGofmt: true)
         }
-        return normalizeIndentation(trimmed)
+        return DocsPreparedSnippet(code: normalizeIndentation(trimmed), formattedByGofmt: false)
+    }
+
+    public static func formatGoSnippet(_ snippet: String, locator: ToolLocator = .shared) -> String {
+        formatGoSnippetDetailed(snippet, locator: locator).code
     }
 
     private static func runGofmt(_ executable: String, input: String, env: [String: String]) -> String? {
@@ -187,6 +217,8 @@ public enum DocsCodeInserter {
         proc.standardInput = inPipe
         proc.standardOutput = outPipe
         proc.standardError = FileHandle.nullDevice
+        let sema = DispatchSemaphore(value: 0)
+        proc.terminationHandler = { _ in sema.signal() }
         do {
             try proc.run()
         } catch {
@@ -194,9 +226,10 @@ public enum DocsCodeInserter {
         }
         inPipe.fileHandleForWriting.write(Data(input.utf8))
         try? inPipe.fileHandleForWriting.close()
-        let deadline = Date().addingTimeInterval(2)
-        while proc.isRunning && Date() < deadline { usleep(10_000) }
-        if proc.isRunning { proc.terminate(); return nil }
+        if sema.wait(timeout: .now() + .seconds(2)) == .timedOut {
+            proc.terminate()
+            return nil
+        }
         guard proc.terminationStatus == 0 else { return nil }
         let data = outPipe.fileHandleForReading.readDataToEndOfFile()
         return String(data: data, encoding: .utf8)
@@ -233,10 +266,14 @@ public enum DocsCodeInserter {
 /// 1. Rule-based routing (`DocsQueryRouter`)
 /// 2. Target Go version resolution (FR-2) and exact-pack check (§7.4)
 /// 3. Deterministic -> FTS5 -> optional Semantic retrieval & merge (FR-9)
-/// 4. Strict version gating (FR-10) + max-3 card cap (UX-3)
+/// 4. Signal verification (anti-hallucination, M-1) + per-chunk `since` version gating (FR-10) + max-3 cap (UX-3)
 /// 5. Grounded card rendering with citations, Go version, and honest Not Found (FR-12..15)
 public actor ResearchService {
     public static let maxCards = 3
+    /// Minimum cosine similarity for semantic candidates (M-1).
+    public static let minimumSemanticSimilarity = 0.35
+    /// Threshold above which a semantic-only match without lexical overlap may pass (M-1).
+    public static let highConfidenceSemanticScore = 80.0
 
     public let packManager: DocsPackManager
     private var enabled: Bool
@@ -273,7 +310,7 @@ public actor ResearchService {
         queryEmbedder = embedder
     }
 
-    /// Executes the fixed offline retrieval pipeline (§7.3).
+    /// Executes the fixed offline retrieval pipeline (§7.3) with cancellation checkpoints (M-4).
     public func search(
         query rawQuery: String,
         projectRoot: URL? = nil,
@@ -281,6 +318,7 @@ public actor ResearchService {
         editorContext: DocsEditorContext? = nil,
         toolchainVersionProvider: (() -> GoVersion?)? = nil
     ) async throws -> DocsAnswer {
+        try Task.checkCancellation()
         let plan = DocsQueryRouter.route(rawQuery)
 
         // DOC-1: opt-in check
@@ -297,7 +335,6 @@ public actor ResearchService {
             )
         }
 
-        // Empty query returns a gentle prompt without fabricating results.
         guard !plan.originalQuery.isEmpty else {
             let msg = plan.language == .japanese
                 ? "調べたい内容（例: 「ファイルを1行ずつ読みたい」「for ループの書き方」「json.Encoder」）を入力してください。"
@@ -322,6 +359,7 @@ public actor ResearchService {
             resolved = ResolvedGoVersion(version: fallbackVer, source: .bundledDefault)
         }
 
+        try Task.checkCancellation()
         let targetVer = resolved.version
         let packKey = targetVer.minorKey
 
@@ -353,19 +391,36 @@ public actor ResearchService {
         defer { index.close() }
 
         // Step 3: Fixed hybrid candidate collection: deterministic -> FTS5 -> optional semantic (FR-9, §7.3).
-        var combined: [String: (chunk: DocsChunk, score: Double, origin: DocsMatchOrigin)] = [:]
+        struct Candidate {
+            var chunk: DocsChunk
+            var score: Double
+            var origin: DocsMatchOrigin
+            var lexicalMatched: Bool
+            var semanticRawScore: Double
+        }
+        var combined: [String: Candidate] = [:]
 
         func merge(_ hits: [DocsIndexHit], weight: Double) {
             for hit in hits {
                 let weighted = hit.score * weight
+                let isLexical = (hit.matchedBy == .deterministicExact || hit.matchedBy == .fts5)
+                let semRaw = hit.matchedBy == .semantic ? hit.score : 0.0
                 if var existing = combined[hit.chunk.stableID] {
                     existing.score += weighted
+                    existing.lexicalMatched = existing.lexicalMatched || isLexical
+                    existing.semanticRawScore = max(existing.semanticRawScore, semRaw)
                     if hit.matchedBy == .deterministicExact {
                         existing.origin = .deterministicExact
                     }
                     combined[hit.chunk.stableID] = existing
                 } else {
-                    combined[hit.chunk.stableID] = (hit.chunk, weighted, hit.matchedBy)
+                    combined[hit.chunk.stableID] = Candidate(
+                        chunk: hit.chunk,
+                        score: weighted,
+                        origin: hit.matchedBy,
+                        lexicalMatched: isLexical,
+                        semanticRawScore: semRaw
+                    )
                 }
             }
         }
@@ -376,11 +431,15 @@ public actor ResearchService {
             merge(detHits, weight: 2.0)
         }
 
+        try Task.checkCancellation()
+
         // 3b. SQLite FTS5 full-text search (FR-9b)
         if !plan.searchTerms.isEmpty {
             let ftsHits = try index.ftsSearch(terms: plan.searchTerms, limit: 15)
             merge(ftsHits, weight: 1.0)
         }
+
+        try Task.checkCancellation()
 
         // 3c. Optional semantic search ONLY when pack is Ready AND model matches (FR-27, FR-28, DOC-4)
         var searchMode: DocsSearchMode = .ftsOnly
@@ -389,24 +448,26 @@ public actor ResearchService {
            manifest.embeddingModelID == embedder.descriptor.id,
            manifest.embeddingModelVersion == embedder.descriptor.version {
             if let qVec = try? await embedder.embed(plan.originalQuery) {
+                try Task.checkCancellation()
                 let semHits = try await index.semanticSearch(
                     queryVector: qVec,
                     model: embedder.descriptor,
                     sharedStore: packManager.sharedVectorStore,
+                    minimumSimilarity: Self.minimumSemanticSimilarity,
                     limit: 10
                 )
-                merge(semHits, weight: 1.2)
+                // Balanced weight so semantic assists recall without swamping deterministic/FTS precision (M-1).
+                merge(semHits, weight: 0.4)
                 searchMode = .hybridSemantic
             }
         }
 
-        // Step 3d: Anti-hallucination / stop-word signal filter (FR-14).
-        // When there are meaningful signal terms, require at least one signal match (unless matched semantically).
+        // Step 3d: Anti-hallucination signal verification (FR-14, M-1).
+        // Applies to BOTH FTS and semantic hits so low-similarity semantic hits cannot fabricate "Yes, it exists".
         let candidates = combined.values.filter { entry in
-            if entry.origin == .deterministicExact || entry.origin == .semantic {
+            if entry.origin == .deterministicExact {
                 return true
             }
-            guard !plan.requiredSignalTerms.isEmpty else { return false }
             let hay = (
                 entry.chunk.title + " " +
                 entry.chunk.packageName + " " +
@@ -415,7 +476,19 @@ public actor ResearchService {
                 entry.chunk.body + " " +
                 entry.chunk.searchAliases.joined(separator: " ")
             ).lowercased()
-            return plan.requiredSignalTerms.contains { hay.contains($0) }
+            let hasSignalOverlap = !plan.requiredSignalTerms.isEmpty && plan.requiredSignalTerms.contains { hay.contains($0) }
+
+            if entry.origin == .semantic && !entry.lexicalMatched {
+                // M-1: semantic-only candidate requires either signal overlap OR very high similarity (>= 0.80)
+                // AND must not bypass explicit non-matching existence checks when required signals exist.
+                if plan.intent == .existenceCheck {
+                    return hasSignalOverlap
+                }
+                return hasSignalOverlap || entry.semanticRawScore >= Self.highConfidenceSemanticScore
+            }
+
+            guard !plan.requiredSignalTerms.isEmpty else { return false }
+            return hasSignalOverlap
         }
 
         // Step 4: Version gating BEFORE final ranking (FR-10, UC-1).
@@ -426,13 +499,16 @@ public actor ResearchService {
             switch GoVersionGate.evaluate(since: entry.chunk.since, target: targetVer) {
             case .allowed:
                 var adjusted = entry.score
-                // Intent-aware source affinity (UC-1 favors spec + guide; UC-2/UC-3 favor stdlib).
                 switch plan.intent {
                 case .syntaxHowTo:
                     if entry.chunk.source == .spec { adjusted += 18.0 }
                     else if entry.chunk.source == .guide { adjusted += 14.0 }
                 case .exactSymbol, .existenceCheck, .needsReverseLookup:
                     if entry.chunk.source == .stdlib { adjusted += 10.0 }
+                    // Prefer concrete symbols (func/type/method/const/var) over broad package overviews in reverse lookup.
+                    if plan.intent == .needsReverseLookup && entry.chunk.kind != .package {
+                        adjusted += 3.0
+                    }
                 case .releaseSince:
                     if entry.chunk.source == .release { adjusted += 20.0 }
                 case .idiomOrWhy:

@@ -2,8 +2,10 @@ import AppKit
 import OgCore
 
 extension Notification.Name {
-    /// Offline Go Docs settings, installed packs, or ingestion batch progress changed.
+    /// Offline Go Docs opt-in toggle or installed pack inventory changed (triggers DocsPanel refresh/requery).
     static let ogDocsChanged = Notification.Name("og.docsChanged")
+    /// Ingestion batch progress or batch scheduling policy changed (status UI only; never retriggers search, M-4).
+    static let ogDocsBatchProgressChanged = Notification.Name("og.docsBatchProgressChanged")
 }
 
 /// App-level coordinator for offline Go documentation lookup and pack management (FR-19..29, DOC-1..9).
@@ -17,7 +19,10 @@ final class DocsManager {
     private(set) var installedPacks: [DocsPackManifest] = []
     private(set) var activeProgress: DocsBatchProgress?
     private(set) var lastError: String?
+    private(set) var detectedToolchainVersion: GoVersion?
     private var batchTasks: [String: Task<Void, Never>] = [:]
+    /// In-memory override for headless tests so `DebugDriver` never mutates UserDefaults opt-in (M-6).
+    var debugEnabledOverride: Bool?
 
     private init() {
         do {
@@ -30,9 +35,20 @@ final class DocsManager {
             self.service = nil
             self.lastError = error.localizedDescription
         }
+        Task.detached(priority: .utility) {
+            let ver = GoVersionResolver.detectInstalledToolchainVersion()
+            await MainActor.run {
+                DocsManager.shared.setDetectedToolchainVersion(ver)
+            }
+        }
         Task { [weak self] in
             await self?.refreshPacks()
         }
+    }
+
+    private func setDetectedToolchainVersion(_ ver: GoVersion?) {
+        detectedToolchainVersion = ver
+        notifyProgressChanged()
     }
 
     // MARK: - Opt-in Settings (FR-19, FR-24)
@@ -42,8 +58,9 @@ final class DocsManager {
     }
 
     var enabled: Bool {
-        get { Self.storedEnabled }
+        get { debugEnabledOverride ?? Self.storedEnabled }
         set {
+            debugEnabledOverride = nil
             UserDefaults.standard.set(newValue, forKey: "og.docs.enabled")
             let svc = service
             Task { [weak self] in
@@ -51,7 +68,7 @@ final class DocsManager {
                 if newValue {
                     await self?.ensureDefaultPackIfNeeded()
                 }
-                self?.notify()
+                self?.notifyPacksChanged()
             }
         }
     }
@@ -64,7 +81,7 @@ final class DocsManager {
         }
         set {
             UserDefaults.standard.set(newValue.rawValue, forKey: "og.docs.batchPolicy")
-            notify()
+            notifyProgressChanged()
         }
     }
 
@@ -81,12 +98,12 @@ final class DocsManager {
         batchTasks.removeAll()
     }
 
-    // MARK: - Pack inventory & ingestion batches (FR-20, FR-22..29)
+    // MARK: - Pack inventory & ingestion batches (FR-20, FR-22..29, M-5)
 
     func refreshPacks() async {
         guard let pm = packManager else { return }
         installedPacks = await pm.installedPacks()
-        notify()
+        notifyPacksChanged()
     }
 
     func ensureDefaultPackIfNeeded() async {
@@ -96,7 +113,7 @@ final class DocsManager {
         if packs.isEmpty {
             startBundledPackIngestion(goVersion: BundledGoCorpus.defaultVersion)
         } else {
-            notify()
+            notifyPacksChanged()
         }
     }
 
@@ -107,21 +124,24 @@ final class DocsManager {
     }
 
     /// Extracts standard library chunks from a local GOROOT `src/` directory and runs the staged batch (FR-4-1).
+    /// M-5: Real GOROOT GoDoc takes precedence over bundled stdlib excerpts so citations match actual official GoDoc;
+    /// bundled spec/guide/release chunks complement the extracted stdlib.
     func startGorootIngestion(goroot: URL, goVersion: String) {
         let srcURL = goroot.appendingPathComponent("src", isDirectory: true)
         guard let pm = packManager else { return }
         batchTasks[goVersion]?.cancel()
         lastError = nil
         activeProgress = DocsBatchProgress(goVersion: goVersion, phase: .extracting)
-        notify()
+        notifyProgressChanged()
 
         batchTasks[goVersion] = Task.detached(priority: .utility) {
-            var chunks = BundledGoCorpus.chunks(forGoVersion: goVersion)
             let stdlib = DocsCorpusExtractor.extractStdlib(fromGorootSrc: srcURL, goVersion: goVersion)
-            let existingIDs = Set(chunks.map(\.stableID))
-            chunks.append(contentsOf: stdlib.filter { !existingIDs.contains($0.stableID) })
+            let extractedIDs = Set(stdlib.map(\.stableID))
+            let bundled = BundledGoCorpus.chunks(forGoVersion: goVersion)
+            // Keep real stdlib first; add non-stdlib (spec/guide/release) and any stdlib not covered by GOROOT.
+            let combined = stdlib + bundled.filter { $0.source != .stdlib || !extractedIDs.contains($0.stableID) }
             do {
-                _ = try await pm.ingest(goVersion: goVersion, chunks: chunks, embedder: nil) { progress in
+                _ = try await pm.ingest(goVersion: goVersion, chunks: combined, embedder: nil) { progress in
                     Task { @MainActor in
                         DocsManager.shared.handleBatchProgress(progress)
                     }
@@ -145,7 +165,7 @@ final class DocsManager {
             totalChunks: est.chunkCount,
             estimatedBytes: est.estimatedBytes
         )
-        notify()
+        notifyProgressChanged()
 
         // FR-24: run at background `.utility` priority so typing & completion are never blocked.
         batchTasks[goVersion] = Task.detached(priority: .utility) {
@@ -164,7 +184,7 @@ final class DocsManager {
 
     private func handleBatchProgress(_ progress: DocsBatchProgress) {
         activeProgress = progress
-        notify()
+        notifyProgressChanged()
     }
 
     func cancelActiveBatch() {
@@ -185,7 +205,7 @@ final class DocsManager {
             totalChunks: progress.totalChunks,
             estimatedBytes: progress.estimatedBytes
         )
-        notify()
+        notifyProgressChanged()
     }
 
     func deletePack(goVersion: String) {
@@ -235,6 +255,14 @@ final class DocsManager {
                 explicitVersionOverride: explicitVersion,
                 editorContext: editorContext
             )
+        } catch is CancellationError {
+            return DocsAnswer(
+                query: query,
+                status: .notFound,
+                language: DocsLanguage.detect(in: query),
+                intent: .needsReverseLookup,
+                conclusion: ""
+            )
         } catch {
             return DocsAnswer(
                 query: query,
@@ -252,7 +280,11 @@ final class DocsManager {
         await refreshPacks()
     }
 
-    private func notify() {
+    private func notifyPacksChanged() {
         NotificationCenter.default.post(name: .ogDocsChanged, object: self)
+    }
+
+    private func notifyProgressChanged() {
+        NotificationCenter.default.post(name: .ogDocsBatchProgressChanged, object: self)
     }
 }

@@ -276,19 +276,80 @@ final class CountingFakeEmbedder: DocsEmbedder, @unchecked Sendable {
     }
 }
 
+/// Embedder that throws on demand to test error propagation and `.failed` progress emission (M-16).
+final class FailingFakeEmbedder: DocsEmbedder, @unchecked Sendable {
+    let descriptor = EmbeddingModelDescriptor(id: "fail-embed", version: "v1")
+    func embed(_ text: String) async throws -> [Float] {
+        throw DocsStorageError.embeddingFailed("injected embedder failure")
+    }
+}
+
+/// Embedder that pauses briefly so concurrent re-entry and GC safety tests can overlap (H-8, H-9).
+final class SlowFakeEmbedder: DocsEmbedder, @unchecked Sendable {
+    let descriptor: EmbeddingModelDescriptor
+    let delayNs: UInt64
+    init(id: String = "slow-embed", version: String = "v1", delayNs: UInt64 = 30_000_000) {
+        self.descriptor = EmbeddingModelDescriptor(id: id, version: version)
+        self.delayNs = delayNs
+    }
+    func embed(_ text: String) async throws -> [Float] {
+        try await Task.sleep(nanoseconds: delayNs)
+        var v = Array(repeating: Float(0), count: 8)
+        for (idx, b) in text.utf8.enumerated() { v[idx % 8] += Float(b) / 255.0 }
+        let norm = sqrt(v.reduce(0) { $0 + $1 * $1 })
+        if norm > 0 { v = v.map { $0 / norm } }
+        return v
+    }
+}
+
+/// Deterministic keyword-aware embedder for verifying real semantic retrieval and M-1 anti-hallucination gating.
+final class SemanticTopicEmbedder: DocsEmbedder, @unchecked Sendable {
+    let descriptor: EmbeddingModelDescriptor
+    init(id: String = "topic-embed", version: String = "v1") {
+        self.descriptor = EmbeddingModelDescriptor(id: id, version: version)
+    }
+    func embed(_ text: String) async throws -> [Float] {
+        let lower = text.lowercased()
+        // 4 orthogonal topic dimensions: [bufio/line, json, timeout, regexp] + [noise]
+        var v: [Float] = [0.0, 0.0, 0.0, 0.0, 0.01]
+        if lower.contains("scanner") || lower.contains("bufio") || lower.contains("line") || lower.contains("行") { v[0] = 1.0 }
+        if lower.contains("json") || lower.contains("marshal") || lower.contains("encoder") || lower.contains("indent") { v[1] = 1.0 }
+        if lower.contains("timeout") || lower.contains("context") || lower.contains("deadline") || lower.contains("タイムアウト") { v[2] = 1.0 }
+        if lower.contains("regexp") || lower.contains("regex") || lower.contains("正規表現") { v[3] = 1.0 }
+        let norm = sqrt(v.reduce(0) { $0 + $1 * $1 })
+        return norm > 0 ? v.map { $0 / norm } : v
+    }
+}
+
 func makeDocsPackManager(in dir: TempDir) throws -> DocsPackManager {
     try DocsPackManager(rootDirectory: dir.subdir("docs-packs"))
 }
 
-func appendURLPath(_ base: URL, _ component: String) -> URL {
-    base.appendingPathComponent(component)
-}
-
-func countLines(_ text: String) -> Int {
-    text.components(separatedBy: "\n").count
+func reopenDocsPackManager(at rootURL: URL) throws -> DocsPackManager {
+    try DocsPackManager(rootDirectory: rootURL)
 }
 
 func stringContains(_ haystack: String, _ needle: String) -> Bool {
     haystack.contains(needle)
 }
+
+func recordProgress(_ box: ProgressRecorder, _ progress: DocsBatchProgress) {
+    box.append(progress)
+}
+
+final class ProgressRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var items: [DocsBatchProgress] = []
+    func append(_ p: DocsBatchProgress) {
+        lock.lock()
+        items.append(p)
+        lock.unlock()
+    }
+    var phases: [DocsBatchPhase] {
+        lock.lock()
+        defer { lock.unlock() }
+        return items.map(\.phase)
+    }
+}
+
 

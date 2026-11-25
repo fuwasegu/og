@@ -34,12 +34,17 @@ public enum DocsChunkKind: String, Sendable, Hashable, Codable, CaseIterable {
 
 /// One indexed documentation chunk with version-independent stable ID and content hash (FR-7, FR-8, FR-31).
 public struct DocsChunk: Sendable, Hashable, Codable {
-    /// Version-independent deterministic ID (FR-31): derived from source + package + symbol + kind + anchor.
+    /// Version-independent deterministic ID (FR-31, H-6): derived from
+    /// `source + docScope(package or documentID) + symbol + kind + anchor`.
     public var stableID: String
     /// Pack Go version (minor key, e.g. `"1.23"` or `"1.21"`).
     public var goVersion: String
     public var source: DocsSourceKind
+    /// For stdlib: Go import path (e.g. `"encoding/json"`). For guides/spec: empty.
     public var packageName: String
+    /// Document identity for non-stdlib sources (e.g. `"go_spec"`, `"effective_go"`, `"tutorial"`) to prevent
+    /// cross-document heading collisions (H-6). Defaults to `packageName` for stdlib.
+    public var documentID: String
     public var symbol: String
     public var kind: DocsChunkKind
     public var title: String
@@ -49,21 +54,22 @@ public struct DocsChunk: Sendable, Hashable, Codable {
     public var since: String?
     /// Concise summary (used for card excerpt when no LLM is running, FR-15).
     public var summary: String
-    /// Optional Go syntax/type/function signature.
+    /// Optional Go syntax/type/function/const/var signature.
     public var signature: String?
     /// Optional minimal runnable/compilable Go snippet (Example-based, UX-1 / UX-2).
     public var example: String?
     /// Full body text used for FTS5 indexing and embedding.
     public var body: String
-    /// Optional multilingual search cues (e.g. Japanese intent phrases) for offline FTS5 cross-lingual recall.
+    /// General multilingual search concepts (no test-query hardcoding; H-2).
     public var searchAliases: [String]
-    /// Deterministic SHA-256 hash of semantic content (FR-25, FR-30, FR-31).
+    /// Deterministic SHA-256 hash of all semantic & embedding inputs (FR-25, FR-30, FR-31, M-8).
     public var contentHash: String
 
     public init(
         goVersion: String,
         source: DocsSourceKind,
         packageName: String,
+        documentID: String? = nil,
         symbol: String,
         kind: DocsChunkKind,
         title: String,
@@ -75,8 +81,10 @@ public struct DocsChunk: Sendable, Hashable, Codable {
         body: String,
         searchAliases: [String] = []
     ) {
+        let resolvedDocID = documentID ?? (packageName.isEmpty ? source.rawValue : packageName)
         self.stableID = Self.makeStableID(
             source: source,
+            documentID: resolvedDocID,
             packageName: packageName,
             symbol: symbol,
             kind: kind,
@@ -85,6 +93,7 @@ public struct DocsChunk: Sendable, Hashable, Codable {
         self.goVersion = goVersion
         self.source = source
         self.packageName = packageName
+        self.documentID = resolvedDocID
         self.symbol = symbol
         self.kind = kind
         self.title = title
@@ -99,41 +108,88 @@ public struct DocsChunk: Sendable, Hashable, Codable {
             stableID: self.stableID,
             title: title,
             signature: signature,
+            summary: summary,
             example: example,
             body: body,
+            searchAliases: searchAliases,
             since: since
         )
     }
 
-    /// FR-31: deterministic, version-independent ID.
+    /// Restores a persisted chunk directly from SQLite without recomputing SHA-256 (H-7).
+    public init(
+        restoredStableID: String,
+        goVersion: String,
+        source: DocsSourceKind,
+        packageName: String,
+        documentID: String,
+        symbol: String,
+        kind: DocsChunkKind,
+        title: String,
+        anchor: String,
+        since: String?,
+        summary: String,
+        signature: String?,
+        example: String?,
+        body: String,
+        searchAliases: [String],
+        storedContentHash: String
+    ) {
+        self.stableID = restoredStableID
+        self.goVersion = goVersion
+        self.source = source
+        self.packageName = packageName
+        self.documentID = documentID
+        self.symbol = symbol
+        self.kind = kind
+        self.title = title
+        self.anchor = anchor
+        self.since = since
+        self.summary = summary
+        self.signature = signature
+        self.example = example
+        self.body = body
+        self.searchAliases = searchAliases
+        self.contentHash = storedContentHash
+    }
+
+    /// FR-31 & H-6: deterministic, version-independent ID including document identity.
     public static func makeStableID(
         source: DocsSourceKind,
+        documentID: String = "",
         packageName: String,
         symbol: String,
         kind: DocsChunkKind,
         anchor: String
     ) -> String {
-        let components = [source.rawValue, packageName, symbol, kind.rawValue, anchor]
+        let scope = !documentID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? documentID
+            : packageName
+        let components = [source.rawValue, scope, packageName, symbol, kind.rawValue, anchor]
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
         return components.joined(separator: "::")
     }
 
-    /// SHA-256 hex digest of chunk content, independent of `goVersion` so identical chunks
-    /// across Go versions share one vector in `SharedVectorStore` (FR-30).
+    /// SHA-256 hex digest covering every field included in `embeddingText` plus `since`/`example` (M-8),
+    /// independent of `goVersion` so identical chunks across Go versions share one vector (FR-30).
     public static func computeContentHash(
         stableID: String,
         title: String,
         signature: String?,
+        summary: String,
         example: String?,
         body: String,
+        searchAliases: [String],
         since: String?
     ) -> String {
         let payload = [
             stableID,
             title,
             signature ?? "",
+            summary,
             example ?? "",
             body,
+            searchAliases.joined(separator: "\u{1E}"),
             since ?? ""
         ].joined(separator: "\u{1F}")
         let digest = SHA256.hash(data: Data(payload.utf8))
@@ -152,7 +208,7 @@ public struct DocsChunk: Sendable, Hashable, Codable {
         }
     }
 
-    /// Full text concatenated for embedding computation.
+    /// Full text concatenated for embedding computation (inputs match `computeContentHash`, M-8).
     public var embeddingText: String {
         var parts = [title]
         if !packageName.isEmpty || !symbol.isEmpty {
@@ -174,6 +230,8 @@ public enum DocsPackStatus: String, Sendable, Hashable, Codable {
 
 /// Metadata stored alongside a documentation pack (FR-5, FR-20, Q-4).
 public struct DocsPackManifest: Sendable, Hashable, Codable {
+    public static let currentSchemaVersion = 2
+
     public var goVersion: String
     public var createdAt: String
     public var license: String
@@ -182,6 +240,7 @@ public struct DocsPackManifest: Sendable, Hashable, Codable {
     public var embeddingModelID: String?
     public var embeddingModelVersion: String?
     public var sizeBytes: Int64
+    public var schemaVersion: Int
 
     public init(
         goVersion: String,
@@ -191,7 +250,8 @@ public struct DocsPackManifest: Sendable, Hashable, Codable {
         status: DocsPackStatus,
         embeddingModelID: String? = nil,
         embeddingModelVersion: String? = nil,
-        sizeBytes: Int64 = 0
+        sizeBytes: Int64 = 0,
+        schemaVersion: Int = DocsPackManifest.currentSchemaVersion
     ) {
         self.goVersion = goVersion
         self.createdAt = createdAt
@@ -201,6 +261,20 @@ public struct DocsPackManifest: Sendable, Hashable, Codable {
         self.embeddingModelID = embeddingModelID
         self.embeddingModelVersion = embeddingModelVersion
         self.sizeBytes = sizeBytes
+        self.schemaVersion = schemaVersion
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        goVersion = try c.decode(String.self, forKey: .goVersion)
+        createdAt = try c.decode(String.self, forKey: .createdAt)
+        license = try c.decodeIfPresent(String.self, forKey: .license) ?? DocsLicense.goBSD3Clause
+        chunkCount = try c.decode(Int.self, forKey: .chunkCount)
+        status = try c.decode(DocsPackStatus.self, forKey: .status)
+        embeddingModelID = try c.decodeIfPresent(String.self, forKey: .embeddingModelID)
+        embeddingModelVersion = try c.decodeIfPresent(String.self, forKey: .embeddingModelVersion)
+        sizeBytes = try c.decodeIfPresent(Int64.self, forKey: .sizeBytes) ?? 0
+        schemaVersion = try c.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
     }
 }
 
