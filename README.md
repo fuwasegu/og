@@ -180,4 +180,8 @@ make spec    # FSL 仕様の検証
 make app     # build/og.app を作る
 ```
 
+```sh
+make eval-docs-phase2  # ローカル GOROOT/src に対して Phase 2 実モデル評価を実行
+```
+
 `VERSION` を更新して `v*` タグを push すると、GitHub Actions がビルド、署名、Release の公開、Homebrew Cask の更新まで行います。

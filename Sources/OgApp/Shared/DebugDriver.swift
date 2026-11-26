@@ -18,8 +18,9 @@ import OgCore
 ///     completions                  request completion at the caret and print the listed labels
 ///     accept [label]               accept the listed completion whose label contains `label`
 ///     docs <query>                 search offline Go Docs and print summary
-///     docsserver [status|on|off|restart|pid]  control/inspect the Phase 2 Docs MLX server
+///     docsserver [status|on|off|restart|wait [sec]|pid]  control/inspect the Phase 2 Docs MLX server
 ///     docsreembed <ver>            re-embed an installed Go docs pack in place
+///     docsexport <ver> <out.json>  export an installed Go docs pack's chunks to JSON for evaluation
 ///     quit
 @MainActor
 enum DebugDriver {
@@ -391,9 +392,10 @@ enum DebugDriver {
             let ok = await dp.debugInsertFirstCard()
             print("docsinsert: \(ok)")
         case "docsserver":
-            // docsserver [status|on|off|restart|pid]: inspect or control the Phase 2 Docs MLX server (W-10).
+            // docsserver [status|on|off|restart|wait [sec]|pid]: inspect or control the Phase 2 Docs MLX server (W-10).
             let ds = DocsServerManager.shared
-            switch arg.trimmingCharacters(in: .whitespaces) {
+            let dsParts = arg.split(separator: " ", maxSplits: 1).map(String.init)
+            switch dsParts.first ?? "" {
             case "on":
                 if !DocsManager.shared.enabled { DocsManager.shared.debugEnabledOverride = true }
                 ds.enabled = true
@@ -401,6 +403,15 @@ enum DebugDriver {
                 ds.enabled = false
             case "restart":
                 ds.restart()
+            case "wait":
+                let limit = Double(dsParts.count > 1 ? dsParts[1] : "") ?? 60
+                let deadline = Date().addingTimeInterval(limit)
+                while Date() < deadline {
+                    if case .ready = ds.phase { break }
+                    if case .failed = ds.phase { break }
+                    if case .off = ds.phase { break }
+                    try? await Task.sleep(nanoseconds: 250_000_000)
+                }
             case "pid":
                 print("docsserver pids: \(ds.debugPIDs)")
             default:
@@ -412,6 +423,21 @@ enum DebugDriver {
             let ver = GoVersion(parsing: arg)?.minorKey ?? BundledGoCorpus.defaultVersion
             DocsManager.shared.startReembedPack(goVersion: ver)
             print("docsreembed: requested go\(ver) phase=\(DocsManager.shared.activeProgress?.phase.rawValue ?? "none") err=\(DocsManager.shared.lastError ?? "none")")
+        case "docsexport":
+            // docsexport <ver> <out.json>: export an installed Go docs pack's chunks to JSON for scripts/eval-docs-phase2.py (V-7).
+            let expParts = arg.split(separator: " ", maxSplits: 1).map(String.init)
+            guard expParts.count == 2, let pm = DocsManager.shared.packManager else {
+                print("docsexport: usage: docsexport <ver> <out.json>")
+                break
+            }
+            let ver = GoVersion(parsing: expParts[0])?.minorKey ?? expParts[0]
+            let outURL = URL(fileURLWithPath: expParts[1])
+            do {
+                let count = try await pm.exportChunksJSON(forGoVersion: ver, to: outURL)
+                print("docsexport: exported \(count) chunks from go\(ver) to \(outURL.path)")
+            } catch {
+                print("docsexport: error \(error.localizedDescription)")
+            }
         case "log":
             print(arg)
         case "dump":

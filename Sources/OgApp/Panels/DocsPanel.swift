@@ -614,7 +614,7 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
     func debugSummary() -> String {
         guard let a = lastAnswer else { return "none" }
         let titles = a.cards.map { "\($0.citation)[go\($0.goVersion)]" }.joined(separator: " | ")
-        return "status=\(a.status) cards=\(a.cards.count) newer=\(a.newerVersionNotes.count) [\(titles)]"
+        return "status=\(a.status) mode=\(a.searchMode.rawValue) rerank=\(a.usedReranker) cards=\(a.cards.count) newer=\(a.newerVersionNotes.count) [\(titles)]"
     }
 }
 

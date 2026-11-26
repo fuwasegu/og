@@ -760,6 +760,75 @@ public actor DocsPackManager {
         return try await ingest(goVersion: goVersion, chunks: chunks, embedder: embedder, onProgress: onProgress)
     }
 
+    /// JSON payload exported for reproducible offline Phase 2 evaluation (`scripts/eval-docs-phase2.py`, V-7).
+    public struct ExportedEvalChunk: Codable, Sendable, Hashable {
+        public var stable_id: String
+        public var title: String
+        public var package_name: String
+        public var symbol: String
+        public var source: String
+        public var provenance: String
+        public var content_hash: String
+        public var text: String
+        public var rerank_text: String
+
+        public init(from chunk: DocsChunk) {
+            self.stable_id = chunk.stableID
+            self.title = chunk.title
+            self.package_name = chunk.packageName
+            self.symbol = chunk.symbol
+            self.source = chunk.source.rawValue
+            self.provenance = chunk.provenance.rawValue
+            self.content_hash = chunk.contentHash
+            self.text = chunk.embeddingText
+            self.rerank_text = chunk.rerankDocumentText
+        }
+    }
+
+    /// Exports all chunks from an installed documentation pack to JSON for `scripts/eval-docs-phase2.py` (V-7).
+    @discardableResult
+    public func exportChunksJSON(forGoVersion goVersion: String, to destinationURL: URL) throws -> Int {
+        guard let index = try openIndex(for: goVersion) else {
+            throw DocsStorageError.io("No installed pack for go\(goVersion)")
+        }
+        defer { index.close() }
+        let chunks = try index.allChunks()
+        return try Self.writeExportedChunksJSON(chunks, to: destinationURL)
+    }
+
+    /// Extracts real stdlib chunks from a local `GOROOT/src` directory and writes them as JSON for evaluation (V-7).
+    @discardableResult
+    public static func exportGorootChunksJSON(
+        fromGorootSrc srcURL: URL,
+        goVersion: String,
+        includeBundledComplement: Bool = true,
+        to destinationURL: URL
+    ) throws -> Int {
+        let stdlib = DocsCorpusExtractor.extractStdlib(fromGorootSrc: srcURL, goVersion: goVersion)
+        let chunks: [DocsChunk]
+        if includeBundledComplement {
+            let extractedIDs = Set(stdlib.map(\.stableID))
+            let bundled = BundledGoCorpus.chunks(forGoVersion: goVersion)
+            chunks = stdlib + bundled.filter { $0.source != .stdlib || !extractedIDs.contains($0.stableID) }
+        } else {
+            chunks = stdlib
+        }
+        return try writeExportedChunksJSON(chunks, to: destinationURL)
+    }
+
+    private static func writeExportedChunksJSON(_ chunks: [DocsChunk], to destinationURL: URL) throws -> Int {
+        try FileManager.default.createDirectory(
+            at: destinationURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let exported = chunks.map(ExportedEvalChunk.init(from:))
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(exported)
+        try data.write(to: destinationURL, options: .atomic)
+        return exported.count
+    }
+
     private func computeBatchVectors(_ texts: [String], with embedder: any DocsEmbedder) async throws -> [[Float]] {
         if texts.count == 1 {
             return [try await embedder.embed(texts[0])]

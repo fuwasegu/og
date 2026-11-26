@@ -1172,6 +1172,44 @@ struct DocsPhase2Tests {
         }
         let fbTimeout = try await svc.search(query: "ファイルを1行ずつ読みたい", projectRoot: proj.url)
         #expect(fbTimeout.status == .found && !fbTimeout.usedReranker && fbTimeout.cards.first?.symbol == "Scanner")
+
+        // 4. Embedder HTTP 500 & timeout fallback: Ready pack degrades cleanly to Phase 1 FTS5 without failing search
+        server.setHandler { method, path, body in
+            if method == "POST" && path == "/v1/embeddings" {
+                let count = stringContains(body, "[\"") ? max(1, body.split(separator: "\",").count) : 1
+                let items = (0..<count).map { #"{"index":\#($0),"embedding":[1.0,0.0]}"# }.joined(separator: ",")
+                return LocalMockHTTPResponse(statusCode: 200, bodyString: #"{"data":[\#(items)]}"#)
+            }
+            return LocalMockHTTPResponse(statusCode: 404, statusText: "Not Found", bodyString: "{}")
+        }
+        let shortEmbedClient = try #require(LoopbackEmbeddingClient(endpoint: server.baseURL, descriptor: desc, timeoutInterval: 0.4))
+        let readySubset = Array(BundledGoCorpus.chunks(forGoVersion: "1.23").prefix(12))
+        let readyRep = try await mgr.ingest(goVersion: "1.23", chunks: readySubset, embedder: shortEmbedClient)
+        #expect(readyRep.status == .ready)
+        await svc.setReranker(nil)
+        await svc.setEmbedder(shortEmbedClient)
+
+        // 4a. /v1/embeddings HTTP 500 -> falls back to .ftsOnly
+        server.setHandler { _, _, _ in
+            LocalMockHTTPResponse(statusCode: 500, statusText: "Internal Server Error", bodyString: #"{"error":"embed failed"}"#)
+        }
+        let embFb500 = try await svc.search(query: "ファイルを1行ずつ読みたい", projectRoot: proj.url)
+        #expect(embFb500.status == .found && embFb500.searchMode == .ftsOnly && embFb500.cards.first?.symbol == "Scanner")
+
+        // 4b. /v1/embeddings timeout (1.0s > 0.4s) -> falls back to .ftsOnly
+        server.setHandler { _, _, _ in
+            LocalMockHTTPResponse(statusCode: 200, bodyString: #"{"data":[{"index":0,"embedding":[1.0,0.0]}]}"#, delaySeconds: 1.0)
+        }
+        let embFbTimeout = try await svc.search(query: "ファイルを1行ずつ読みたい", projectRoot: proj.url)
+        #expect(embFbTimeout.status == .found && embFbTimeout.searchMode == .ftsOnly && embFbTimeout.cards.first?.symbol == "Scanner")
+
+        // 5. V-7: exportChunksJSON exports installed pack chunks for scripts/eval-docs-phase2.py
+        let exportURL = dir.url.appendingPathComponent("exported-chunks.json")
+        let exportedCount = try await mgr.exportChunksJSON(forGoVersion: "1.23", to: exportURL)
+        #expect(exportedCount == readySubset.count)
+        #expect(pathExists(exportURL))
+        let exportedText = readFile(exportURL) ?? ""
+        #expect(stringContains(exportedText, "stable_id") && stringContains(exportedText, "rerank_text"))
     }
 
     @Test("Vector store SQLite failure falls back cleanly to Phase 1 FTS instead of crashing search (V-4)")

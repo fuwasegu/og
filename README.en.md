@@ -70,4 +70,5 @@ Specs live in `spec/` (FSL, verified with `fslc`). See `spec/README.md` and `AGE
 make check
 make spec
 make app
+make eval-docs-phase2  # evaluate Phase 2 MLX embedder + reranker against local GOROOT/src
 ```
