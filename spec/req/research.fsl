@@ -22,15 +22,18 @@
 //   DOC-8: Search works offline without an LLM (FTS5 + deterministic excerpts) (FR-15, FR-28).
 //   DOC-9: Code insertion into the editor is allowed only for grounded, version-gated cards
 //          matching the current project version (UX-2).
+//   DOC-10: Phase 2 two-stage retrieval (union of deterministic + FTS5 + semantic candidates
+//           followed by optional local cross-encoder reranking). Reranking runs strictly on
+//           loopback when available, preserves pack/`since` version gating and honest Not Found,
+//           and falls back seamlessly to Phase 1 (FTS5 / unranked) when unavailable (Issue #21, FR-11).
 //
 // ASSUME-1 (representation only): two Go versions (0 = older e.g. 1.21, 1 = newer e.g. 1.23)
 //   and two embedding models are sufficient to expose pack-level, chunk-`since`, and model bugs.
-// ASSUME-2 (confirmed 2026-11-26): Research is specified independently of ModelServer (which
-//   governs the inline completion server); both share D-9 (og-owned loopback servers only).
-//   Phase 1 runs completely offline without a generation/embedding server, using a temporary
-//   data-driven concept dictionary for Japanese-to-English FTS5 expansion until Phase 2
-//   cross-lingual embeddings replace/augment it. Phase 2 will add server lifecycle supervision
-//   for research models under the same D-9 contract.
+// ASSUME-2 (confirmed 2026-11-26, updated for Issue #21 Q-2): Research uses a dedicated
+//   og-owned MLX loopback server slot governed by the same D-9/D-10 lifecycle contract as
+//   `spec/req/model_server.fsl` (1 process serving both embeddings and cross-encoder reranking).
+//   When that server is disabled or unavailable, lookup falls back transparently to Phase 1
+//   offline FTS5 + deterministic excerpts without error.
 requirements Research {
   number GoVer
   number ModelId
@@ -55,7 +58,8 @@ requirements Research {
     shared_model:            ModelId,
     last_batch_reused:       Bool,
     llm_available:           Bool,
-    // DOC-2 / DOC-7 / DOC-9: answer state
+    reranker_available:      Bool,
+    // DOC-2 / DOC-7 / DOC-9 / DOC-10: answer state
     answer_kind:             AnswerKind,
     answer_ver:              Option<GoVer>,
     answer_card_since:       Option<GoVer>,
@@ -64,6 +68,7 @@ requirements Research {
     answer_has_scope:        Bool,
     answer_grounded:         Bool,
     answer_used_semantic:    Bool,
+    answer_used_reranker:    Bool,
     inserted:                Bool,
     sent_remote:             Bool       // MODEL-1: ghost — data ever sent off-machine
   }
@@ -79,6 +84,7 @@ requirements Research {
     shared_model = 0
     last_batch_reused = false
     llm_available = false
+    reranker_available = false
     answer_kind = NoAnswer
     answer_ver = none
     answer_card_since = none
@@ -87,6 +93,7 @@ requirements Research {
     answer_has_scope = false
     answer_grounded = false
     answer_used_semantic = false
+    answer_used_reranker = false
     inserted = false
     sent_remote = false
     forall v: GoVer {
@@ -111,6 +118,7 @@ requirements Research {
     answer_has_scope = false
     answer_grounded = false
     answer_used_semantic = false
+    answer_used_reranker = false
   }
 
   action set_project_version(v: GoVer) "DOC-2: project Go version changes; previous version's answers are cleared" {
@@ -124,11 +132,28 @@ requirements Research {
     answer_has_scope = false
     answer_grounded = false
     answer_used_semantic = false
+    answer_used_reranker = false
   }
 
   action toggle_llm(avail: Bool) "DOC-8: local answer-generation LLM availability changes independently of search" {
     requires avail != llm_available
     llm_available = avail
+  }
+
+  action toggle_reranker(avail: Bool) "DOC-10: local cross-encoder reranker availability changes; disabling clears reranked-flag answers only when needed" {
+    requires avail != reranker_available
+    reranker_available = avail
+    if not avail and answer_used_reranker {
+      answer_kind = NoAnswer
+      answer_ver = none
+      answer_card_since = none
+      answer_has_newer_notes = false
+      answer_has_citation = false
+      answer_has_scope = false
+      answer_grounded = false
+      answer_used_semantic = false
+      answer_used_reranker = false
+    }
   }
 
   // MARK: - Pack ingestion & update contract (DOC-3, DOC-4, DOC-5)
@@ -155,6 +180,7 @@ requirements Research {
       answer_has_scope = false
       answer_grounded = false
       answer_used_semantic = false
+      answer_used_reranker = false
     }
   }
 
@@ -195,6 +221,7 @@ requirements Research {
       answer_has_scope = false
       answer_grounded = false
       answer_used_semantic = false
+      answer_used_reranker = false
     }
   }
 
@@ -217,6 +244,7 @@ requirements Research {
       answer_has_scope = false
       answer_grounded = false
       answer_used_semantic = false
+      answer_used_reranker = false
     }
   }
 
@@ -236,6 +264,7 @@ requirements Research {
       answer_has_scope = false
       answer_grounded = false
       answer_used_semantic = false
+      answer_used_reranker = false
     }
   }
 
@@ -259,12 +288,13 @@ requirements Research {
       answer_has_scope = false
       answer_grounded = false
       answer_used_semantic = false
+      answer_used_reranker = false
     }
   }
 
-  // MARK: - Grounded version-gated lookup (DOC-2, DOC-6, DOC-7, DOC-8, DOC-9)
+  // MARK: - Grounded version-gated lookup (DOC-2, DOC-6, DOC-7, DOC-8, DOC-9, DOC-10)
 
-  action query_found(to: Endpoint, card_since: GoVer, has_newer_feature: Bool) "DOC-7: local query returns grounded, cited cards with card_since <= project_ver; newer features are separated into notes" {
+  action query_found(to: Endpoint, card_since: GoVer, has_newer_feature: Bool) "DOC-7: local two-stage query returns grounded, cited cards with card_since <= project_ver; optional local reranker refines ranking" {
     requires enabled
     requires to == Local
     requires pack_state[project_ver] != Missing
@@ -277,6 +307,7 @@ requirements Research {
     answer_has_scope = true
     answer_grounded = true
     answer_used_semantic = pack_state[project_ver] == Ready and pack_model[project_ver] == selected_model
+    answer_used_reranker = reranker_available
     sent_remote = sent_remote or to == Remote
   }
 
@@ -292,6 +323,7 @@ requirements Research {
     answer_has_scope = true
     answer_grounded = true
     answer_used_semantic = pack_state[project_ver] == Ready and pack_model[project_ver] == selected_model
+    answer_used_reranker = false
     sent_remote = sent_remote or to == Remote
   }
 
@@ -306,6 +338,7 @@ requirements Research {
     answer_has_scope = true
     answer_grounded = true
     answer_used_semantic = false
+    answer_used_reranker = false
   }
 
   action insert_card() "DOC-9: code insertion is permitted only for grounded, since-gated cards of the current project version" {
@@ -363,7 +396,11 @@ requirements Research {
   }
 
   invariant DisabledHasNoAnswer "DOC-1: disabling lookup leaves no answer displayed" {
-    not enabled => answer_kind == NoAnswer
+    not enabled => (answer_kind == NoAnswer and not answer_used_reranker)
+  }
+
+  invariant RerankRequiresAvailableAndGroundedCards "DOC-10: reranking is reported only for grounded local cards when the local reranker is available" {
+    answer_used_reranker => (enabled and reranker_available and answer_kind == GroundedCards)
   }
 
   // MARK: - Acceptance & Forbidden traces
@@ -403,6 +440,16 @@ requirements Research {
     expect pack_state[0] == Ready and pack_model[0] == 0 and last_batch_reused and answer_used_semantic
   }
 
+  acceptance AC-DOC-8 "DOC-10: Phase 2 two-stage retrieval (semantic + local cross-encoder rerank) returns version-gated cards and allows insertion" {
+    enable() start_batch(0) complete_batch_compute(0) toggle_reranker(true) query_found(Local, 0, false) insert_card()
+    expect answer_kind == GroundedCards and answer_used_semantic and answer_used_reranker and inserted
+  }
+
+  acceptance AC-DOC-9 "DOC-10: disabling reranker falls back cleanly to Phase 1/unranked grounded cards" {
+    enable() start_batch(0) publish_fts_pack(0) query_found(Local, 0, false)
+    expect answer_kind == GroundedCards and not answer_used_semantic and not answer_used_reranker
+  }
+
   forbidden FB-DOC-1 "DOC-6: queries to a remote endpoint are refused" {
     enable() start_batch(0) publish_fts_pack(0) query_found(Remote, 0, false)
     expect rejected
@@ -430,6 +477,16 @@ requirements Research {
 
   forbidden FB-DOC-6 "DOC-2: cannot return a card whose since version exceeds project_ver" {
     enable() start_batch(0) publish_fts_pack(0) query_found(Local, 1, false)
+    expect rejected
+  }
+
+  forbidden FB-DOC-7 "DOC-10: reranking never bypasses the chunk since version gate" {
+    enable() start_batch(0) complete_batch_compute(0) toggle_reranker(true) query_found(Local, 1, false)
+    expect rejected
+  }
+
+  forbidden FB-DOC-8 "DOC-10: reranking never permits sending queries to a remote endpoint" {
+    enable() start_batch(0) complete_batch_compute(0) toggle_reranker(true) query_found(Remote, 0, false)
     expect rejected
   }
 }

@@ -534,4 +534,83 @@ final class ProgressRecorder: @unchecked Sendable {
     }
 }
 
+/// Deterministic batch-capable embedder for testing `embedBatch` and `reembedExistingPack` (Issue #21).
+final class BatchCountingFakeEmbedder: DocsEmbedder, @unchecked Sendable {
+    let descriptor: EmbeddingModelDescriptor
+    let preferredBatchSize: Int
+    private let lock = NSLock()
+    private var _batchCalls = 0
+    private var _singleCalls = 0
+
+    init(id: String = "batch-embed", version: String = "v1", batchSize: Int = 4) {
+        self.descriptor = EmbeddingModelDescriptor(id: id, version: version)
+        self.preferredBatchSize = batchSize
+    }
+
+    var batchCalls: Int { lock.withLock { _batchCalls } }
+    var singleCalls: Int { lock.withLock { _singleCalls } }
+
+    func embed(_ text: String) async throws -> [Float] {
+        lock.withLock { _singleCalls += 1 }
+        return Self.vector(for: text)
+    }
+
+    func embedBatch(_ texts: [String]) async throws -> [[Float]] {
+        lock.withLock { _batchCalls += 1 }
+        return texts.map { Self.vector(for: $0) }
+    }
+
+    private static func vector(for text: String) -> [Float] {
+        var v = Array(repeating: Float(0), count: 8)
+        for (idx, b) in text.utf8.enumerated() { v[idx % 8] += Float(b) / 255.0 }
+        let norm = sqrt(v.reduce(0) { $0 + $1 * $1 })
+        return norm > 0 ? v.map { $0 / norm } : v
+    }
+}
+
+/// Deterministic cross-encoder reranker double for unit-testing Issue #21 Stage 2 ranking and anti-hallucination.
+final class StubDocsReranker: DocsReranker, @unchecked Sendable {
+    let modelID: String
+    private let scorer: @Sendable (String, String) -> Double
+
+    init(modelID: String = "stub-reranker-v1", scorer: @escaping @Sendable (String, String) -> Double) {
+        self.modelID = modelID
+        self.scorer = scorer
+    }
+
+    func rerank(query: String, documents: [String], topN: Int) async throws -> [DocsRerankerResult] {
+        var results = documents.enumerated().map { idx, doc in
+            DocsRerankerResult(index: idx, score: scorer(query, doc))
+        }
+        results.sort {
+            if abs($0.score - $1.score) > 1e-9 { return $0.score > $1.score }
+            return $0.index < $1.index
+        }
+        return Array(results.prefix(max(1, min(topN, results.count))))
+    }
+}
+
+/// Reranker that always fails so tests can verify transparent fallback to Phase 1 ranking (Issue #21, DOC-10).
+final class FailingDocsReranker: DocsReranker, @unchecked Sendable {
+    let modelID = "failing-reranker"
+    func rerank(query: String, documents: [String], topN: Int) async throws -> [DocsRerankerResult] {
+        throw DocsStorageError.rerankFailed("injected reranker failure")
+    }
+}
+
+/// Returns the local installed `GOROOT/src` directory if `go` is available on the host (for real GOROOT smoke tests).
+func realGorootSrcURL() -> URL? {
+    guard let goroot = GoVersionResolver.detectGoroot() else { return nil }
+    let src = goroot.appendingPathComponent("src", isDirectory: true)
+    return FileManager.default.fileExists(atPath: src.path) ? src : nil
+}
+
+func makeFakeToolLocator(with toolName: String, in dir: TempDir) -> ToolLocator {
+    let binDir = dir.subdir("bin")
+    let exe = dir.file("bin/\(toolName)", "#!/bin/sh\nexit 0\n")
+    try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: exe.path)
+    return ToolLocator(searchPath: [binDir.path], environment: ["PATH": binDir.path])
+}
+
+
 

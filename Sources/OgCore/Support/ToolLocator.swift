@@ -10,6 +10,12 @@ public final class ToolLocator: Sendable {
     public let searchPath: [String]
     public let environment: [String: String]
 
+    /// Explicit search path initializer for deterministic unit tests.
+    public init(searchPath: [String], environment: [String: String] = [:]) {
+        self.searchPath = searchPath
+        self.environment = environment
+    }
+
     public init() {
         var env = ProcessInfo.processInfo.environment
         var dirs: [String] = []

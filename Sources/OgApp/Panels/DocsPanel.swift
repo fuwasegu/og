@@ -156,6 +156,11 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
                 self?.updateModeLabelForProgress()
             }
         })
+        observers.append(NotificationCenter.default.addObserver(forName: .ogDocsServerChanged, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.updateModeLabelForProgress()
+            }
+        })
         refreshVersionPopup()
         renderIdleOrStatus()
     }
@@ -165,9 +170,23 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
            prog.phase == .extracting || prog.phase == .buildingFTS || prog.phase == .embedding || prog.phase == .activating {
             modeLabel.stringValue = "Indexing go\(prog.goVersion) (\(prog.processedChunks)/\(prog.totalChunks))"
         } else if let a = lastAnswer {
-            modeLabel.stringValue = a.searchMode == .hybridSemantic ? "Hybrid" : "FTS5 のみ"
+            modeLabel.stringValue = a.searchMode.shortLabel
         } else {
-            modeLabel.stringValue = DocsManager.shared.enabled ? "FTS5 のみ（ローカル完結）" : "Off"
+            modeLabel.stringValue = idleModeText()
+        }
+    }
+
+    private func idleModeText() -> String {
+        guard DocsManager.shared.enabled else { return "Off" }
+        switch DocsServerManager.shared.phase {
+        case .ready:
+            return DocsServerManager.shared.rerankReady ? "MLX Ready (Embed + Rerank)" : "MLX Ready (Embed)"
+        case .starting(let detail):
+            return "MLX: \(detail)"
+        case .failed:
+            return "FTS5 のみ（MLX 停止）"
+        case .off:
+            return "FTS5 のみ（ローカル完結）"
         }
     }
 
@@ -382,10 +401,10 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
                 size: 12
             ))
         } else {
-            modeLabel.stringValue = "FTS5 のみ（ローカル完結）"
+            modeLabel.stringValue = idleModeText()
         }
         let hint = label(
-            "ニーズから Go の書き方・標準ライブラリを逆引きできます（例: 「ファイルを1行ずつ読みたい」「JSON を整形して出したい」「for ループの書き方」「json.Encoder」）。",
+            "ニーズから Go の書き方・標準ライブラリを逆引きできます（例: 「json のデコード」「ファイルを1行ずつ読みたい」「for ループの書き方」「json.Encoder」）。",
             color: Theme.secondaryText,
             size: 12
         )
@@ -394,7 +413,7 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
 
     private func render(answer: DocsAnswer) {
         clearContent()
-        modeLabel.stringValue = answer.searchMode == .hybridSemantic ? "Hybrid" : "FTS5 のみ"
+        modeLabel.stringValue = answer.searchMode.shortLabel
 
         // Conclusion banner (UX-1)
         let conclusionField = label(answer.conclusion, color: Theme.text, size: 13, bold: true)

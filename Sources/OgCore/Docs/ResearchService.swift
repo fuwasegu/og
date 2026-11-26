@@ -1,14 +1,27 @@
 import Foundation
 
-/// How retrieval was executed for a query (FR-28: UI explicitly displays FTS-only mode).
+/// How retrieval was executed for a query (FR-28: UI explicitly displays active retrieval mode).
 public enum DocsSearchMode: String, Sendable, Hashable, Codable {
     case ftsOnly = "fts_only"
+    case ftsReranked = "fts_reranked"
     case hybridSemantic = "hybrid_semantic"
+    case hybridReranked = "hybrid_reranked"
 
     public var label: String {
         switch self {
         case .ftsOnly: return "FTS5 (全文検索のみ — 意味検索は未構築/オフ)"
+        case .ftsReranked: return "FTS5 + Rerank (全文検索 + リランク)"
         case .hybridSemantic: return "Hybrid (決定的 + FTS5 + 意味検索)"
+        case .hybridReranked: return "Hybrid + Rerank (決定的 + FTS5 + 意味検索 + リランク)"
+        }
+    }
+
+    public var shortLabel: String {
+        switch self {
+        case .ftsOnly: return "FTS5 のみ"
+        case .ftsReranked: return "FTS5 + Rerank"
+        case .hybridSemantic: return "Hybrid"
+        case .hybridReranked: return "Hybrid + Rerank"
         }
     }
 }
@@ -109,6 +122,8 @@ public struct DocsAnswer: Sendable, Hashable {
     public var versionSource: GoVersionSource?
     public var searchMode: DocsSearchMode
     public var usedLLM: Bool
+    /// True when the local cross-encoder reranker re-scored the returned cards (DOC-10, Issue #21).
+    public var usedReranker: Bool
     /// Explicit search scope shown on all answers and especially Not Found (FR-14).
     public var searchedScope: String
     public var licenseNotice: String
@@ -125,6 +140,7 @@ public struct DocsAnswer: Sendable, Hashable {
         versionSource: GoVersionSource? = nil,
         searchMode: DocsSearchMode = .ftsOnly,
         usedLLM: Bool = false,
+        usedReranker: Bool = false,
         searchedScope: String = "",
         licenseNotice: String = DocsLicense.goBSD3Clause
     ) {
@@ -139,6 +155,7 @@ public struct DocsAnswer: Sendable, Hashable {
         self.versionSource = versionSource
         self.searchMode = searchMode
         self.usedLLM = usedLLM
+        self.usedReranker = usedReranker
         self.searchedScope = searchedScope
         self.licenseNotice = licenseNotice
     }
@@ -350,25 +367,38 @@ public enum DocsCodeInserter {
     }
 }
 
-/// Fixed-pipeline offline Go documentation research engine (spec/design/research.fsl, §7.3).
+/// Fixed two-stage offline Go documentation research engine (spec/design/research.fsl, §7.3, Issue #21).
 ///
 /// Pipeline (fixed, never an unbounded agent loop):
 /// 1. Rule-based routing (`DocsQueryRouter`)
 /// 2. Target Go version resolution (FR-2) and exact-pack check (§7.4)
-/// 3. Deterministic -> FTS5 -> optional Semantic retrieval & merge (FR-9)
-/// 4. Signal verification (anti-hallucination, M-1) + per-chunk `since` version gating (FR-10) + max-3 cap (UX-3)
-/// 5. Grounded card rendering with citations, Go version, and honest Not Found (FR-12..15)
+/// 3. Stage 1 retrieval: union of Deterministic + FTS5 + optional Semantic candidates (capped at `retrievalPoolLimit = 30`)
+/// 4. Per-chunk `since` version gating BEFORE final ranking (FR-10, DOC-2, DOC-10)
+/// 5. Stage 2 optional local cross-encoder reranking (`DocsReranker`) + anti-hallucination gating + max-3 cap (UX-3, Issue #21)
+///    Falls back cleanly to Stage 1 (Phase 1 behavior) when no reranker is configured or if reranking fails.
+/// 6. Grounded card rendering with citations, Go version, and honest Not Found (FR-12..15)
 public actor ResearchService {
     public static let maxCards = 3
-    /// Minimum cosine similarity for semantic candidates (M-1).
-    public static let minimumSemanticSimilarity = 0.35
-    /// Threshold above which a semantic-only match without lexical overlap may pass (M-1).
-    public static let highConfidenceSemanticScore = 80.0
+    /// Candidate pool size passed to Stage 2 cross-encoder reranking (benchmarked in Issue #21: N=30, ~318ms median).
+    public static let retrievalPoolLimit = 30
+    /// Minimum cosine similarity for semantic candidates (calibrated on real GOROOT with bge-m3-mlx-8bit, Issue #21;
+    /// replaces Phase 1 provisional 0.35; positive top-1 measured 0.541..0.692, negative max 0.522).
+    public static let minimumSemanticSimilarity = 0.45
+    /// Threshold (similarity * 100) above which a semantic-only match without lexical overlap may pass when no reranker
+    /// is active (calibrated on real GOROOT with bge-m3-mlx-8bit, Issue #21; replaces Phase 1 provisional 80.0;
+    /// sits in the measured separation band between negative max 52.2 and positive min 54.1).
+    public static let highConfidenceSemanticScore = 53.5
+    /// Minimum cross-encoder probability `[0, 1]` for semantic-only / ungrounded candidates (calibrated on real GOROOT
+    /// with bge-reranker-v2-m3-mlx-8bit, Issue #21: positive min 0.018 / median 0.758 vs negative max 0.002).
+    public static let minimumRerankScore = 0.015
+    /// Stricter cross-encoder threshold for `existenceCheck` queries without lexical signal overlap (FR-14).
+    public static let minimumExistenceRerankScore = 0.05
 
     public let packManager: DocsPackManager
     private var enabled: Bool
     private var validatedEndpoint: URL?
     private var queryEmbedder: (any DocsEmbedder)?
+    private var reranker: (any DocsReranker)?
     private var conceptRulesOverride: [DocsConceptRule]?
 
     public init(packManager: DocsPackManager, enabled: Bool = false) {
@@ -405,6 +435,15 @@ public actor ResearchService {
     /// Configures an optional local embedder for semantic search (Phase 2 / tests).
     public func setEmbedder(_ embedder: (any DocsEmbedder)?) {
         queryEmbedder = embedder
+    }
+
+    /// Configures an optional local cross-encoder reranker for Stage 2 ranking (Issue #21, DOC-10).
+    public func setReranker(_ reranker: (any DocsReranker)?) {
+        self.reranker = reranker
+    }
+
+    public func hasReranker() -> Bool {
+        reranker != nil
     }
 
     /// Executes the fixed offline retrieval pipeline (§7.3) with cancellation checkpoints (M-4).
@@ -499,25 +538,34 @@ public actor ResearchService {
         }
         defer { index.close() }
 
-        // Step 3: Fixed hybrid candidate collection: deterministic -> FTS5 -> optional semantic (FR-9, §7.3).
+        // Step 3: Stage 1 hybrid candidate collection: deterministic -> FTS5 -> optional semantic (FR-9, §7.3, Issue #21).
         struct Candidate {
             var chunk: DocsChunk
             var score: Double
             var origin: DocsMatchOrigin
             var lexicalMatched: Bool
+            var lexicalRank: Int?
             var semanticRawScore: Double
+            var semanticRank: Int?
+            var hasSignalOverlap: Bool
         }
         var combined: [String: Candidate] = [:]
 
         func merge(_ hits: [DocsIndexHit], weight: Double) {
-            for hit in hits {
+            for (rankIdx, hit) in hits.enumerated() {
                 let weighted = hit.score * weight
                 let isLexical = (hit.matchedBy == .deterministicExact || hit.matchedBy == .fts5)
                 let semRaw = hit.matchedBy == .semantic ? hit.score : 0.0
                 if var existing = combined[hit.chunk.stableID] {
                     existing.score += weighted
                     existing.lexicalMatched = existing.lexicalMatched || isLexical
-                    existing.semanticRawScore = max(existing.semanticRawScore, semRaw)
+                    if hit.matchedBy == .fts5 {
+                        existing.lexicalRank = min(existing.lexicalRank ?? rankIdx, rankIdx)
+                    }
+                    if hit.matchedBy == .semantic {
+                        existing.semanticRawScore = max(existing.semanticRawScore, semRaw)
+                        existing.semanticRank = min(existing.semanticRank ?? rankIdx, rankIdx)
+                    }
                     if hit.matchedBy == .deterministicExact {
                         existing.origin = .deterministicExact
                     }
@@ -528,7 +576,10 @@ public actor ResearchService {
                         score: weighted,
                         origin: hit.matchedBy,
                         lexicalMatched: isLexical,
-                        semanticRawScore: semRaw
+                        lexicalRank: hit.matchedBy == .fts5 ? rankIdx : nil,
+                        semanticRawScore: semRaw,
+                        semanticRank: hit.matchedBy == .semantic ? rankIdx : nil,
+                        hasSignalOverlap: false
                     )
                 }
             }
@@ -536,7 +587,7 @@ public actor ResearchService {
 
         // 3a. Deterministic lookup (FR-1, FR-9a)
         if let sym = plan.exactSymbolCandidate {
-            let detHits = try index.deterministicSearch(symbolOrPackage: sym, limit: 8)
+            let detHits = try index.deterministicSearch(symbolOrPackage: sym, limit: 10)
             merge(detHits, weight: 2.0)
         }
 
@@ -544,38 +595,43 @@ public actor ResearchService {
 
         // 3b. SQLite FTS5 full-text search (FR-9b)
         if !plan.searchTerms.isEmpty {
-            let ftsHits = try index.ftsSearch(terms: plan.searchTerms, limit: 15)
+            let ftsHits = try index.ftsSearch(terms: plan.searchTerms, limit: 20)
             merge(ftsHits, weight: 1.0)
         }
 
         try Task.checkCancellation()
 
         // 3c. Optional semantic search ONLY when pack is Ready AND model matches (FR-27, FR-28, DOC-4)
-        var searchMode: DocsSearchMode = .ftsOnly
+        var usedSemantic = false
         if manifest.status == .ready,
            let embedder = queryEmbedder,
            manifest.embeddingModelID == embedder.descriptor.id,
            manifest.embeddingModelVersion == embedder.descriptor.version {
-            if let qVec = try? await embedder.embed(plan.originalQuery) {
+            if let qVec = try? await embedder.embedQuery(plan.originalQuery) {
                 try Task.checkCancellation()
                 let semHits = try await index.semanticSearch(
                     queryVector: qVec,
                     model: embedder.descriptor,
                     sharedStore: packManager.sharedVectorStore,
                     minimumSimilarity: Self.minimumSemanticSimilarity,
-                    limit: 10
+                    limit: Self.retrievalPoolLimit
                 )
                 // Balanced weight so semantic assists recall without swamping deterministic/FTS precision (M-1).
                 merge(semHits, weight: 0.4)
-                searchMode = .hybridSemantic
+                usedSemantic = true
             }
         }
 
-        // Step 3d: Anti-hallucination signal verification (FR-14, M-1).
-        // Applies to BOTH FTS and semantic hits so low-similarity semantic hits cannot fabricate "Yes, it exists".
-        let candidates = combined.values.filter { entry in
+        let activeReranker = reranker
+
+        // Step 3d: Anti-hallucination signal verification (FR-14, M-1, Issue #21).
+        var candidates: [Candidate] = []
+        candidates.reserveCapacity(combined.count)
+        for var entry in combined.values {
             if entry.origin == .deterministicExact {
-                return true
+                entry.hasSignalOverlap = true
+                candidates.append(entry)
+                continue
             }
             let hay = (
                 entry.chunk.title + " " +
@@ -586,49 +642,84 @@ public actor ResearchService {
                 entry.chunk.searchAliases.joined(separator: " ")
             ).lowercased()
             let hasSignalOverlap = !plan.requiredSignalTerms.isEmpty && plan.requiredSignalTerms.contains { hay.contains($0) }
+            entry.hasSignalOverlap = hasSignalOverlap
 
             if entry.origin == .semantic && !entry.lexicalMatched {
-                // M-1: semantic-only candidate requires either signal overlap OR very high similarity (>= 0.80)
-                // AND must not bypass explicit non-matching existence checks when required signals exist.
-                if plan.intent == .existenceCheck {
-                    return hasSignalOverlap
+                if activeReranker != nil {
+                    // Stage 2 cross-encoder performs precision & anti-hallucination gating on cross-lingual candidates.
+                    candidates.append(entry)
+                } else {
+                    // Phase 1 / reranker-disabled fallback: require signal overlap or calibrated high similarity.
+                    if plan.intent == .existenceCheck {
+                        if hasSignalOverlap { candidates.append(entry) }
+                    } else if hasSignalOverlap || entry.semanticRawScore >= Self.highConfidenceSemanticScore {
+                        candidates.append(entry)
+                    }
                 }
-                return hasSignalOverlap || entry.semanticRawScore >= Self.highConfidenceSemanticScore
+                continue
             }
 
-            guard !plan.requiredSignalTerms.isEmpty else { return false }
-            return hasSignalOverlap
+            if !plan.requiredSignalTerms.isEmpty && hasSignalOverlap {
+                candidates.append(entry)
+            }
         }
 
-        // Step 4: Version gating BEFORE final ranking (FR-10, UC-1).
-        var allowedEntries: [(chunk: DocsChunk, score: Double, origin: DocsMatchOrigin)] = []
+        // Step 4: Version gating BEFORE Stage 2 reranking & final ranking (FR-10, UC-1, DOC-2, DOC-10).
+        struct ScoredCandidate {
+            var candidate: Candidate
+            var intentBonus: Double
+            var stage1Score: Double
+            var finalScore: Double
+        }
+
+        let lowerSearchTerms = plan.searchTerms.map { $0.lowercased() }.filter { $0.count >= 2 }
+        var allowedEntries: [ScoredCandidate] = []
         var newerNotes: [DocsNewerVersionNote] = []
 
         for entry in candidates {
             switch GoVersionGate.evaluate(since: entry.chunk.since, target: targetVer) {
             case .allowed:
-                var adjusted = entry.score
+                var intentBonus = 0.0
                 switch plan.intent {
                 case .syntaxHowTo:
-                    if entry.chunk.source == .spec { adjusted += 18.0 }
-                    else if entry.chunk.source == .guide { adjusted += 14.0 }
+                    if entry.chunk.source == .spec { intentBonus += 18.0 }
+                    else if entry.chunk.source == .guide { intentBonus += 14.0 }
                 case .exactSymbol, .existenceCheck, .needsReverseLookup:
-                    if entry.chunk.source == .stdlib { adjusted += 10.0 }
-                    // Prefer concrete symbols (func/type/method/const/var) over broad package overviews in reverse lookup.
+                    if entry.chunk.source == .stdlib { intentBonus += 10.0 }
                     if plan.intent == .needsReverseLookup && entry.chunk.kind != .package {
-                        adjusted += 3.0
+                        intentBonus += 3.0
+                        if !entry.chunk.symbol.contains(".") {
+                            intentBonus += 2.0
+                        }
+                    }
+                    if entry.lexicalMatched {
+                        let symLower = entry.chunk.symbol.lowercased()
+                        let pkgLower = entry.chunk.packageName.lowercased()
+                        let shortPkg = pkgLower.split(separator: "/").last.map(String.init) ?? pkgLower
+                        if !symLower.isEmpty && lowerSearchTerms.contains(symLower) {
+                            intentBonus += 12.0
+                        }
+                        if !pkgLower.isEmpty && (lowerSearchTerms.contains(pkgLower) || lowerSearchTerms.contains(shortPkg)) {
+                            intentBonus += 4.0
+                        }
                     }
                 case .releaseSince:
-                    if entry.chunk.source == .release { adjusted += 20.0 }
+                    if entry.chunk.source == .release { intentBonus += 20.0 }
                 case .idiomOrWhy:
-                    if entry.chunk.source == .guide || entry.chunk.source == .spec { adjusted += 12.0 }
+                    if entry.chunk.source == .guide || entry.chunk.source == .spec { intentBonus += 12.0 }
                 }
                 // FR-3: weak signal from currently edited file's imports (never leaves machine).
                 if let ctx = editorContext, !entry.chunk.packageName.isEmpty,
                    ctx.importedPackages.contains(entry.chunk.packageName) {
-                    adjusted += 1.5
+                    intentBonus += 1.5
                 }
-                allowedEntries.append((entry.chunk, adjusted, entry.origin))
+                let stage1 = entry.score + intentBonus
+                allowedEntries.append(ScoredCandidate(
+                    candidate: entry,
+                    intentBonus: intentBonus,
+                    stage1Score: stage1,
+                    finalScore: stage1
+                ))
             case .requiresNewer(let since):
                 newerNotes.append(DocsNewerVersionNote(
                     title: entry.chunk.title,
@@ -638,15 +729,153 @@ public actor ResearchService {
             }
         }
 
+        // Default Stage 1 ordering (used directly when reranker is absent or fails).
         allowedEntries.sort {
-            if abs($0.score - $1.score) > 0.001 { return $0.score > $1.score }
-            return $0.chunk.stableID < $1.chunk.stableID
+            if abs($0.stage1Score - $1.stage1Score) > 0.001 { return $0.stage1Score > $1.stage1Score }
+            return $0.candidate.chunk.stableID < $1.candidate.chunk.stableID
         }
+
+        // Step 5: Stage 2 optional local cross-encoder reranking (Issue #21, FR-11, DOC-10).
+        var usedReranker = false
+        if let activeReranker, !allowedEntries.isEmpty {
+            // Build balanced top-N union pool: deterministic hits first, then top FTS hits and top semantic hits
+            // so neither high-BM25 FTS nor semantic retrieval starves the other.
+            let limit = Self.retrievalPoolLimit
+            var pool: [ScoredCandidate] = []
+            pool.reserveCapacity(min(limit, allowedEntries.count))
+            var seenIDs = Set<String>()
+
+            func take(_ entry: ScoredCandidate) {
+                guard pool.count < limit else { return }
+                if seenIDs.insert(entry.candidate.chunk.stableID).inserted {
+                    pool.append(entry)
+                }
+            }
+
+            for entry in allowedEntries where entry.candidate.origin == .deterministicExact {
+                take(entry)
+            }
+            let ftsSorted = allowedEntries
+                .filter { $0.candidate.lexicalRank != nil }
+                .sorted { ($0.candidate.lexicalRank ?? Int.max) < ($1.candidate.lexicalRank ?? Int.max) }
+            let ftsQuota = min(limit / 2, ftsSorted.count)
+            for entry in ftsSorted.prefix(ftsQuota) {
+                take(entry)
+            }
+            let semSorted = allowedEntries
+                .filter { $0.candidate.semanticRank != nil }
+                .sorted { ($0.candidate.semanticRank ?? Int.max) < ($1.candidate.semanticRank ?? Int.max) }
+            for entry in semSorted {
+                take(entry)
+            }
+            for entry in allowedEntries {
+                take(entry)
+            }
+
+            let documents = pool.map(\.candidate.chunk.rerankDocumentText)
+
+            try Task.checkCancellation()
+            if let rerankResults = try? await activeReranker.rerank(
+                query: plan.originalQuery,
+                documents: documents,
+                topN: documents.count
+            ), !rerankResults.isEmpty {
+                try Task.checkCancellation()
+                var rrScoreByIndex: [Int: Double] = [:]
+                rrScoreByIndex.reserveCapacity(rerankResults.count)
+                for res in rerankResults {
+                    rrScoreByIndex[res.index] = res.score
+                }
+
+                var rerankedEntries: [ScoredCandidate] = []
+                rerankedEntries.reserveCapacity(pool.count)
+
+                for (idx, var item) in pool.enumerated() {
+                    let rr = rrScoreByIndex[idx] ?? 0.0
+                    let cand = item.candidate
+                    let isDet = (cand.origin == .deterministicExact)
+
+                    // Anti-hallucination gate for semantic-only candidates (Issue #21).
+                    if cand.origin == .semantic && !cand.lexicalMatched {
+                        let threshold = (plan.intent == .existenceCheck)
+                            ? Self.minimumExistenceRerankScore
+                            : Self.minimumRerankScore
+                        if rr < threshold {
+                            continue
+                        }
+                    }
+
+                    let lexicalStrength = Self.lexicalMatchStrength(
+                        chunk: cand.chunk,
+                        lexicalMatched: cand.lexicalMatched,
+                        lowerTerms: lowerSearchTerms
+                    )
+
+                    // Drop noisy body-only FTS hits (e.g. a single incidental word match) when cross-encoder rejects them.
+                    if !isDet && lexicalStrength == 0 && rr < Self.minimumRerankScore {
+                        continue
+                    }
+
+                    if isDet {
+                        // Explicit symbol query stays #1 while reranker refines sibling ordering.
+                        item.finalScore = 220.0 + rr * 50.0 + item.stage1Score * 0.2
+                    } else {
+                        let ftsRankBonus: Double
+                        if let rank = cand.lexicalRank {
+                            ftsRankBonus = 8.0 / Double(rank + 1)
+                        } else {
+                            ftsRankBonus = 0.0
+                        }
+                        let lexicalBonus: Double
+                        if lexicalStrength >= 2 {
+                            // Exact symbol or guide/spec title match (e.g. bufio.Scanner, json.Decoder, json.Encoder).
+                            // Equal across siblings of the same family so cross-encoder breaks ties decisively.
+                            lexicalBonus = 50.0 + ftsRankBonus
+                        } else if lexicalStrength == 1 {
+                            // Package-level or method-prefix lexical match.
+                            lexicalBonus = 38.0 + ftsRankBonus
+                        } else if cand.lexicalMatched {
+                            lexicalBonus = ftsRankBonus
+                        } else {
+                            lexicalBonus = 0.0
+                        }
+                        item.finalScore = rr * 100.0 + lexicalBonus + item.intentBonus
+                    }
+                    rerankedEntries.append(item)
+                }
+
+                rerankedEntries.sort {
+                    if abs($0.finalScore - $1.finalScore) > 0.001 { return $0.finalScore > $1.finalScore }
+                    return $0.candidate.chunk.stableID < $1.candidate.chunk.stableID
+                }
+                allowedEntries = rerankedEntries
+                usedReranker = !allowedEntries.isEmpty
+            } else {
+                // Reranker unavailable or failed: fall back cleanly to Phase 1 anti-hallucination gating.
+                allowedEntries = allowedEntries.filter { item in
+                    let cand = item.candidate
+                    if cand.origin == .semantic && !cand.lexicalMatched {
+                        if plan.intent == .existenceCheck { return cand.hasSignalOverlap }
+                        return cand.hasSignalOverlap || cand.semanticRawScore >= Self.highConfidenceSemanticScore
+                    }
+                    return true
+                }
+            }
+        }
+
+        let searchMode: DocsSearchMode
+        switch (usedSemantic, usedReranker) {
+        case (true, true): searchMode = .hybridReranked
+        case (true, false): searchMode = .hybridSemantic
+        case (false, true): searchMode = .ftsReranked
+        case (false, false): searchMode = .ftsOnly
+        }
+
         newerNotes.sort { ($0.since, $0.title) < ($1.since, $1.title) }
 
         let scopeText = "Go \(packKey) pack (\(manifest.chunkCount) chunks: Language Spec, Official Guides, Standard Library)"
 
-        // Step 5: Honest Not Found when zero grounded, version-gated candidates match (FR-12, FR-14, UX-4).
+        // Step 6: Honest Not Found when zero grounded, version-gated candidates match (FR-12, FR-14, UX-4).
         guard !allowedEntries.isEmpty else {
             let msg: String
             if plan.language == .japanese {
@@ -664,8 +893,9 @@ public actor ResearchService {
                 newerVersionNotes: Array(newerNotes.prefix(3)),
                 targetVersion: targetVer,
                 versionSource: resolved.source,
-                searchMode: searchMode,
+                searchMode: usedSemantic ? .hybridSemantic : .ftsOnly,
                 usedLLM: false,
+                usedReranker: false,
                 searchedScope: scopeText
             )
         }
@@ -673,7 +903,7 @@ public actor ResearchService {
         // UX-3: cap to maximum 3 grounded cards.
         let top = allowedEntries.prefix(Self.maxCards)
         let cards: [DocsAnswerCard] = top.map { entry in
-            let c = entry.chunk
+            let c = entry.candidate.chunk
             let hasCode = !(c.example?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
             let canInsert = hasCode && GoVersionGate.evaluate(since: c.since, target: targetVer) == .allowed
             return DocsAnswerCard(
@@ -691,7 +921,7 @@ public actor ResearchService {
                 goVersion: packKey,
                 since: c.since,
                 canInsert: canInsert,
-                matchedBy: entry.origin
+                matchedBy: entry.candidate.origin
             )
         }
 
@@ -709,8 +939,33 @@ public actor ResearchService {
             versionSource: resolved.source,
             searchMode: searchMode,
             usedLLM: false,
+            usedReranker: usedReranker,
             searchedScope: scopeText
         )
+    }
+
+    /// Returns 2 for an exact symbol or spec/guide title match, 1 for a package or method-prefix match, 0 otherwise.
+    private static func lexicalMatchStrength(
+        chunk: DocsChunk,
+        lexicalMatched: Bool,
+        lowerTerms: [String]
+    ) -> Int {
+        guard lexicalMatched, !lowerTerms.isEmpty else { return 0 }
+        let sym = chunk.symbol.lowercased()
+        let pkg = chunk.packageName.lowercased()
+        let shortPkg = pkg.split(separator: "/").last.map(String.init) ?? pkg
+        if chunk.source == .stdlib {
+            if !sym.isEmpty && lowerTerms.contains(sym) { return 2 }
+            if lowerTerms.contains(where: { (!sym.isEmpty && sym.hasPrefix($0 + ".")) || pkg == $0 || shortPkg == $0 }) {
+                return 1
+            }
+            return 0
+        }
+        let title = chunk.title.lowercased()
+        if lowerTerms.contains(where: { (!sym.isEmpty && sym.contains($0)) || title.contains($0) }) {
+            return 2
+        }
+        return 0
     }
 
     private func buildConclusion(

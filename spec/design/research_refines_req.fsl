@@ -1,6 +1,7 @@
 // ResearchDesign ⊑ Research
-// Chunk-level embedding progress, staged FTS rebuilds, and loopback validation
-// refine the requirements-level pack update, resume, reuse, and version-gate contract.
+// Chunk-level embedding progress, staged FTS rebuilds, loopback validation,
+// and optional local cross-encoder reranking refine the requirements-level
+// pack update, resume, reuse, version-gate, and two-stage retrieval contract.
 refinement ResearchRefinesReq {
   impl ResearchDesign
   abs  Research

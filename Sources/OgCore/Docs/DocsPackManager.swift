@@ -596,6 +596,9 @@ public actor DocsPackManager {
             if let embedder {
                 let model = embedder.descriptor
                 let completedRefs = try stageIndex.vectorReferences()
+                let batchSize = max(1, embedder.preferredBatchSize)
+                var pendingBatch: [(chunk: DocsChunk, key: SharedVectorKey)] = []
+                pendingBatch.reserveCapacity(batchSize)
 
                 for chunk in chunks {
                     if Task.isCancelled || cancelRequested[goVersion] == true {
@@ -634,14 +637,34 @@ public actor DocsPackManager {
                     if try await sharedVectorStore.contains(key) {
                         try stageIndex.recordVectorReference(stableID: chunk.stableID, key: key)
                         reusedCount += 1
+                        processed += 1
+                        emit(.embedding)
                     } else {
-                        let vector = try await embedder.embed(chunk.embeddingText)
-                        try await sharedVectorStore.store(key: key, vector: vector)
-                        try stageIndex.recordVectorReference(stableID: chunk.stableID, key: key)
-                        computedCount += 1
+                        pendingBatch.append((chunk, key))
+                        if pendingBatch.count >= batchSize {
+                            let batch = pendingBatch
+                            pendingBatch.removeAll(keepingCapacity: true)
+                            let vectors = try await computeBatchVectors(batch.map(\.chunk.embeddingText), with: embedder)
+                            for (item, vector) in zip(batch, vectors) {
+                                try await sharedVectorStore.store(key: item.key, vector: vector)
+                                try stageIndex.recordVectorReference(stableID: item.chunk.stableID, key: item.key)
+                                computedCount += 1
+                                processed += 1
+                            }
+                            emit(.embedding)
+                        }
                     }
-
-                    processed += 1
+                }
+                if !pendingBatch.isEmpty && !(Task.isCancelled || cancelRequested[goVersion] == true) {
+                    let batch = pendingBatch
+                    pendingBatch.removeAll(keepingCapacity: true)
+                    let vectors = try await computeBatchVectors(batch.map(\.chunk.embeddingText), with: embedder)
+                    for (item, vector) in zip(batch, vectors) {
+                        try await sharedVectorStore.store(key: item.key, vector: vector)
+                        try stageIndex.recordVectorReference(stableID: item.chunk.stableID, key: item.key)
+                        computedCount += 1
+                        processed += 1
+                    }
                     emit(.embedding)
                 }
                 finalStatus = .ready
@@ -716,6 +739,38 @@ public actor DocsPackManager {
             emit(.failed, error: error.localizedDescription)
             throw error
         }
+    }
+
+    /// Re-embeds an already-installed pack in place (preserving its extracted chunks) using `embedder` (FR-27, FR-30).
+    /// Returns `nil` if no pack is installed for `goVersion`.
+    public func reembedExistingPack(
+        goVersion: String,
+        embedder: any DocsEmbedder,
+        onProgress: (@Sendable (DocsBatchProgress) -> Void)? = nil
+    ) async throws -> DocsIngestionReport? {
+        guard let index = try openIndex(for: goVersion) else { return nil }
+        let chunks: [DocsChunk]
+        do {
+            chunks = try index.allChunks()
+        } catch {
+            index.close()
+            throw error
+        }
+        index.close()
+        return try await ingest(goVersion: goVersion, chunks: chunks, embedder: embedder, onProgress: onProgress)
+    }
+
+    private func computeBatchVectors(_ texts: [String], with embedder: any DocsEmbedder) async throws -> [[Float]] {
+        let vectors: [[Float]]
+        if texts.count == 1 {
+            vectors = [try await embedder.embed(texts[0])]
+        } else {
+            vectors = try await embedder.embedBatch(texts)
+        }
+        guard vectors.count == texts.count else {
+            throw DocsStorageError.embeddingFailed("embedBatch returned \(vectors.count) vectors for \(texts.count) chunks")
+        }
+        return vectors
     }
 
     private func cleanupDeletedInFlightIfNeeded(goVersion: String) async {
