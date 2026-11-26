@@ -34,6 +34,8 @@ refinement ResearchRefinesReq {
   action batch_commit_compute(v)          -> complete_batch_compute(v)
   action batch_commit_reuse(v)            -> complete_batch_reuse(v)
   action batch_abort()                    -> abort_batch()
-  action query_found(card_since, has_newer_feature) -> query_found(Local, card_since, has_newer_feature)
-  action query_not_found(has_newer_feature)         -> query_not_found(Local, has_newer_feature)
+  action query_found(card_since, has_newer_feature, source, card_count)
+    -> query_found(Local, card_since, has_newer_feature, source, card_count, true, true)
+  action query_not_found(has_newer_feature)
+    -> query_not_found(Local, has_newer_feature)
 }

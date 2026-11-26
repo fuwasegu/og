@@ -17,6 +17,9 @@ import OgCore
 ///     diags                        print every diagnostic (gopls + og style) of the editor
 ///     completions                  request completion at the caret and print the listed labels
 ///     accept [label]               accept the listed completion whose label contains `label`
+///     docs <query>                 search offline Go Docs and print summary
+///     docsserver [status|on|off|restart|pid]  control/inspect the Phase 2 Docs MLX server
+///     docsreembed <ver>            re-embed an installed Go docs pack in place
 ///     quit
 @MainActor
 enum DebugDriver {
@@ -387,6 +390,28 @@ enum DebugDriver {
             guard let dp = project?.bottomPanel.docsPanel else { return }
             let ok = await dp.debugInsertFirstCard()
             print("docsinsert: \(ok)")
+        case "docsserver":
+            // docsserver [status|on|off|restart|pid]: inspect or control the Phase 2 Docs MLX server (W-10).
+            let ds = DocsServerManager.shared
+            switch arg.trimmingCharacters(in: .whitespaces) {
+            case "on":
+                if !DocsManager.shared.enabled { DocsManager.shared.debugEnabledOverride = true }
+                ds.enabled = true
+            case "off":
+                ds.enabled = false
+            case "restart":
+                ds.restart()
+            case "pid":
+                print("docsserver pids: \(ds.debugPIDs)")
+            default:
+                break
+            }
+            print("docsserver: \(ds.statusText) phase=\(ds.phase)")
+        case "docsreembed":
+            // docsreembed <ver>: re-embed an installed Go docs pack in place with the active embedder (W-10).
+            let ver = GoVersion(parsing: arg)?.minorKey ?? BundledGoCorpus.defaultVersion
+            DocsManager.shared.startReembedPack(goVersion: ver)
+            print("docsreembed: requested go\(ver) phase=\(DocsManager.shared.activeProgress?.phase.rawValue ?? "none") err=\(DocsManager.shared.lastError ?? "none")")
         case "log":
             print(arg)
         case "dump":

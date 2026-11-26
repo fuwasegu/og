@@ -156,11 +156,17 @@ public enum ModelServerCommand {
         return Int(UInt16(bigEndian: addr.sin_port))
     }
 
-    /// True if GET `url` answers 200 within `timeout`.
+    /// True if GET `url` (loopback only, no redirects) answers 200 within `timeout`.
     public static func healthy(_ url: URL, timeout: TimeInterval = 2) async -> Bool {
+        guard LocalCompletionClient.isLoopback(url) else { return false }
+        let cfg = LocalCompletionClient.sessionConfiguration.copy() as? URLSessionConfiguration ?? .ephemeral
+        cfg.timeoutIntervalForRequest = timeout
+        cfg.timeoutIntervalForResource = timeout
+        let session = URLSession(configuration: cfg, delegate: LoopbackOnlySessionDelegate.shared, delegateQueue: nil)
+        defer { session.invalidateAndCancel() }
         var req = URLRequest(url: url)
         req.timeoutInterval = timeout
-        guard let (_, resp) = try? await URLSession.shared.data(for: req) else { return false }
+        guard let (_, resp) = try? await session.data(for: req) else { return false }
         return (resp as? HTTPURLResponse)?.statusCode == 200
     }
 }

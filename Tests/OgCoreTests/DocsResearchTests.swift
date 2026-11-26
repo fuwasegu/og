@@ -1027,6 +1027,7 @@ struct DocsPhase2Tests {
         let argv = try DocsModelServerCommand.argv(for: cfg, port: 43210, scriptURL: scriptURL, locator: locator)
 
         #expect(pathExists(scriptURL))
+        #expect(!argv.contains("--offline"))
         #expect(argv.contains("--host"))
         #expect(argv.contains("127.0.0.1"))
         #expect(argv.contains("--port"))
@@ -1034,6 +1035,166 @@ struct DocsPhase2Tests {
         #expect(argv.contains(DocsEmbedModelPreset.default.id))
         #expect(argv.contains("--rerank-model"))
         #expect(argv.contains(DocsRerankModelPreset.default.id))
+
+        // W-8: cached launches pass `--offline` to uvx
+        let offlineArgv = try DocsModelServerCommand.argv(for: cfg, port: 43210, offline: true, scriptURL: scriptURL, locator: locator)
+        #expect(offlineArgv.contains("--offline"))
+    }
+
+    @Test("DocsServerRestartPolicy enforces sliding crash window and exponential backoff (V-5)")
+    func docsServerRestartPolicyWindowAndBackoff() {
+        var policy = DocsServerRestartPolicy(maxFailures: 3, windowSeconds: 120, baseBackoffSeconds: 1.0)
+        // Rapid Ready->crash loop inside 120s window hits maxFailures=3 and stops
+        let r1 = policy.recordFailure(at: makeTestDate(offsetSeconds: 0))
+        #expect(r1.shouldRetry && r1.delaySeconds == 1.0 && r1.failureCount == 1)
+        let r2 = policy.recordFailure(at: makeTestDate(offsetSeconds: 10))
+        #expect(r2.shouldRetry && r2.delaySeconds == 2.0 && r2.failureCount == 2)
+        let r3 = policy.recordFailure(at: makeTestDate(offsetSeconds: 20))
+        #expect(!r3.shouldRetry && r3.failureCount == 3)
+
+        // After the 120s sliding window expires, old failures are pruned and restart budget recovers
+        let r4 = policy.recordFailure(at: makeTestDate(offsetSeconds: 200))
+        #expect(r4.shouldRetry && r4.failureCount == 1 && r4.delaySeconds == 1.0)
+
+        policy.reset()
+        #expect(policy.failureTimestamps.isEmpty)
+    }
+
+    @Test("Batch embedder degrades to single-item embed when embedBatch fails (W-5)")
+    func batchEmbeddingDegradesToSingleItemOnFailure() async throws {
+        let dir = TempDir()
+        defer { dir.cleanup() }
+        let mgr = try makeDocsPackManager(in: dir)
+        let chunks = Array(BundledGoCorpus.chunks(forGoVersion: "1.23").prefix(6))
+        let embedder = BatchFailingThenSingleEmbedder(id: "fallback-embed", version: "v1", batchSize: 4)
+
+        let report = try await mgr.ingest(goVersion: "1.23", chunks: chunks, embedder: embedder)
+        #expect(report.status == .ready)
+        #expect(report.computedVectors == 6)
+        #expect(embedder.batchFailures == 2) // batches of 4 + 2 both degraded
+        #expect(embedder.singleCalls == 6)
+    }
+
+    @Test("Loopback HTTP clients handle /v1/embeddings, /v1/rerank, block 3xx redirects, and fall back on 500/bad JSON/empty/timeout (V-3, V-7, W-9)")
+    func loopbackClientsHTTPMockRedirectAndErrorFallbacks() async throws {
+        let server = try LocalMockHTTPServer { method, path, body in
+            if method == "GET" && path == "/health" {
+                return LocalMockHTTPResponse(statusCode: 200, bodyString: #"{"status":"ok","rerank_ready":true}"#)
+            }
+            if method == "POST" && path == "/v1/embeddings" {
+                if stringContains(body, "[\"") {
+                    return LocalMockHTTPResponse(
+                        statusCode: 200,
+                        bodyString: #"{"data":[{"index":1,"embedding":[0.0,1.0]},{"index":0,"embedding":[1.0,0.0]}]}"#
+                    )
+                }
+                return LocalMockHTTPResponse(
+                    statusCode: 200,
+                    bodyString: #"{"data":[{"index":0,"embedding":[1.0,0.0]}]}"#
+                )
+            }
+            if method == "POST" && path == "/v1/rerank" {
+                return LocalMockHTTPResponse(
+                    statusCode: 200,
+                    bodyString: #"{"results":[{"index":1,"relevance_score":0.92},{"index":0,"relevance_score":0.31}]}"#
+                )
+            }
+            return LocalMockHTTPResponse(statusCode: 404, statusText: "Not Found", bodyString: #"{"error":"not found"}"#)
+        }
+        defer { server.stop() }
+
+        let desc = EmbeddingModelDescriptor(id: "mock-bge", version: "v1")
+        let embedClient = try #require(LoopbackEmbeddingClient(endpoint: server.baseURL, descriptor: desc, timeoutInterval: 2))
+        let rerankClient = try #require(LoopbackRerankerClient(endpoint: server.baseURL, modelID: "mock-rr", timeoutInterval: 0.4))
+
+        // 1. Happy path over real local HTTP
+        #expect(await ModelServerCommand.healthy(server.baseURL.appendingPathComponent("health")))
+        let singleVec = try await embedClient.embedQuery("json decode")
+        #expect(singleVec == [1.0, 0.0])
+        let batchVecs = try await embedClient.embedBatch(["first", "second"])
+        #expect(batchVecs == [[1.0, 0.0], [0.0, 1.0]])
+        let rrHits = try await rerankClient.rerank(query: "json", documents: ["doc0", "doc1"], topN: 2)
+        #expect(rrHits.count == 2)
+        #expect(rrHits[0].index == 1 && rrHits[0].score > 0.9)
+        #expect(rrHits[1].index == 0 && rrHits[1].score < 0.4)
+
+        // 2. V-3: 302 redirect to an external host MUST be blocked (never followed off-machine)
+        server.setHandler { _, _, _ in
+            LocalMockHTTPResponse(
+                statusCode: 302,
+                statusText: "Found",
+                headers: ["Location": "https://example.com/exfiltrate"],
+                bodyString: ""
+            )
+        }
+        #expect(!(await ModelServerCommand.healthy(server.baseURL.appendingPathComponent("health"))))
+        var embedBlockedRedirect = false
+        do { _ = try await embedClient.embedQuery("secret code") } catch { embedBlockedRedirect = true }
+        #expect(embedBlockedRedirect)
+        var rerankBlockedRedirect = false
+        do { _ = try await rerankClient.rerank(query: "secret", documents: ["doc"], topN: 1) } catch { rerankBlockedRedirect = true }
+        #expect(rerankBlockedRedirect)
+
+        // 3. W-9: ResearchService falls back cleanly on HTTP 500, malformed JSON, empty results, and timeout
+        let dir = TempDir()
+        let proj = TempDir()
+        defer { dir.cleanup(); proj.cleanup() }
+        _ = proj.file("go.mod", "module example.com/httpfb\n\ngo 1.23\n")
+        let mgr = try makeDocsPackManager(in: dir)
+        _ = try await mgr.ensureBundledPackInstalled(goVersion: "1.23")
+        let svc = ResearchService(packManager: mgr, enabled: true)
+        await svc.setReranker(rerankClient)
+
+        // 3a. HTTP 500
+        server.setHandler { _, _, _ in
+            LocalMockHTTPResponse(statusCode: 500, statusText: "Internal Server Error", bodyString: #"{"error":"boom"}"#)
+        }
+        let fb500 = try await svc.search(query: "ファイルを1行ずつ読みたい", projectRoot: proj.url)
+        #expect(fb500.status == .found && !fb500.usedReranker && fb500.cards.first?.symbol == "Scanner")
+
+        // 3b. Malformed JSON
+        server.setHandler { _, _, _ in
+            LocalMockHTTPResponse(statusCode: 200, bodyString: "{not-valid-json")
+        }
+        let fbBadJSON = try await svc.search(query: "ファイルを1行ずつ読みたい", projectRoot: proj.url)
+        #expect(fbBadJSON.status == .found && !fbBadJSON.usedReranker && fbBadJSON.cards.first?.symbol == "Scanner")
+
+        // 3c. Empty results
+        server.setHandler { _, _, _ in
+            LocalMockHTTPResponse(statusCode: 200, bodyString: #"{"results":[]}"#)
+        }
+        let fbEmpty = try await svc.search(query: "ファイルを1行ずつ読みたい", projectRoot: proj.url)
+        #expect(fbEmpty.status == .found && !fbEmpty.usedReranker && fbEmpty.cards.first?.symbol == "Scanner")
+
+        // 3d. Timeout (handler sleeps 1.0s > client 0.4s timeout)
+        server.setHandler { _, _, _ in
+            LocalMockHTTPResponse(statusCode: 200, bodyString: #"{"results":[{"index":0,"relevance_score":0.9}]}"#, delaySeconds: 1.0)
+        }
+        let fbTimeout = try await svc.search(query: "ファイルを1行ずつ読みたい", projectRoot: proj.url)
+        #expect(fbTimeout.status == .found && !fbTimeout.usedReranker && fbTimeout.cards.first?.symbol == "Scanner")
+    }
+
+    @Test("Vector store SQLite failure falls back cleanly to Phase 1 FTS instead of crashing search (V-4)")
+    func vectorStoreFailureFallsBackToPhase1FTS() async throws {
+        let dir = TempDir()
+        let proj = TempDir()
+        defer { dir.cleanup(); proj.cleanup() }
+        _ = proj.file("go.mod", "module example.com/v4\n\ngo 1.23\n")
+
+        let mgr = try makeDocsPackManager(in: dir)
+        let embedder = SemanticTopicEmbedder(id: "topic-v4", version: "v1")
+        _ = try await mgr.ingest(goVersion: "1.23", chunks: BundledGoCorpus.chunks(forGoVersion: "1.23"), embedder: embedder)
+
+        // Break shared_vectors table so index.semanticSearch(...) throws a SQLite error
+        try corruptSharedVectorStoreTable(at: await mgr.sharedVectorStore.databaseURL)
+
+        let svc = ResearchService(packManager: mgr, enabled: true)
+        await svc.setEmbedder(embedder)
+
+        let ans = try await svc.search(query: "ファイルを1行ずつ読みたい", projectRoot: proj.url)
+        #expect(ans.status == .found)
+        #expect(ans.searchMode == .ftsOnly)
+        #expect(ans.cards.first?.packageName == "bufio" && ans.cards.first?.symbol == "Scanner")
     }
 
     @Test("DocsCorpusExtractor skips underscore/dot non-package directories like _gen and _asm (Go tool convention)")
@@ -1111,16 +1272,15 @@ struct DocsPhase2Tests {
         }
         await svc.setReranker(reranker)
 
-        // 1. Issue #21 primary motivation: 「json のデコード」 -> Unmarshal/Decoder ranked #1 above Encoder
+        // 1. Issue #21 primary motivation: 「json のデコード」 -> Unmarshal/Decoder ranked #1 above Encoder (V-7: non-vacuous)
         let jsonDecode = try await svc.search(query: "json のデコード", projectRoot: proj123.url)
         #expect(jsonDecode.status == .found)
         #expect(jsonDecode.usedReranker)
         #expect(jsonDecode.searchMode == .hybridReranked)
         #expect(jsonDecode.cards.first?.packageName == "encoding/json")
         #expect(jsonDecode.cards.first?.symbol == "Unmarshal" || jsonDecode.cards.first?.symbol == "Decoder")
-        if let encIdx = jsonDecode.cards.firstIndex(where: { $0.symbol == "Encoder" }) {
-            #expect(encIdx > 0)
-        }
+        let encIdx = try #require(jsonDecode.cards.firstIndex(where: { $0.symbol == "Encoder" }))
+        #expect(encIdx > 0)
 
         // 2. Regression check: 「ファイルを1行ずつ読みたい」 -> bufio.Scanner #1
         let readLine = try await svc.search(query: "ファイルを1行ずつ読みたい", projectRoot: proj123.url)
@@ -1151,12 +1311,12 @@ struct DocsPhase2Tests {
         #expect(phase1.cards.first?.symbol == "Scanner")
     }
 
-    @Test("Real GOROOT smoke test: extract stdlib packages -> ingest -> search golden queries (Issue #21 carry-over)")
+    @Test(
+        "Real GOROOT smoke test: Phase 1 FTS + Phase 2 semantic/rerank on local GOROOT (Issue #21, V-8)",
+        .enabled(if: realGorootSrcURL() != nil, "Requires local Go toolchain (GOROOT/src)")
+    )
     func realGorootSmokeTest() async throws {
-        guard let srcURL = realGorootSrcURL() else {
-            // Skip cleanly on environments without a local Go toolchain installed.
-            return
-        }
+        let srcURL = try #require(realGorootSrcURL())
         let targetPkgs = ["bufio", "encoding/json", "context", "regexp", "slices"]
         var stdlib: [DocsChunk] = []
         for pkg in targetPkgs {
@@ -1198,5 +1358,34 @@ struct DocsPhase2Tests {
 
         let rNeg = try await svc.search(query: "標準ライブラリに量子テレポーテーション制御ある？", projectRoot: proj.url)
         #expect(rNeg.status == .notFound && rNeg.cards.isEmpty)
+
+        // V-8: Exercise Phase 2 (semantic + reranker) on real extracted GOROOT chunks
+        let embedder = SemanticTopicEmbedder(id: "goroot-smoke-embed", version: "v1")
+        let reembedReport = try await mgr.reembedExistingPack(goVersion: "1.23", embedder: embedder)
+        #expect(reembedReport?.status == .ready)
+        await svc.setEmbedder(embedder)
+        await svc.setReranker(StubDocsReranker { query, doc in
+            let q = query.lowercased()
+            let d = doc.lowercased()
+            if q.contains("デコード") && q.contains("json") {
+                if d.contains("unmarshal") || d.contains("decoder") { return 0.96 }
+                if d.contains("encoder") { return 0.60 }
+                return 0.05
+            }
+            if q.contains("1行ずつ") {
+                return d.contains("bufio.scanner") ? 0.95 : 0.05
+            }
+            if q.contains("量子テレポーテーション") { return 0.001 }
+            return 0.40
+        })
+
+        let p2Decode = try await svc.search(query: "json のデコード", projectRoot: proj.url)
+        #expect(p2Decode.status == .found && p2Decode.searchMode == .hybridReranked && p2Decode.usedReranker)
+        #expect(p2Decode.cards.first?.packageName == "encoding/json")
+        #expect(p2Decode.cards.first?.symbol == "Unmarshal" || p2Decode.cards.first?.symbol == "Decoder")
+        #expect(p2Decode.cards.first?.provenance == .officialExtracted)
+
+        let p2Neg = try await svc.search(query: "標準ライブラリに量子テレポーテーション制御ある？", projectRoot: proj.url)
+        #expect(p2Neg.status == .notFound && p2Neg.cards.isEmpty && !p2Neg.usedReranker)
     }
 }

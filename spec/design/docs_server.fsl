@@ -1,0 +1,269 @@
+// og — Local Docs inference server design (DocsServerManager on MainActor + MLX uvx child process)
+//
+// Refines: spec/req/docs_server.fsl (mapping: spec/design/docs_server_refines_req.fsl)
+//
+// DES-1: Child process in its own process group bound strictly to 127.0.0.1:<free port>.
+//        Uses offline-first uvx/HF cache when available; stopping signals SIGTERM -> SIGKILL.
+// DES-2: Ready means loopback GET /health (with redirects disabled) answered 200.
+//        Health polling enforces a bounded startup timeout (extended while downloads make progress).
+// DES-3: At most one Docs server process exists at a time; replacements wait for zombie exit.
+// DES-4: Process exit events carry a generation token; stale exits are ignored.
+//        Ready-state crashes accumulate in a sliding crash window up to MAXR (preventing spin loops).
+// DES-5: Quitting stops and waits for the process group to exit.
+//
+// ASSUME-1 (representation only): two models per role, MAXR = 2.
+spec DocsServerDesign {
+  number Model
+  number Tries
+  const MAXR = 2
+
+  enum DPhase { DOff, DSpawning, DLoading, DReady, DFailed }
+
+  state {
+    app_running:      Bool,
+    docs_enabled:     Bool,
+    semantic_enabled: Bool,
+    phase:            DPhase,
+    embed_model:      Model,
+    loaded_embed:     Model,
+    rerank_enabled:   Bool,
+    rerank_model:     Model,
+    loaded_rerank:    Model,
+    loaded_has_rr:    Bool,
+    failures:         Tries,
+    alive:            Bool,
+    zombie:           Bool
+  }
+
+  init {
+    app_running = true
+    docs_enabled = false
+    semantic_enabled = false
+    phase = DOff
+    embed_model = 0
+    loaded_embed = 0
+    rerank_enabled = true
+    rerank_model = 0
+    loaded_rerank = 0
+    loaded_has_rr = false
+    failures = 0
+    alive = false
+    zombie = false
+  }
+
+  def wanted() = app_running and docs_enabled and semantic_enabled
+  def starting() = phase == DSpawning or phase == DLoading
+
+  action enable_docs() "DES-DS-1: enable Docs lookup; request spawn if semantic search is on" {
+    requires app_running
+    requires not docs_enabled
+    docs_enabled = true
+    if semantic_enabled {
+      phase = DSpawning
+      loaded_embed = embed_model
+      loaded_rerank = rerank_model
+      loaded_has_rr = rerank_enabled
+      failures = 0
+    }
+  }
+
+  action disable_docs() "DES-1: disable Docs lookup; signal Docs server process group" {
+    requires docs_enabled
+    docs_enabled = false
+    phase = DOff
+    zombie = zombie or alive
+    alive = false
+  }
+
+  action enable_semantic() "DES-DS-2: enable Docs semantic search; request spawn if Docs is on" {
+    requires app_running
+    requires not semantic_enabled
+    semantic_enabled = true
+    if docs_enabled {
+      phase = DSpawning
+      loaded_embed = embed_model
+      loaded_rerank = rerank_model
+      loaded_has_rr = rerank_enabled
+      failures = 0
+    }
+  }
+
+  action disable_semantic() "DES-1: disable Docs semantic search; signal process group" {
+    requires semantic_enabled
+    semantic_enabled = false
+    phase = DOff
+    zombie = zombie or alive
+    alive = false
+  }
+
+  fair action spawned() "DES-3: launch uvx MLX server once no previous process is alive" {
+    requires phase == DSpawning
+    requires not zombie
+    requires not alive
+    phase = DLoading
+    alive = true
+  }
+
+  action spawn_error() "DES-DS-3: uvx missing or spawn failed" {
+    requires phase == DSpawning
+    requires not zombie
+    requires not alive
+    requires failures < MAXR
+    failures = failures + 1
+    if failures + 1 < MAXR { phase = DSpawning } else { phase = DFailed }
+  }
+
+  fair action health_ok() "DES-2: loopback /health answered 200" {
+    requires phase == DLoading
+    requires alive
+    phase = DReady
+  }
+
+  action health_timeout() "DES-2: startup health poll exceeded timeout; stop process and count failure (V-6)" {
+    requires phase == DLoading
+    requires alive
+    requires failures < MAXR
+    zombie = true
+    alive = false
+    failures = failures + 1
+    if failures + 1 < MAXR { phase = DSpawning } else { phase = DFailed }
+  }
+
+  action exit_while_loading() "DES-4: process exited before becoming ready" {
+    requires phase == DLoading
+    requires alive
+    requires failures < MAXR
+    alive = false
+    failures = failures + 1
+    if failures + 1 < MAXR { phase = DSpawning } else { phase = DFailed }
+  }
+
+  action exit_while_ready() "DES-4: ready process crashed unexpectedly; accumulate windowed failure count up to MAXR (V-5)" {
+    requires phase == DReady
+    requires alive
+    requires failures < MAXR
+    alive = false
+    failures = failures + 1
+    if failures + 1 < MAXR { phase = DSpawning } else { phase = DFailed }
+  }
+
+  action reset_crash_window() "DES-4: healthy uptime elapsed past crash window; reset counter" {
+    requires phase == DReady
+    requires alive
+    requires failures > 0
+    failures = 0
+  }
+
+  fair action zombie_exit() "DES-4: stopped process finally exited; stale event ignored" {
+    requires zombie
+    zombie = false
+  }
+
+  action retry() "DES-DS-4: user retries after Failed" {
+    requires wanted()
+    requires phase == DFailed
+    phase = DSpawning
+    loaded_embed = embed_model
+    loaded_rerank = rerank_model
+    loaded_has_rr = rerank_enabled
+    failures = 0
+  }
+
+  action select_embed_model(m: Model) "DES-3: switching embedder stops current process; replacement waits for exit" {
+    requires embed_model != m
+    embed_model = m
+    if wanted() and phase != DFailed {
+      phase = DSpawning
+      loaded_embed = m
+      loaded_rerank = rerank_model
+      loaded_has_rr = rerank_enabled
+      failures = 0
+      zombie = zombie or alive
+      alive = false
+    }
+  }
+
+  action select_rerank_model(m: Model) "DES-3: switching reranker stops current process; replacement waits for exit" {
+    requires rerank_model != m
+    rerank_model = m
+    if wanted() and phase != DFailed {
+      phase = DSpawning
+      loaded_embed = embed_model
+      loaded_rerank = m
+      loaded_has_rr = rerank_enabled
+      failures = 0
+      zombie = zombie or alive
+      alive = false
+    }
+  }
+
+  action toggle_rerank_setting(on: Bool) "DES-3: toggling reranker stops current process and restarts" {
+    requires rerank_enabled != on
+    rerank_enabled = on
+    if wanted() and phase != DFailed {
+      phase = DSpawning
+      loaded_embed = embed_model
+      loaded_rerank = rerank_model
+      loaded_has_rr = on
+      failures = 0
+      zombie = zombie or alive
+      alive = false
+    }
+  }
+
+  action quit() "DES-5: quitting stops Docs server and waits for process group exit" {
+    requires app_running
+    app_running = false
+    docs_enabled = false
+    semantic_enabled = false
+    phase = DOff
+    alive = false
+    zombie = false
+  }
+
+  invariant AtMostOneServer "DES-3: never two Docs server processes alive simultaneously" {
+    not (alive and zombie)
+  }
+
+  invariant AliveOnlyWhenLoadingOrReady "DES-1: a live process belongs to a loading or ready Docs server" {
+    alive => (phase == DLoading or phase == DReady)
+  }
+
+  invariant NothingAfterQuit "DES-5: no Docs server process survives app termination" {
+    not app_running => (not alive and not zombie)
+  }
+
+  invariant RunningOnlyWhenWanted "MODEL-1: induction aid" {
+    (starting() or phase == DReady) => (
+      wanted() and loaded_embed == embed_model and
+      loaded_rerank == rerank_model and loaded_has_rr == rerank_enabled
+    )
+  }
+
+  invariant NotWantedIsOff "MODEL-2: induction aid" {
+    not wanted() => phase == DOff
+  }
+
+  invariant EnabledOnlyWhileRunning "MODEL-3: induction aid" {
+    (docs_enabled or semantic_enabled) => app_running
+  }
+
+  invariant BoundedFailures "MODEL-4: induction aid" {
+    failures <= MAXR
+  }
+
+  invariant LoadingOrReadyIsAlive "MODEL-5: induction aid" {
+    (phase == DLoading or phase == DReady) => alive
+  }
+
+  leadsTo ZombiesExit "DES-4: stopped Docs server process always exits eventually" {
+    zombie ~> not zombie
+  }
+
+  terminal { not app_running }
+}
+
+verify {
+  values Model = 0..1
+  values Tries = 0..2
+}

@@ -761,16 +761,26 @@ public actor DocsPackManager {
     }
 
     private func computeBatchVectors(_ texts: [String], with embedder: any DocsEmbedder) async throws -> [[Float]] {
-        let vectors: [[Float]]
         if texts.count == 1 {
-            vectors = [try await embedder.embed(texts[0])]
-        } else {
-            vectors = try await embedder.embedBatch(texts)
+            return [try await embedder.embed(texts[0])]
         }
-        guard vectors.count == texts.count else {
-            throw DocsStorageError.embeddingFailed("embedBatch returned \(vectors.count) vectors for \(texts.count) chunks")
+        do {
+            let vectors = try await embedder.embedBatch(texts)
+            if vectors.count == texts.count {
+                return vectors
+            }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            // W-5: degrade failed batch call to single-item embedding before failing the batch.
         }
-        return vectors
+        var out: [[Float]] = []
+        out.reserveCapacity(texts.count)
+        for text in texts {
+            try Task.checkCancellation()
+            out.append(try await embedder.embed(text))
+        }
+        return out
     }
 
     private func cleanupDeletedInFlightIfNeeded(goVersion: String) async {

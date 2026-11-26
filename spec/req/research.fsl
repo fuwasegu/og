@@ -30,18 +30,21 @@
 // ASSUME-1 (representation only): two Go versions (0 = older e.g. 1.21, 1 = newer e.g. 1.23)
 //   and two embedding models are sufficient to expose pack-level, chunk-`since`, and model bugs.
 // ASSUME-2 (confirmed 2026-11-26, updated for Issue #21 Q-2): Research uses a dedicated
-//   og-owned MLX loopback server slot governed by the same D-9/D-10 lifecycle contract as
-//   `spec/req/model_server.fsl` (1 process serving both embeddings and cross-encoder reranking).
+//   og-owned MLX loopback server slot formally specified in `spec/req/docs_server.fsl`
+//   (1 process serving both embeddings and cross-encoder reranking under D-9/D-10).
 //   When that server is disabled or unavailable, lookup falls back transparently to Phase 1
 //   offline FTS5 + deterministic excerpts without error.
 requirements Research {
   number GoVer
   number ModelId
+  number CardCount
+  const MAX_CARDS = 3
 
   enum Endpoint { Local, Remote }
   enum PackState { Missing, IndexingFTSOnly, Ready }
   enum BatchState { BIdle, BRunning, BPaused }
   enum AnswerKind { NoAnswer, GroundedCards, GroundedNotFound, MissingPack }
+  enum RetrievalSource { RFTSOnly, RHybridUnion }
 
   state {
     enabled:                 Bool,
@@ -63,6 +66,8 @@ requirements Research {
     answer_kind:             AnswerKind,
     answer_ver:              Option<GoVer>,
     answer_card_since:       Option<GoVer>,
+    answer_card_count:       CardCount,
+    answer_retrieval_source: RetrievalSource,
     answer_has_newer_notes:  Bool,
     answer_has_citation:     Bool,
     answer_has_scope:        Bool,
@@ -88,6 +93,8 @@ requirements Research {
     answer_kind = NoAnswer
     answer_ver = none
     answer_card_since = none
+    answer_card_count = 0
+    answer_retrieval_source = RFTSOnly
     answer_has_newer_notes = false
     answer_has_citation = false
     answer_has_scope = false
@@ -113,6 +120,8 @@ requirements Research {
     answer_kind = NoAnswer
     answer_ver = none
     answer_card_since = none
+    answer_card_count = 0
+    answer_retrieval_source = RFTSOnly
     answer_has_newer_notes = false
     answer_has_citation = false
     answer_has_scope = false
@@ -127,6 +136,8 @@ requirements Research {
     answer_kind = NoAnswer
     answer_ver = none
     answer_card_since = none
+    answer_card_count = 0
+    answer_retrieval_source = RFTSOnly
     answer_has_newer_notes = false
     answer_has_citation = false
     answer_has_scope = false
@@ -140,13 +151,15 @@ requirements Research {
     llm_available = avail
   }
 
-  action toggle_reranker(avail: Bool) "DOC-10: local cross-encoder reranker availability changes; disabling clears reranked-flag answers only when needed" {
+  action toggle_reranker(avail: Bool) "DOC-10: local cross-encoder reranker availability changes; disabling clears reranked answers" {
     requires avail != reranker_available
     reranker_available = avail
     if not avail and answer_used_reranker {
       answer_kind = NoAnswer
       answer_ver = none
       answer_card_since = none
+      answer_card_count = 0
+      answer_retrieval_source = RFTSOnly
       answer_has_newer_notes = false
       answer_has_citation = false
       answer_has_scope = false
@@ -154,6 +167,21 @@ requirements Research {
       answer_used_semantic = false
       answer_used_reranker = false
     }
+  }
+
+  action switch_rerank_model() "D-10: switching the cross-encoder reranker model (tracked in spec/req/docs_server.fsl) clears reranked answers without invalidating embedding vectors" {
+    requires answer_used_reranker
+    answer_kind = NoAnswer
+    answer_ver = none
+    answer_card_since = none
+    answer_card_count = 0
+    answer_retrieval_source = RFTSOnly
+    answer_has_newer_notes = false
+    answer_has_citation = false
+    answer_has_scope = false
+    answer_grounded = false
+    answer_used_semantic = false
+    answer_used_reranker = false
   }
 
   // MARK: - Pack ingestion & update contract (DOC-3, DOC-4, DOC-5)
@@ -175,6 +203,8 @@ requirements Research {
       answer_kind = NoAnswer
       answer_ver = none
       answer_card_since = none
+      answer_card_count = 0
+      answer_retrieval_source = RFTSOnly
       answer_has_newer_notes = false
       answer_has_citation = false
       answer_has_scope = false
@@ -216,6 +246,8 @@ requirements Research {
       answer_kind = NoAnswer
       answer_ver = none
       answer_card_since = none
+      answer_card_count = 0
+      answer_retrieval_source = RFTSOnly
       answer_has_newer_notes = false
       answer_has_citation = false
       answer_has_scope = false
@@ -239,6 +271,8 @@ requirements Research {
       answer_kind = NoAnswer
       answer_ver = none
       answer_card_since = none
+      answer_card_count = 0
+      answer_retrieval_source = RFTSOnly
       answer_has_newer_notes = false
       answer_has_citation = false
       answer_has_scope = false
@@ -259,6 +293,8 @@ requirements Research {
       answer_kind = NoAnswer
       answer_ver = none
       answer_card_since = none
+      answer_card_count = 0
+      answer_retrieval_source = RFTSOnly
       answer_has_newer_notes = false
       answer_has_citation = false
       answer_has_scope = false
@@ -283,6 +319,8 @@ requirements Research {
       answer_kind = NoAnswer
       answer_ver = none
       answer_card_since = none
+      answer_card_count = 0
+      answer_retrieval_source = RFTSOnly
       answer_has_newer_notes = false
       answer_has_citation = false
       answer_has_scope = false
@@ -294,30 +332,46 @@ requirements Research {
 
   // MARK: - Grounded version-gated lookup (DOC-2, DOC-6, DOC-7, DOC-8, DOC-9, DOC-10)
 
-  action query_found(to: Endpoint, card_since: GoVer, has_newer_feature: Bool) "DOC-7: local two-stage query returns grounded, cited cards with card_since <= project_ver; optional local reranker refines ranking" {
+  action query_found(
+    to: Endpoint,
+    card_since: GoVer,
+    has_newer_feature: Bool,
+    source: RetrievalSource,
+    card_count: CardCount,
+    within_top_n: Bool,
+    passed_threshold: Bool
+  ) "DOC-7 / DOC-10: local two-stage query returns 1..MAX_CARDS grounded, cited, since-gated, threshold-verified cards from top-N union pool" {
     requires enabled
     requires to == Local
     requires pack_state[project_ver] != Missing
     requires card_since <= project_ver
+    requires card_count >= 1 and card_count <= MAX_CARDS
+    requires within_top_n
+    requires passed_threshold
+    requires source == RFTSOnly or (pack_state[project_ver] == Ready and pack_model[project_ver] == selected_model)
     answer_kind = GroundedCards
     answer_ver = some(project_ver)
     answer_card_since = some(card_since)
+    answer_card_count = card_count
+    answer_retrieval_source = source
     answer_has_newer_notes = has_newer_feature
     answer_has_citation = true
     answer_has_scope = true
     answer_grounded = true
-    answer_used_semantic = pack_state[project_ver] == Ready and pack_model[project_ver] == selected_model
+    answer_used_semantic = source != RFTSOnly
     answer_used_reranker = reranker_available
     sent_remote = sent_remote or to == Remote
   }
 
-  action query_not_found(to: Endpoint, has_newer_feature: Bool) "DOC-7: when no chunk matches for project_ver, answer Not Found with searched scope and no fabricated citation/symbol" {
+  action query_not_found(to: Endpoint, has_newer_feature: Bool) "DOC-7: when no chunk passes version-gate and anti-hallucination thresholds for project_ver, answer Not Found with searched scope and no fabricated citation/symbol" {
     requires enabled
     requires to == Local
     requires pack_state[project_ver] != Missing
     answer_kind = GroundedNotFound
     answer_ver = some(project_ver)
     answer_card_since = none
+    answer_card_count = 0
+    answer_retrieval_source = if pack_state[project_ver] == Ready and pack_model[project_ver] == selected_model then RHybridUnion else RFTSOnly
     answer_has_newer_notes = has_newer_feature
     answer_has_citation = false
     answer_has_scope = true
@@ -333,6 +387,8 @@ requirements Research {
     answer_kind = MissingPack
     answer_ver = some(project_ver)
     answer_card_since = none
+    answer_card_count = 0
+    answer_retrieval_source = RFTSOnly
     answer_has_newer_notes = false
     answer_has_citation = false
     answer_has_scope = true
@@ -403,11 +459,21 @@ requirements Research {
     answer_used_reranker => (enabled and reranker_available and answer_kind == GroundedCards)
   }
 
+  invariant CardsBoundedByMax "DOC-10: grounded answers return 1..MAX_CARDS cards and non-card answers carry 0" {
+    (answer_kind == GroundedCards => (answer_card_count >= 1 and answer_card_count <= MAX_CARDS)) and
+    (answer_kind != GroundedCards => answer_card_count == 0)
+  }
+
+  invariant RetrievalSourceMatchesSemantic "DOC-10: semantic/hybrid retrieval requires a Ready pack matching selected_model" {
+    answer_used_semantic == (answer_retrieval_source != RFTSOnly) and
+    (answer_retrieval_source != RFTSOnly => (pack_state[project_ver] == Ready and pack_model[project_ver] == selected_model))
+  }
+
   // MARK: - Acceptance & Forbidden traces
 
   acceptance AC-DOC-1 "DOC-8: offline FTS-only query without LLM returns cited, version-gated cards and allows insertion" {
-    enable() start_batch(0) publish_fts_pack(0) query_found(Local, 0, true) insert_card()
-    expect answer_kind == GroundedCards and answer_has_citation and answer_has_newer_notes and not answer_used_semantic and inserted
+    enable() start_batch(0) publish_fts_pack(0) query_found(Local, 0, true, RFTSOnly, 2, true, true) insert_card()
+    expect answer_kind == GroundedCards and answer_has_citation and answer_has_newer_notes and not answer_used_semantic and answer_card_count == 2 and inserted
   }
 
   acceptance AC-DOC-2 "DOC-5: second Go version pack reuses cached vectors from the shared store" {
@@ -431,32 +497,42 @@ requirements Research {
   }
 
   acceptance AC-DOC-6 "DOC-3: updating an already-Ready pack and aborting leaves the active Ready pack intact and queryable" {
-    enable() start_batch(0) complete_batch_compute(0) start_batch(0) pause_batch() abort_batch() query_found(Local, 0, false)
-    expect pack_state[0] == Ready and answer_kind == GroundedCards and answer_used_semantic
+    enable() start_batch(0) complete_batch_compute(0) start_batch(0) pause_batch() abort_batch() query_found(Local, 0, false, RHybridUnion, 3, true, true)
+    expect pack_state[0] == Ready and answer_kind == GroundedCards and answer_used_semantic and answer_card_count == 3
   }
 
   acceptance AC-DOC-7 "DOC-3: updating an already-Ready pack to completion atomically swaps while reusing cached vectors" {
-    enable() start_batch(0) complete_batch_compute(0) start_batch(0) complete_batch_reuse(0) query_found(Local, 0, false)
+    enable() start_batch(0) complete_batch_compute(0) start_batch(0) complete_batch_reuse(0) query_found(Local, 0, false, RHybridUnion, 1, true, true)
     expect pack_state[0] == Ready and pack_model[0] == 0 and last_batch_reused and answer_used_semantic
   }
 
-  acceptance AC-DOC-8 "DOC-10: Phase 2 two-stage retrieval (semantic + local cross-encoder rerank) returns version-gated cards and allows insertion" {
-    enable() start_batch(0) complete_batch_compute(0) toggle_reranker(true) query_found(Local, 0, false) insert_card()
-    expect answer_kind == GroundedCards and answer_used_semantic and answer_used_reranker and inserted
+  acceptance AC-DOC-8 "DOC-10: Phase 2 two-stage retrieval (union + local cross-encoder rerank) returns up to 3 version-gated cards and allows insertion" {
+    enable() start_batch(0) complete_batch_compute(0) toggle_reranker(true) query_found(Local, 0, false, RHybridUnion, 3, true, true) insert_card()
+    expect answer_kind == GroundedCards and answer_used_semantic and answer_used_reranker and answer_retrieval_source == RHybridUnion and answer_card_count == 3 and inserted
   }
 
-  acceptance AC-DOC-9 "DOC-10: disabling reranker falls back cleanly to Phase 1/unranked grounded cards" {
-    enable() start_batch(0) publish_fts_pack(0) query_found(Local, 0, false)
-    expect answer_kind == GroundedCards and not answer_used_semantic and not answer_used_reranker
+  acceptance AC-DOC-9 "DOC-10: disabling reranker clears reranked results and falls back cleanly to unranked grounded cards" {
+    enable() start_batch(0) complete_batch_compute(0) toggle_reranker(true) query_found(Local, 0, false, RHybridUnion, 2, true, true) toggle_reranker(false) query_found(Local, 0, false, RHybridUnion, 2, true, true)
+    expect answer_kind == GroundedCards and answer_used_semantic and not answer_used_reranker
+  }
+
+  acceptance AC-DOC-10 "DOC-10: honest Not Found is preserved when reranker is enabled and no chunk passes thresholds" {
+    enable() start_batch(0) complete_batch_compute(0) toggle_reranker(true) query_not_found(Local, false)
+    expect answer_kind == GroundedNotFound and not answer_used_reranker and answer_has_scope and not answer_has_citation and answer_card_count == 0
+  }
+
+  acceptance AC-DOC-11 "D-10: switching reranker model clears reranked answers while preserving Ready embedding packs without re-embedding" {
+    enable() start_batch(0) complete_batch_compute(0) toggle_reranker(true) query_found(Local, 0, false, RHybridUnion, 2, true, true) switch_rerank_model() query_found(Local, 0, false, RHybridUnion, 1, true, true)
+    expect pack_state[0] == Ready and answer_used_reranker and answer_retrieval_source == RHybridUnion and answer_card_count == 1
   }
 
   forbidden FB-DOC-1 "DOC-6: queries to a remote endpoint are refused" {
-    enable() start_batch(0) publish_fts_pack(0) query_found(Remote, 0, false)
+    enable() start_batch(0) publish_fts_pack(0) query_found(Remote, 0, false, RFTSOnly, 1, true, true)
     expect rejected
   }
 
   forbidden FB-DOC-2 "DOC-2: cannot answer from version 1 pack when project_ver is 0" {
-    enable() start_batch(1) complete_batch_compute(1) query_found(Local, 0, false)
+    enable() start_batch(1) complete_batch_compute(1) query_found(Local, 0, false, RFTSOnly, 1, true, true)
     expect rejected
   }
 
@@ -466,27 +542,37 @@ requirements Research {
   }
 
   forbidden FB-DOC-4 "DOC-1: cannot query while docs lookup is disabled" {
-    start_batch(0) publish_fts_pack(0) query_found(Local, 0, false)
+    start_batch(0) publish_fts_pack(0) query_found(Local, 0, false, RFTSOnly, 1, true, true)
     expect rejected
   }
 
   forbidden FB-DOC-5 "DOC-9: cannot insert stale card after switching project version" {
-    enable() start_batch(0) publish_fts_pack(0) query_found(Local, 0, false) set_project_version(1) insert_card()
+    enable() start_batch(0) publish_fts_pack(0) query_found(Local, 0, false, RFTSOnly, 1, true, true) set_project_version(1) insert_card()
     expect rejected
   }
 
   forbidden FB-DOC-6 "DOC-2: cannot return a card whose since version exceeds project_ver" {
-    enable() start_batch(0) publish_fts_pack(0) query_found(Local, 1, false)
+    enable() start_batch(0) publish_fts_pack(0) query_found(Local, 1, false, RFTSOnly, 1, true, true)
     expect rejected
   }
 
   forbidden FB-DOC-7 "DOC-10: reranking never bypasses the chunk since version gate" {
-    enable() start_batch(0) complete_batch_compute(0) toggle_reranker(true) query_found(Local, 1, false)
+    enable() start_batch(0) complete_batch_compute(0) toggle_reranker(true) query_found(Local, 1, false, RHybridUnion, 1, true, true)
     expect rejected
   }
 
   forbidden FB-DOC-8 "DOC-10: reranking never permits sending queries to a remote endpoint" {
-    enable() start_batch(0) complete_batch_compute(0) toggle_reranker(true) query_found(Remote, 0, false)
+    enable() start_batch(0) complete_batch_compute(0) toggle_reranker(true) query_found(Remote, 0, false, RHybridUnion, 1, true, true)
+    expect rejected
+  }
+
+  forbidden FB-DOC-9 "DOC-10: candidates below the anti-hallucination threshold cannot be returned as grounded cards" {
+    enable() start_batch(0) complete_batch_compute(0) toggle_reranker(true) query_found(Local, 0, false, RHybridUnion, 1, true, false)
+    expect rejected
+  }
+
+  forbidden FB-DOC-10 "DOC-10: candidates outside the top-N rerank pool cannot be returned as grounded cards" {
+    enable() start_batch(0) complete_batch_compute(0) toggle_reranker(true) query_found(Local, 0, false, RHybridUnion, 1, false, true)
     expect rejected
   }
 }
@@ -494,4 +580,5 @@ requirements Research {
 verify {
   values GoVer = 0..1
   values ModelId = 0..1
+  values CardCount = 0..3
 }

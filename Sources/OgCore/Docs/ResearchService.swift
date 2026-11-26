@@ -372,9 +372,9 @@ public enum DocsCodeInserter {
 /// Pipeline (fixed, never an unbounded agent loop):
 /// 1. Rule-based routing (`DocsQueryRouter`)
 /// 2. Target Go version resolution (FR-2) and exact-pack check (§7.4)
-/// 3. Stage 1 retrieval: union of Deterministic + FTS5 + optional Semantic candidates (capped at `retrievalPoolLimit = 30`)
+/// 3. Stage 1 retrieval: collect Deterministic (up to 10) + FTS5 (up to 20) + optional Semantic (up to 30) candidates
 /// 4. Per-chunk `since` version gating BEFORE final ranking (FR-10, DOC-2, DOC-10)
-/// 5. Stage 2 optional local cross-encoder reranking (`DocsReranker`) + anti-hallucination gating + max-3 cap (UX-3, Issue #21)
+/// 5. Stage 2 balanced union pool (capped at `retrievalPoolLimit = 30`) -> optional local cross-encoder reranking (`DocsReranker`) + anti-hallucination gating + max-3 cap (UX-3, Issue #21)
 ///    Falls back cleanly to Stage 1 (Phase 1 behavior) when no reranker is configured or if reranking fails.
 /// 6. Grounded card rendering with citations, Go version, and honest Not Found (FR-12..15)
 public actor ResearchService {
@@ -601,13 +601,15 @@ public actor ResearchService {
 
         try Task.checkCancellation()
 
-        // 3c. Optional semantic search ONLY when pack is Ready AND model matches (FR-27, FR-28, DOC-4)
+        // 3c. Optional semantic search ONLY when pack is Ready AND model matches (FR-27, FR-28, DOC-4).
+        // Any non-cancellation failure from the embedder or vector store degrades cleanly to Phase 1 FTS (V-4).
         var usedSemantic = false
         if manifest.status == .ready,
            let embedder = queryEmbedder,
            manifest.embeddingModelID == embedder.descriptor.id,
            manifest.embeddingModelVersion == embedder.descriptor.version {
-            if let qVec = try? await embedder.embedQuery(plan.originalQuery) {
+            do {
+                let qVec = try await embedder.embedQuery(plan.originalQuery)
                 try Task.checkCancellation()
                 let semHits = try await index.semanticSearch(
                     queryVector: qVec,
@@ -619,6 +621,10 @@ public actor ResearchService {
                 // Balanced weight so semantic assists recall without swamping deterministic/FTS precision (M-1).
                 merge(semHits, weight: 0.4)
                 usedSemantic = true
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                usedSemantic = false
             }
         }
 
@@ -775,11 +781,19 @@ public actor ResearchService {
             let documents = pool.map(\.candidate.chunk.rerankDocumentText)
 
             try Task.checkCancellation()
-            if let rerankResults = try? await activeReranker.rerank(
-                query: plan.originalQuery,
-                documents: documents,
-                topN: documents.count
-            ), !rerankResults.isEmpty {
+            let rerankOutcome: [DocsRerankerResult]?
+            do {
+                rerankOutcome = try await activeReranker.rerank(
+                    query: plan.originalQuery,
+                    documents: documents,
+                    topN: documents.count
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                rerankOutcome = nil
+            }
+            if let rerankResults = rerankOutcome, !rerankResults.isEmpty {
                 try Task.checkCancellation()
                 var rrScoreByIndex: [Int: Double] = [:]
                 rrScoreByIndex.reserveCapacity(rerankResults.count)

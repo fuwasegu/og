@@ -137,6 +137,55 @@ public struct DocsServerConfig: Sendable, Hashable, Codable {
     }
 
     public var healthPath: String { "/health" }
+
+    /// Stable key identifying the exact model/backend configuration for offline-cached launch reuse (W-8).
+    public var cacheKey: String {
+        let rr = rerankEnabled ? rerankModel.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+        return "\(backend.rawValue)|\(embedModel.trimmingCharacters(in: .whitespacesAndNewlines))|\(rerankEnabled)|\(rr)"
+    }
+}
+
+/// Sliding-window crash restart and backoff policy for the Docs inference server
+/// (`spec/req/docs_server.fsl`, `spec/design/docs_server.fsl`, V-5).
+public struct DocsServerRestartPolicy: Sendable, Equatable {
+    public let maxFailures: Int
+    public let windowSeconds: TimeInterval
+    public let baseBackoffSeconds: TimeInterval
+    public private(set) var failureTimestamps: [Date] = []
+
+    public init(
+        maxFailures: Int = 3,
+        windowSeconds: TimeInterval = 120,
+        baseBackoffSeconds: TimeInterval = 1.0
+    ) {
+        self.maxFailures = max(1, maxFailures)
+        self.windowSeconds = max(1, windowSeconds)
+        self.baseBackoffSeconds = max(0, baseBackoffSeconds)
+    }
+
+    /// Removes failures older than the sliding crash window.
+    public mutating func prune(now: Date) {
+        let cutoff = now.addingTimeInterval(-windowSeconds)
+        failureTimestamps.removeAll { $0 < cutoff }
+    }
+
+    /// Records a failure (startup exit, health timeout, or Ready crash) at `now`.
+    /// Returns whether another restart is allowed, the backoff delay in seconds, and the windowed count.
+    public mutating func recordFailure(at now: Date) -> (shouldRetry: Bool, delaySeconds: TimeInterval, failureCount: Int) {
+        prune(now: now)
+        failureTimestamps.append(now)
+        let count = failureTimestamps.count
+        guard count < maxFailures else {
+            return (false, 0, count)
+        }
+        let exponent = max(0, count - 1)
+        let delay = min(8.0, baseBackoffSeconds * pow(2.0, Double(exponent)))
+        return (true, delay, count)
+    }
+
+    public mutating func reset() {
+        failureTimestamps.removeAll()
+    }
 }
 
 /// Builds launch commands and manages the embedded MLX server script for the Docs inference server
@@ -163,10 +212,12 @@ public enum DocsModelServerCommand {
         return url
     }
 
-    /// Builds argv for the Docs inference server bound strictly to `127.0.0.1:<port>` (D-9, DES-1, DES-6).
+    /// Builds argv for the Docs inference server bound strictly to `127.0.0.1:<port>` (D-9, DES-1, DES-6, W-8).
+    /// When `offline` is true, passes `--offline` to `uvx` so cached packages and models start with zero network access.
     public static func argv(
         for config: DocsServerConfig,
         port: Int,
+        offline: Bool = false,
         scriptURL: URL? = nil,
         locator: ToolLocator = .shared
     ) throws -> [String] {
@@ -181,8 +232,11 @@ public enum DocsModelServerCommand {
                 throw ModelServerCommandError.emptyCustomCommand
             }
             let preset = DocsEmbedModelPreset.matching(id: embedID)
-            var cmd = [
-                uvx,
+            var cmd = [uvx]
+            if offline {
+                cmd.append("--offline")
+            }
+            cmd += [
                 "--with", "mlx",
                 "--with", "tokenizers",
                 "--with", "huggingface-hub",

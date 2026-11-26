@@ -28,11 +28,16 @@ public final class LoopbackRerankerClient: DocsReranker, Sendable {
     public let modelID: String
     private let session: URLSession
 
-    public init?(endpoint: URL, modelID: String) {
+    public init?(endpoint: URL, modelID: String, timeoutInterval: TimeInterval? = nil) {
         guard LocalCompletionClient.isLoopback(endpoint) else { return nil }
         self.endpoint = endpoint
         self.modelID = modelID
-        self.session = URLSession(configuration: LocalCompletionClient.sessionConfiguration)
+        let cfg = LocalCompletionClient.sessionConfiguration.copy() as? URLSessionConfiguration ?? .ephemeral
+        if let timeoutInterval {
+            cfg.timeoutIntervalForRequest = timeoutInterval
+            cfg.timeoutIntervalForResource = timeoutInterval
+        }
+        self.session = URLSession(configuration: cfg, delegate: LoopbackOnlySessionDelegate.shared, delegateQueue: nil)
     }
 
     deinit {

@@ -31,7 +31,8 @@ FSL で表せるのは、操作の順序や組み合わせで壊れうる部分�
 | 実行・デバッグ | RUN-1, RUN-2, RUN-3, RUN-4 | `req/run_debug.fsl` |
 | Git | VCS-1, VCS-2, VCS-3 | `req/vcs.fsl` |
 | 補完 | GO-1（Tab の優先順位）, GO-5 | `req/completion.fsl` |
-| AI サーバー | AI-1〜AI-6 | `req/model_server.fsl` |
+| AI サーバー（補完） | AI-1〜AI-6 | `req/model_server.fsl` |
+| Docs 推論サーバー | D-9, D-10, AI-1〜AI-6 | `req/docs_server.fsl` |
 | Go 調べ物（Docs） | DOC-1〜DOC-10 | `req/research.fsl` |
 | テストで確認 | WS-2, WS-3, FT-1, FT-3, ED-4, ED-5 | UI テスト |
 | テストで確認 | NAV-1〜NAV-6, LSP-3 | gopls 結合テスト（読み取りのみ） |
@@ -66,7 +67,8 @@ FSL で表せるのは、操作の順序や組み合わせで壊れうる部分�
 | 実行・デバッグ | `design/run_debug.fsl` | `design/run_debug_refines_req.fsl` | refines |
 | Git | `design/vcs.fsl` | `design/vcs_refines_req.fsl` | refines |
 | 補完 | `design/completion.fsl` | `design/completion_refines_req.fsl` | refines |
-| AI サーバー | `design/model_server.fsl` | `design/model_server_refines_req.fsl` | refines |
+| AI サーバー（補完） | `design/model_server.fsl` | `design/model_server_refines_req.fsl` | refines |
+| Docs 推論サーバー | `design/docs_server.fsl` | `design/docs_server_refines_req.fsl` | refines |
 | Go 調べ物（Docs） | `design/research.fsl` | `design/research_refines_req.fsl` | refines |
 
 ```sh

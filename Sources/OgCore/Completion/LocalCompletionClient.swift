@@ -2,6 +2,22 @@ import Foundation
 
 // CONTRACT (owned by the Completion agent; keep these signatures).
 
+/// URLSession delegate that blocks all HTTP 3xx redirects so loopback traffic can never
+/// be redirected off-machine (V-3, NeverLeavesMachine / DOC-6).
+public final class LoopbackOnlySessionDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    public static let shared = LoopbackOnlySessionDelegate()
+
+    public func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping @Sendable (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
+    }
+}
+
 /// Local-only FIM completion against llama-server (spec/design/completion.fsl).
 public final class LocalCompletionClient: Sendable {
     /// Wire format of the server.
@@ -38,7 +54,11 @@ public final class LocalCompletionClient: Sendable {
         let request = makeRequest(prefix: prefix, suffix: suffix, maxTokens: maxTokens)
         return AsyncThrowingStream { continuation in
             let task = Task {
-                let session = URLSession(configuration: Self.sessionConfiguration)
+                let session = URLSession(
+                    configuration: Self.sessionConfiguration,
+                    delegate: LoopbackOnlySessionDelegate.shared,
+                    delegateQueue: nil
+                )
                 defer { session.invalidateAndCancel() }
                 do {
                     let (bytes, response) = try await session.bytes(for: request)
@@ -75,7 +95,7 @@ public final class LocalCompletionClient: Sendable {
 
     // MARK: - Internals (internal for tests)
 
-    static let sessionConfiguration: URLSessionConfiguration = {
+    public static let sessionConfiguration: URLSessionConfiguration = {
         let c = URLSessionConfiguration.ephemeral
         c.connectionProxyDictionary = [:]          // never route loopback traffic through a proxy
         c.timeoutIntervalForRequest = 15

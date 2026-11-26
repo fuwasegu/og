@@ -152,6 +152,9 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         docsReembedButton.target = self
         docsReembedButton.action = #selector(docsReembedClicked)
         let docsServerRow = NSStackView(views: [docsServerStatus, NSView(), docsReembedButton, docsServerActionButton])
+        let docsSemanticHint = NSTextField(wrappingLabelWithString: "Requires `uv` (`brew install uv`). First start downloads ~1.15 GB of MLX models (BGE-M3 8-bit + BGE-Reranker-v2-M3 8-bit) and Python packages via `uvx`. Once cached, startup takes ~3s completely offline on 127.0.0.1; turn off anytime to stay in Phase 1 FTS5 mode.")
+        docsSemanticHint.font = Theme.smallFont
+        docsSemanticHint.textColor = .secondaryLabelColor
 
         for p in DocsBatchRunPolicy.allCases { docsBatchPolicy.addItem(withTitle: p.title) }
         docsBatchPolicy.target = self
@@ -187,7 +190,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
             reopen, NSBox(),
             aiEnabled, row("Backend", backend), row("Model", model), customRow, hint, statusRow, logScroll,
             NSBox(),
-            docsEnabled, docsSemanticEnabled, row("Embedding", docsEmbedModel), docsRerankEnabled, row("Reranker", docsRerankModel),
+            docsEnabled, docsSemanticEnabled, docsSemanticHint, row("Embedding", docsEmbedModel), docsRerankEnabled, row("Reranker", docsRerankModel),
             docsServerRow, row("Indexing", docsBatchPolicy), docsButtons, docsPacksLabel, docsProgressBar, docsProgressLabel
         ])
         stack.orientation = .vertical
@@ -196,6 +199,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
         statusRow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
         logScroll.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
+        docsSemanticHint.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
         docsServerRow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
         docsProgressBar.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
         docsPacksLabel.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true

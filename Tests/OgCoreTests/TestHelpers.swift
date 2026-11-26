@@ -1,4 +1,5 @@
 // Foundation helpers for tests live here (AGENTS.md: never import Foundation and Testing in one file).
+import Darwin
 import Foundation
 import SQLite3
 @testable import OgCore
@@ -611,6 +612,254 @@ func makeFakeToolLocator(with toolName: String, in dir: TempDir) -> ToolLocator 
     try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: exe.path)
     return ToolLocator(searchPath: [binDir.path], environment: ["PATH": binDir.path])
 }
+
+func makeTestDate(offsetSeconds: Double) -> Date {
+    Date(timeIntervalSinceReferenceDate: 1_000_000 + offsetSeconds)
+}
+
+/// Embedder whose `embedBatch` always fails so tests verify single-item fallback (W-5).
+final class BatchFailingThenSingleEmbedder: DocsEmbedder, @unchecked Sendable {
+    let descriptor: EmbeddingModelDescriptor
+    let preferredBatchSize: Int
+    private let lock = NSLock()
+    private var _batchFailures = 0
+    private var _singleCalls = 0
+
+    init(id: String = "batch-fallback", version: String = "v1", batchSize: Int = 4) {
+        self.descriptor = EmbeddingModelDescriptor(id: id, version: version)
+        self.preferredBatchSize = batchSize
+    }
+
+    var batchFailures: Int { lock.withLock { _batchFailures } }
+    var singleCalls: Int { lock.withLock { _singleCalls } }
+
+    func embed(_ text: String) async throws -> [Float] {
+        lock.withLock { _singleCalls += 1 }
+        var v = Array(repeating: Float(0), count: 8)
+        for (idx, b) in text.utf8.enumerated() { v[idx % 8] += Float(b) / 255.0 }
+        let norm = sqrt(v.reduce(0) { $0 + $1 * $1 })
+        return norm > 0 ? v.map { $0 / norm } : v
+    }
+
+    func embedBatch(_ texts: [String]) async throws -> [[Float]] {
+        lock.withLock { _batchFailures += 1 }
+        throw DocsStorageError.embeddingFailed("injected batch endpoint failure")
+    }
+}
+
+/// Drops `shared_vectors` table from an existing `SharedVectorStore` DB so `semanticSearch` throws SQLite errors (V-4).
+func corruptSharedVectorStoreTable(at databaseURL: URL) throws {
+    var db: OpaquePointer?
+    guard sqlite3_open_v2(databaseURL.path, &db, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK, let db else {
+        throw DocsStorageError.sqlite("unable to open shared vector store for corruption test")
+    }
+    defer { sqlite3_close(db) }
+    var err: UnsafeMutablePointer<CChar>?
+    if sqlite3_exec(db, "DROP TABLE IF EXISTS shared_vectors;", nil, nil, &err) != SQLITE_OK {
+        let msg = err.map { String(cString: $0) } ?? "drop table failed"
+        sqlite3_free(err)
+        throw DocsStorageError.sqlite(msg)
+    }
+}
+
+/// Programmable HTTP response for `LocalMockHTTPServer`.
+struct LocalMockHTTPResponse: Sendable {
+    var statusCode: Int
+    var statusText: String
+    var headers: [String: String]
+    var body: Data
+    var delaySeconds: Double
+
+    init(
+        statusCode: Int = 200,
+        statusText: String = "OK",
+        headers: [String: String] = ["Content-Type": "application/json"],
+        bodyString: String = "{}",
+        delaySeconds: Double = 0
+    ) {
+        self.statusCode = statusCode
+        self.statusText = statusText
+        self.headers = headers
+        self.body = Data(bodyString.utf8)
+        self.delaySeconds = delaySeconds
+    }
+}
+
+/// Lightweight loopback-only POSIX socket HTTP/1.1 mock server for testing real `URLSession` client behavior
+/// (redirects, HTTP 500, malformed JSON, empty results, timeouts — V-3, V-7, W-9).
+final class LocalMockHTTPServer: @unchecked Sendable {
+    typealias Handler = @Sendable (_ method: String, _ path: String, _ body: String) -> LocalMockHTTPResponse
+
+    let port: Int
+    var baseURL: URL { URL(string: "http://127.0.0.1:\(port)")! }
+
+    private let listenFD: Int32
+    private let queue = DispatchQueue(label: "og.tests.mock-http", attributes: .concurrent)
+    private let lock = NSLock()
+    private var _handler: Handler
+    private var _stopped = false
+
+    init(handler: @escaping Handler) throws {
+        self._handler = handler
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else {
+            throw DocsStorageError.io("socket() failed")
+        }
+        var one: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = 0
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+
+        let bound = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bound == 0 else {
+            close(fd)
+            throw DocsStorageError.io("bind() failed")
+        }
+        guard listen(fd, 16) == 0 else {
+            close(fd)
+            throw DocsStorageError.io("listen() failed")
+        }
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let named = withUnsafeMutablePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getsockname(fd, $0, &len)
+            }
+        }
+        guard named == 0 else {
+            close(fd)
+            throw DocsStorageError.io("getsockname() failed")
+        }
+        self.listenFD = fd
+        self.port = Int(UInt16(bigEndian: addr.sin_port))
+        startAcceptLoop()
+    }
+
+    deinit {
+        stop()
+    }
+
+    func setHandler(_ handler: @escaping Handler) {
+        lock.withLock { _handler = handler }
+    }
+
+    func stop() {
+        let shouldClose = lock.withLock { () -> Bool in
+            guard !_stopped else { return false }
+            _stopped = true
+            return true
+        }
+        if shouldClose {
+            shutdown(listenFD, SHUT_RDWR)
+            close(listenFD)
+        }
+    }
+
+    private func currentHandler() -> Handler {
+        lock.withLock { _handler }
+    }
+
+    private func isStopped() -> Bool {
+        lock.withLock { _stopped }
+    }
+
+    private func startAcceptLoop() {
+        let fd = listenFD
+        queue.async { [weak self] in
+            while let self, !self.isStopped() {
+                var clientAddr = sockaddr_in()
+                var addrLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+                let clientFD = withUnsafeMutablePointer(to: &clientAddr) {
+                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                        accept(fd, $0, &addrLen)
+                    }
+                }
+                if clientFD < 0 {
+                    if self.isStopped() { break }
+                    continue
+                }
+                self.queue.async { [weak self] in
+                    self?.handleConnection(clientFD)
+                }
+            }
+        }
+    }
+
+    private func handleConnection(_ clientFD: Int32) {
+        defer { close(clientFD) }
+        var nosig: Int32 = 1
+        setsockopt(clientFD, SOL_SOCKET, SO_NOSIGPIPE, &nosig, socklen_t(MemoryLayout<Int32>.size))
+
+        var buffer = Data()
+        var chunk = [UInt8](repeating: 0, count: 4096)
+        let delimiter = Data("\r\n\r\n".utf8)
+        var headerEndRange: Range<Data.Index>?
+
+        while headerEndRange == nil && buffer.count < 65536 {
+            let n = recv(clientFD, &chunk, chunk.count, 0)
+            if n <= 0 { return }
+            buffer.append(chunk, count: n)
+            headerEndRange = buffer.range(of: delimiter)
+        }
+        guard let hdrRange = headerEndRange else { return }
+
+        let headerText = String(data: buffer[..<hdrRange.lowerBound], encoding: .utf8) ?? ""
+        let headerLines = headerText.components(separatedBy: "\r\n")
+        let requestParts = (headerLines.first ?? "").split(separator: " ").map(String.init)
+        let method = requestParts.count > 0 ? requestParts[0] : "GET"
+        let path = requestParts.count > 1 ? requestParts[1] : "/"
+
+        var contentLength = 0
+        for line in headerLines.dropFirst() {
+            if let colon = line.firstIndex(of: ":") {
+                let name = line[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+                if name == "content-length" {
+                    contentLength = Int(line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)) ?? 0
+                }
+            }
+        }
+
+        var bodyData = Data(buffer[hdrRange.upperBound...])
+        while bodyData.count < contentLength {
+            let n = recv(clientFD, &chunk, min(chunk.count, contentLength - bodyData.count), 0)
+            if n <= 0 { break }
+            bodyData.append(chunk, count: n)
+        }
+        let bodyString = String(data: bodyData.prefix(contentLength), encoding: .utf8) ?? ""
+
+        let response = currentHandler()(method, path, bodyString)
+        if response.delaySeconds > 0 {
+            usleep(useconds_t(response.delaySeconds * 1_000_000))
+        }
+
+        var headerOut = "HTTP/1.1 \(response.statusCode) \(response.statusText)\r\n"
+        for (k, v) in response.headers {
+            headerOut += "\(k): \(v)\r\n"
+        }
+        headerOut += "Content-Length: \(response.body.count)\r\n"
+        headerOut += "Connection: close\r\n\r\n"
+
+        var wire = Data(headerOut.utf8)
+        wire.append(response.body)
+        wire.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            var sent = 0
+            while sent < raw.count {
+                let written = send(clientFD, base.advanced(by: sent), raw.count - sent, 0)
+                if written <= 0 { break }
+                sent += written
+            }
+        }
+    }
+}
+
 
 
 

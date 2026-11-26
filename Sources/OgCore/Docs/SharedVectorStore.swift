@@ -69,11 +69,16 @@ public final class LoopbackEmbeddingClient: DocsEmbedder, Sendable {
     public let preferredBatchSize: Int = 32
     private let session: URLSession
 
-    public init?(endpoint: URL, descriptor: EmbeddingModelDescriptor) {
+    public init?(endpoint: URL, descriptor: EmbeddingModelDescriptor, timeoutInterval: TimeInterval? = nil) {
         guard LocalCompletionClient.isLoopback(endpoint) else { return nil }
         self.endpoint = endpoint
         self.descriptor = descriptor
-        self.session = URLSession(configuration: LocalCompletionClient.sessionConfiguration)
+        let cfg = LocalCompletionClient.sessionConfiguration.copy() as? URLSessionConfiguration ?? .ephemeral
+        if let timeoutInterval {
+            cfg.timeoutIntervalForRequest = timeoutInterval
+            cfg.timeoutIntervalForResource = timeoutInterval
+        }
+        self.session = URLSession(configuration: cfg, delegate: LoopbackOnlySessionDelegate.shared, delegateQueue: nil)
     }
 
     deinit {
