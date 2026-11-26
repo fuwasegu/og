@@ -64,6 +64,7 @@ final class DocsManager {
         set {
             debugEnabledOverride = nil
             UserDefaults.standard.set(newValue, forKey: "og.docs.enabled")
+            DocsServerManager.shared.syncWithDocsOptIn(docsEnabled: newValue)
             let svc = service
             Task { [weak self] in
                 await svc?.setEnabled(newValue)
@@ -89,6 +90,7 @@ final class DocsManager {
 
     func startIfEnabled() {
         guard enabled else { return }
+        DocsServerManager.shared.startIfEnabled()
         Task { [weak self] in
             await self?.service?.setEnabled(true)
             await self?.ensureDefaultPackIfNeeded()
@@ -98,6 +100,35 @@ final class DocsManager {
     func shutdownForQuit() {
         for (_, task) in batchTasks { task.cancel() }
         batchTasks.removeAll()
+        DocsServerManager.shared.shutdownForQuit()
+    }
+
+    /// Synchronizes the active loopback embedder and reranker clients from `DocsServerManager` into `ResearchService` (Phase 2, D-9, DOC-10).
+    func syncInferenceClients() {
+        guard let svc = service else { return }
+        let embedder = DocsServerManager.shared.embedderClient
+        let reranker = DocsServerManager.shared.rerankerClient
+        let endpoint = DocsServerManager.shared.endpointURL
+        Task { [weak self] in
+            try? await svc.setLocalEndpoint(endpoint)
+            await svc.setEmbedder(embedder)
+            await svc.setReranker(reranker)
+            self?.notifyPacksChanged()
+        }
+    }
+
+    /// Handles an embedding model change in Settings: demotes incompatible packs to FTS-only (FR-27, DOC-4).
+    func handleEmbeddingModelChanged(to descriptor: EmbeddingModelDescriptor) {
+        guard let pm = packManager else { return }
+        Task { [weak self] in
+            do {
+                _ = try await pm.selectEmbeddingModel(descriptor)
+                self?.lastError = nil
+            } catch {
+                self?.lastError = error.localizedDescription
+            }
+            await self?.refreshPacks()
+        }
     }
 
     // MARK: - Pack inventory & ingestion batches (FR-20, FR-22..29, M-5)
@@ -156,6 +187,7 @@ final class DocsManager {
         activeProgress = DocsBatchProgress(goVersion: goVersion, phase: .extracting)
         notifyProgressChanged()
 
+        let activeEmbedder = DocsServerManager.shared.embedderClient
         batchTasks[goVersion] = Task.detached(priority: .utility) {
             let stdlib = DocsCorpusExtractor.extractStdlib(fromGorootSrc: srcURL, goVersion: goVersion)
             let extractedIDs = Set(stdlib.map(\.stableID))
@@ -163,7 +195,7 @@ final class DocsManager {
             // Keep real stdlib first; add non-stdlib (spec/guide/release) and any stdlib not covered by GOROOT.
             let combined = stdlib + bundled.filter { $0.source != .stdlib || !extractedIDs.contains($0.stableID) }
             do {
-                _ = try await pm.ingest(goVersion: goVersion, chunks: combined, embedder: nil) { progress in
+                _ = try await pm.ingest(goVersion: goVersion, chunks: combined, embedder: activeEmbedder) { progress in
                     Task { @MainActor in
                         DocsManager.shared.handleBatchProgress(progress)
                     }
@@ -177,9 +209,10 @@ final class DocsManager {
 
     func startIngestion(goVersion: String, chunks: [DocsChunk]) {
         guard let pm = packManager else { return }
+        let activeEmbedder = DocsServerManager.shared.embedderClient
         batchTasks[goVersion]?.cancel()
         lastError = nil
-        let est = DocsPackManager.estimateBatch(chunks: chunks, includesEmbeddings: false)
+        let est = DocsPackManager.estimateBatch(chunks: chunks, includesEmbeddings: activeEmbedder != nil)
         activeProgress = DocsBatchProgress(
             goVersion: goVersion,
             phase: .extracting,
@@ -192,12 +225,43 @@ final class DocsManager {
         // FR-24: run at background `.utility` priority so typing & completion are never blocked.
         batchTasks[goVersion] = Task.detached(priority: .utility) {
             do {
-                _ = try await pm.ingest(goVersion: goVersion, chunks: chunks, embedder: nil) { progress in
+                _ = try await pm.ingest(goVersion: goVersion, chunks: chunks, embedder: activeEmbedder) { progress in
                     Task { @MainActor in
                         DocsManager.shared.handleBatchProgress(progress)
                     }
                 }
                 await DocsManager.shared.finishBatch(goVersion: goVersion, error: nil)
+            } catch {
+                await DocsManager.shared.finishBatch(goVersion: goVersion, error: error.localizedDescription)
+            }
+        }
+    }
+
+    /// Re-embeds an already-installed pack in place with the active local MLX embedder (FR-27, FR-30).
+    func startReembedPack(goVersion: String) {
+        guard let pm = packManager else { return }
+        guard let activeEmbedder = DocsServerManager.shared.embedderClient else {
+            lastError = "Docs semantic server is not ready yet. Enable and start it first."
+            notifyProgressChanged()
+            return
+        }
+        batchTasks[goVersion]?.cancel()
+        lastError = nil
+        activeProgress = DocsBatchProgress(goVersion: goVersion, phase: .embedding)
+        notifyProgressChanged()
+
+        batchTasks[goVersion] = Task.detached(priority: .utility) {
+            do {
+                let report = try await pm.reembedExistingPack(goVersion: goVersion, embedder: activeEmbedder) { progress in
+                    Task { @MainActor in
+                        DocsManager.shared.handleBatchProgress(progress)
+                    }
+                }
+                if report == nil {
+                    await DocsManager.shared.finishBatch(goVersion: goVersion, error: "No installed pack for go\(goVersion).")
+                } else {
+                    await DocsManager.shared.finishBatch(goVersion: goVersion, error: nil)
+                }
             } catch {
                 await DocsManager.shared.finishBatch(goVersion: goVersion, error: error.localizedDescription)
             }

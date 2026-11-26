@@ -67,7 +67,7 @@ public enum DocsCorpusExtractor {
                 let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
                 guard isDir else { continue }
                 let name = url.lastPathComponent
-                if name == "internal" || name == "vendor" || name == "testdata" || name == "cmd" {
+                if name == "internal" || name == "vendor" || name == "testdata" || name == "cmd" || name.hasPrefix("_") || name.hasPrefix(".") {
                     enumerator.skipDescendants()
                     continue
                 }

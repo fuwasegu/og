@@ -1,0 +1,231 @@
+// og — Local Docs inference server lifecycle (owned by the application, Issue #21 Q-2)
+//
+// Source: D-9 / D-10 + Issue #21 Q-2 resolution (2026-11-26).
+//   D-9:  og starts, supervises, and stops the Docs inference server itself
+//         (unified Apple Silicon MLX process via `uvx` serving `/v1/embeddings`
+//         and `/v1/rerank`). It never attaches to a server started outside og.
+//   D-10: both embedding and reranker models are chosen in og's settings.
+//
+// ASSUME-1 (confirmed 2026-11-26, Issue #21 Q-2): dedicated role slot separate from
+//   inline completion (`spec/req/model_server.fsl`). Starts only when both Docs lookup
+//   and Docs semantic search are enabled; stops immediately when either is disabled or
+//   when the app quits.
+// ASSUME-2 (Issue #21 review V-5): crashes — both during startup/loading and after
+//   becoming Ready within the crash window — count toward MAXR; hitting MAXR stops
+//   automatic restarts and enters Failed until the user explicitly retries.
+// ASSUME-3 (representation only): two models per role, MAXR = 2.
+requirements DocsServer {
+  number Model
+  number Tries
+  const MAXR = 2
+
+  enum Phase { Off, Starting, Ready, Failed }
+
+  state {
+    app_running:      Bool,
+    docs_enabled:     Bool,
+    semantic_enabled: Bool,
+    phase:            Phase,
+    embed_model:      Model,
+    loaded_embed:     Model,
+    rerank_enabled:   Bool,
+    rerank_model:     Model,
+    loaded_rerank:    Model,
+    loaded_has_rr:    Bool,
+    failures:         Tries
+  }
+
+  init {
+    app_running = true
+    docs_enabled = false
+    semantic_enabled = false
+    phase = Off
+    embed_model = 0
+    loaded_embed = 0
+    rerank_enabled = true
+    rerank_model = 0
+    loaded_rerank = 0
+    loaded_has_rr = false
+    failures = 0
+  }
+
+  def wanted() = app_running and docs_enabled and semantic_enabled
+  def running() = phase == Starting or phase == Ready
+
+  action enable_docs() "DOC-1: opt-in to Go Docs starts Docs server if semantic search was already enabled" {
+    requires app_running
+    requires not docs_enabled
+    docs_enabled = true
+    if semantic_enabled {
+      phase = Starting
+      loaded_embed = embed_model
+      loaded_rerank = rerank_model
+      loaded_has_rr = rerank_enabled
+      failures = 0
+    }
+  }
+
+  action disable_docs() "AI-2: disabling Go Docs stops the Docs inference server" {
+    requires docs_enabled
+    docs_enabled = false
+    phase = Off
+  }
+
+  action enable_semantic() "AI-1: turning Docs semantic search on starts the server when Docs is enabled" {
+    requires app_running
+    requires not semantic_enabled
+    semantic_enabled = true
+    if docs_enabled {
+      phase = Starting
+      loaded_embed = embed_model
+      loaded_rerank = rerank_model
+      loaded_has_rr = rerank_enabled
+      failures = 0
+    }
+  }
+
+  action disable_semantic() "AI-2: turning Docs semantic search off stops the server" {
+    requires semantic_enabled
+    semantic_enabled = false
+    phase = Off
+  }
+
+  fair action became_ready() "AI-3: server becomes ready once loopback /health succeeds" {
+    requires phase == Starting
+    phase = Ready
+  }
+
+  action start_failed() "AI-4: startup/timeout/download failure counts toward MAXR" {
+    requires phase == Starting
+    requires failures < MAXR
+    failures = failures + 1
+    if failures + 1 < MAXR { phase = Starting } else { phase = Failed }
+  }
+
+  action crashed() "AI-4: crash while Ready increments windowed failure count and stops at MAXR (V-5)" {
+    requires phase == Ready
+    requires failures < MAXR
+    failures = failures + 1
+    if failures + 1 < MAXR { phase = Starting } else { phase = Failed }
+  }
+
+  action reset_crash_window() "AI-4: sustained healthy uptime clears the crash-window counter" {
+    requires phase == Ready
+    requires failures > 0
+    failures = 0
+  }
+
+  action retry() "AI-5: after giving up, the user can retry with the currently selected models" {
+    requires wanted()
+    requires phase == Failed
+    phase = Starting
+    loaded_embed = embed_model
+    loaded_rerank = rerank_model
+    loaded_has_rr = rerank_enabled
+    failures = 0
+  }
+
+  action select_embed_model(m: Model) "D-10: changing the embedding model restarts a running Docs server" {
+    requires embed_model != m
+    embed_model = m
+    if wanted() and phase != Failed {
+      phase = Starting
+      loaded_embed = m
+      loaded_rerank = rerank_model
+      loaded_has_rr = rerank_enabled
+      failures = 0
+    }
+  }
+
+  action select_rerank_model(m: Model) "D-10: changing the reranker model restarts a running Docs server" {
+    requires rerank_model != m
+    rerank_model = m
+    if wanted() and phase != Failed {
+      phase = Starting
+      loaded_embed = embed_model
+      loaded_rerank = m
+      loaded_has_rr = rerank_enabled
+      failures = 0
+    }
+  }
+
+  action toggle_rerank_setting(on: Bool) "D-10: toggling reranker restarts a running Docs server with updated configuration" {
+    requires rerank_enabled != on
+    rerank_enabled = on
+    if wanted() and phase != Failed {
+      phase = Starting
+      loaded_embed = embed_model
+      loaded_rerank = rerank_model
+      loaded_has_rr = on
+      failures = 0
+    }
+  }
+
+  action quit() "AI-2: quitting the app stops the Docs server" {
+    requires app_running
+    app_running = false
+    docs_enabled = false
+    semantic_enabled = false
+    phase = Off
+  }
+
+  invariant ServerOnlyWhenWanted "D-9: Docs server runs only while app, Docs lookup, and semantic search are all enabled" {
+    running() => wanted()
+  }
+
+  invariant OffWhenNotWanted "AI-2: when Docs or semantic search is off, the Docs server is off" {
+    not wanted() => phase == Off
+  }
+
+  invariant ServesSelectedModels "D-10: a ready Docs server always serves the selected embedder and reranker config" {
+    phase == Ready => (loaded_embed == embed_model and loaded_rerank == rerank_model and loaded_has_rr == rerank_enabled)
+  }
+
+  invariant BoundedFailures "AI-4: crash-loop and startup failures never exceed MAXR" {
+    failures <= MAXR
+  }
+
+  invariant RunningMatchesSelection "MODEL-1: induction aid" {
+    running() => (loaded_embed == embed_model and loaded_rerank == rerank_model and loaded_has_rr == rerank_enabled)
+  }
+
+  invariant EnabledOnlyWhileRunning "MODEL-2: induction aid" {
+    (docs_enabled or semantic_enabled) => app_running
+  }
+
+  leadsTo StartSettles "AI-3: a starting server eventually becomes Ready, Failed, or Off" {
+    phase == Starting ~> (phase == Ready or phase == Failed or phase == Off)
+  }
+
+  acceptance AC-DS-1 "D-9: enabling Docs and semantic search reaches Ready" {
+    enable_docs() enable_semantic() became_ready()
+    expect phase == Ready
+  }
+
+  acceptance AC-DS-2 "V-5: repeated Ready->crash cycles stop in Failed at MAXR rather than looping forever" {
+    enable_docs() enable_semantic() became_ready() crashed() became_ready() crashed()
+    expect phase == Failed and failures == MAXR
+  }
+
+  acceptance AC-DS-3 "D-10: switching reranker model restarts server and serves the newly selected model" {
+    enable_docs() enable_semantic() became_ready() select_rerank_model(1) became_ready()
+    expect phase == Ready and loaded_rerank == 1
+  }
+
+  forbidden FB-DS-1 "AI-1: Docs server cannot become Ready while semantic search is disabled" {
+    enable_docs() became_ready()
+    expect rejected
+  }
+
+  forbidden FB-DS-2 "AI-5: retry is refused while server has not failed" {
+    enable_docs() enable_semantic() retry()
+    expect rejected
+  }
+
+  terminal { not app_running }
+}
+
+verify {
+  values Model = 0..1
+  values Tries = 0..2
+}

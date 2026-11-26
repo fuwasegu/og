@@ -1,4 +1,4 @@
-.PHONY: all check quick build release test run install-hooks clean spec
+.PHONY: all check quick build release test run install-hooks clean spec eval-docs-phase2
 
 all: check
 
@@ -13,6 +13,10 @@ quick:
 ## Verify FSL specs (requirements, design, refinement); requires fslc
 spec:
 	./scripts/spec-check.sh
+
+## Evaluate Phase 2 Docs semantic search + reranker against local real GOROOT/src (requires go + uv)
+eval-docs-phase2:
+	python3 scripts/eval-docs-phase2.py
 
 ## Build debug executable
 build:

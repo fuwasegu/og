@@ -21,8 +21,15 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     private let actionButton = NSButton(title: "Restart", target: nil, action: nil)
     private let logView = NSTextView()
 
-    // Offline Go Docs (FR-19, FR-20, FR-23, FR-24, FR-29, Q-4, L-9)
+    // Offline Go Docs (FR-19, FR-20, FR-23, FR-24, FR-27, FR-29, Q-4, L-9, Issue #21)
     private let docsEnabled = NSButton(checkboxWithTitle: "Enable offline Go Docs lookup (local-only; independent of inline AI completion)", target: nil, action: nil)
+    private let docsSemanticEnabled = NSButton(checkboxWithTitle: "Enable semantic search & cross-encoder reranker (local MLX server via uvx on 127.0.0.1)", target: nil, action: nil)
+    private let docsEmbedModel = NSComboBox()
+    private let docsRerankEnabled = NSButton(checkboxWithTitle: "Use cross-encoder reranker (improves Japanese -> English ranking)", target: nil, action: nil)
+    private let docsRerankModel = NSComboBox()
+    private let docsServerStatus = NSTextField(labelWithString: "")
+    private let docsServerActionButton = NSButton(title: "Restart", target: nil, action: nil)
+    private let docsReembedButton = NSButton(title: "Build Embeddings", target: nil, action: nil)
     private let docsBatchPolicy = NSPopUpButton()
     private let docsVersionCombo = NSComboBox()
     private let docsInstallButton = NSButton(title: "Add / Update Pack", target: nil, action: nil)
@@ -35,7 +42,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     private let docsProgressLabel = NSTextField(labelWithString: "")
 
     private init() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 680), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 780), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         w.title = "Settings"
         super.init(window: w)
         build()
@@ -48,6 +55,9 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
             MainActor.assumeIsolated { self?.refreshDocs() }
         }
         NotificationCenter.default.addObserver(forName: .ogDocsBatchProgressChanged, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshDocs() }
+        }
+        NotificationCenter.default.addObserver(forName: .ogDocsServerChanged, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.refreshDocs() }
         }
     }
@@ -115,9 +125,37 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
 
         let statusRow = NSStackView(views: [status, NSView(), actionButton])
 
-        // Offline Go Docs controls (FR-19, FR-20, FR-23, FR-24, FR-29, L-9)
+        // Offline Go Docs controls (FR-19, FR-20, FR-23, FR-24, FR-27, FR-29, L-9, Issue #21)
         docsEnabled.target = self
         docsEnabled.action = #selector(docsEnabledChanged)
+        docsSemanticEnabled.target = self
+        docsSemanticEnabled.action = #selector(docsSemanticEnabledChanged)
+        docsEmbedModel.isEditable = true
+        docsEmbedModel.completes = false
+        docsEmbedModel.delegate = self
+        docsEmbedModel.target = self
+        docsEmbedModel.action = #selector(docsEmbedModelChanged)
+        docsEmbedModel.addItems(withObjectValues: DocsEmbedModelPreset.all.map(\.title))
+        docsEmbedModel.widthAnchor.constraint(equalToConstant: 420).isActive = true
+        docsRerankEnabled.target = self
+        docsRerankEnabled.action = #selector(docsRerankEnabledChanged)
+        docsRerankModel.isEditable = true
+        docsRerankModel.completes = false
+        docsRerankModel.delegate = self
+        docsRerankModel.target = self
+        docsRerankModel.action = #selector(docsRerankModelChanged)
+        docsRerankModel.addItems(withObjectValues: DocsRerankModelPreset.all.map(\.title))
+        docsRerankModel.widthAnchor.constraint(equalToConstant: 420).isActive = true
+        docsServerStatus.font = Theme.smallFont
+        docsServerActionButton.target = self
+        docsServerActionButton.action = #selector(docsServerActionClicked)
+        docsReembedButton.target = self
+        docsReembedButton.action = #selector(docsReembedClicked)
+        let docsServerRow = NSStackView(views: [docsServerStatus, NSView(), docsReembedButton, docsServerActionButton])
+        let docsSemanticHint = NSTextField(wrappingLabelWithString: "Requires `uv` (`brew install uv`). First start downloads ~1.15 GB of MLX models (BGE-M3 8-bit + BGE-Reranker-v2-M3 8-bit) and Python packages via `uvx`. Once cached, startup takes ~3s completely offline on 127.0.0.1; turn off anytime to stay in Phase 1 FTS5 mode.")
+        docsSemanticHint.font = Theme.smallFont
+        docsSemanticHint.textColor = .secondaryLabelColor
+
         for p in DocsBatchRunPolicy.allCases { docsBatchPolicy.addItem(withTitle: p.title) }
         docsBatchPolicy.target = self
         docsBatchPolicy.action = #selector(docsPolicyChanged)
@@ -152,7 +190,8 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
             reopen, NSBox(),
             aiEnabled, row("Backend", backend), row("Model", model), customRow, hint, statusRow, logScroll,
             NSBox(),
-            docsEnabled, row("Indexing", docsBatchPolicy), docsButtons, docsPacksLabel, docsProgressBar, docsProgressLabel
+            docsEnabled, docsSemanticEnabled, docsSemanticHint, row("Embedding", docsEmbedModel), docsRerankEnabled, row("Reranker", docsRerankModel),
+            docsServerRow, row("Indexing", docsBatchPolicy), docsButtons, docsPacksLabel, docsProgressBar, docsProgressLabel
         ])
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -160,6 +199,8 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
         statusRow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
         logScroll.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
+        docsSemanticHint.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
+        docsServerRow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
         docsProgressBar.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
         docsPacksLabel.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
         let scroll = NSScrollView()
@@ -246,8 +287,18 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     }
 
     func comboBoxSelectionDidChange(_ notification: Notification) {
+        let sender = notification.object as AnyObject?
         DispatchQueue.main.async { [weak self] in
-            MainActor.assumeIsolated { self?.modelChanged() }
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                if sender === self.docsEmbedModel {
+                    self.docsEmbedModelChanged()
+                } else if sender === self.docsRerankModel {
+                    self.docsRerankModelChanged()
+                } else if sender === self.model {
+                    self.modelChanged()
+                }
+            }
         }
     }
 
@@ -290,7 +341,40 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
 
     private func refreshDocs() {
         let d = DocsManager.shared
+        let ds = DocsServerManager.shared
+        let dsCfg = ds.config
         docsEnabled.state = d.enabled ? .on : .off
+        docsSemanticEnabled.state = ds.enabled ? .on : .off
+        docsSemanticEnabled.isEnabled = d.enabled
+        docsEmbedModel.stringValue = DocsEmbedModelPreset.matching(id: dsCfg.embedModel)?.title ?? dsCfg.embedModel
+        docsEmbedModel.isEnabled = d.enabled && ds.enabled
+        docsRerankEnabled.state = dsCfg.rerankEnabled ? .on : .off
+        docsRerankEnabled.isEnabled = d.enabled && ds.enabled
+        docsRerankModel.stringValue = DocsRerankModelPreset.matching(id: dsCfg.rerankModel)?.title ?? dsCfg.rerankModel
+        docsRerankModel.isEnabled = d.enabled && ds.enabled && dsCfg.rerankEnabled
+
+        switch ds.phase {
+        case .off:
+            docsServerStatus.stringValue = "Docs MLX Server: off (Phase 1 FTS5 mode)"
+            docsServerStatus.textColor = .secondaryLabelColor
+            docsServerActionButton.title = "Start"
+        case .starting(let detail):
+            docsServerStatus.stringValue = "Docs MLX Server: \(detail)"
+            docsServerStatus.textColor = .systemOrange
+            docsServerActionButton.title = "Restart"
+        case .ready:
+            let rr = ds.rerankReady ? " + reranker" : ""
+            docsServerStatus.stringValue = "Docs MLX Server: ready on 127.0.0.1:\(ds.port ?? 0) (embedder\(rr))"
+            docsServerStatus.textColor = .systemGreen
+            docsServerActionButton.title = "Restart"
+        case .failed(let why):
+            docsServerStatus.stringValue = "Docs MLX Server failed: \(why)"
+            docsServerStatus.textColor = .systemRed
+            docsServerActionButton.title = "Retry"
+        }
+        docsServerActionButton.isEnabled = d.enabled && ds.enabled
+        docsReembedButton.isEnabled = d.enabled && ds.phase == .ready && !d.installedPacks.isEmpty
+
         docsBatchPolicy.selectItem(at: DocsBatchRunPolicy.allCases.firstIndex(of: d.batchPolicy) ?? 0)
 
         let packs = d.installedPacks
@@ -366,6 +450,91 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     @objc private func docsEnabledChanged() {
         DocsManager.shared.enabled = docsEnabled.state == .on
         refreshDocs()
+    }
+
+    @objc private func docsSemanticEnabledChanged() {
+        DocsServerManager.shared.enabled = docsSemanticEnabled.state == .on
+        refreshDocs()
+    }
+
+    @objc private func docsEmbedModelChanged() {
+        let text = docsEmbedModel.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let preset = DocsEmbedModelPreset.all.first { $0.title == text || $0.id == text }
+        let newID = preset?.id ?? text
+        let newVer = preset?.version ?? "custom-v1"
+        guard !newID.isEmpty else { return }
+        var cfg = DocsServerManager.shared.config
+        guard cfg.embedModel != newID else { return }
+
+        // FR-27: warn before switching embedding models when Ready packs exist.
+        let hasReady = DocsManager.shared.installedPacks.contains { $0.status == .ready }
+        let applyChange: () -> Void = {
+            cfg.embedModel = newID
+            cfg.embedModelVersion = newVer
+            DocsServerManager.shared.config = cfg
+            self.refreshDocs()
+        }
+        if hasReady {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Switch Docs embedding model?"
+            alert.informativeText = "Existing packs with embeddings will revert to FTS-only mode until you rebuild their embeddings with \"Build Embeddings\" (vectors from different models are never mixed)."
+            alert.addButton(withTitle: "Switch Model")
+            alert.addButton(withTitle: "Cancel")
+            let handle: (NSApplication.ModalResponse) -> Void = { response in
+                if response == .alertFirstButtonReturn {
+                    applyChange()
+                } else {
+                    self.refreshDocs()
+                }
+            }
+            if let w = window {
+                alert.beginSheetModal(for: w, completionHandler: handle)
+            } else {
+                handle(alert.runModal())
+            }
+        } else {
+            applyChange()
+        }
+    }
+
+    @objc private func docsRerankEnabledChanged() {
+        var cfg = DocsServerManager.shared.config
+        cfg.rerankEnabled = docsRerankEnabled.state == .on
+        DocsServerManager.shared.config = cfg
+        refreshDocs()
+    }
+
+    @objc private func docsRerankModelChanged() {
+        let text = docsRerankModel.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let preset = DocsRerankModelPreset.all.first { $0.title == text || $0.id == text }
+        let newID = preset?.id ?? text
+        guard !newID.isEmpty else { return }
+        var cfg = DocsServerManager.shared.config
+        guard cfg.rerankModel != newID else { return }
+        cfg.rerankModel = newID
+        DocsServerManager.shared.config = cfg
+        refreshDocs()
+    }
+
+    @objc private func docsServerActionClicked() {
+        let ds = DocsServerManager.shared
+        switch ds.phase {
+        case .failed: ds.retry()
+        case .off: ds.enabled = true
+        default: ds.restart()
+        }
+    }
+
+    @objc private func docsReembedClicked() {
+        guard let ver = parsedSelectedDocsVersion() else {
+            showDocsAlert(
+                message: "Invalid Go Version",
+                info: "Select an installed Go pack version to build embeddings for."
+            )
+            return
+        }
+        DocsManager.shared.startReembedPack(goVersion: ver)
     }
 
     @objc private func docsPolicyChanged() {

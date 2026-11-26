@@ -1,6 +1,9 @@
 // og — Model server design (ModelServerManager on the main actor + child process)
 //
 // Refines: spec/req/model_server.fsl (mapping: spec/design/model_server_refines_req.fsl)
+// Note (Q-2, Issue #21): This spec governs the inline-completion server slot. The dedicated
+// Docs research inference server slot (MLX embedder + reranker) is modeled separately under
+// the same D-9/D-10 lifecycle contract in `spec/design/docs_server.fsl`.
 //
 // DES-1: The server is a child process in its own process group, bound to
 //        127.0.0.1 on a free port chosen by og. Stopping sends SIGTERM to the group

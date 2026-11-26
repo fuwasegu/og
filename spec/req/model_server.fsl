@@ -1,16 +1,19 @@
 // og — Local model server lifecycle (owned by the application)
 //
-// Source: owner decisions in the 2026-11-09 session.
-//   D-9:  og starts, supervises and stops the local completion server itself
-//         (llama.cpp `llama-server` or MLX `mlx_lm.server`). It never attaches
-//         to a server started outside og.
-//   D-10: the model is chosen in og's settings.
+// Source: owner decisions in the 2026-11-09 session and Q-2 resolution in Issue #21 (2026-11-26).
+//   D-9:  og starts, supervises and stops every local AI server itself
+//         (inline completion: llama.cpp `llama-server` or MLX `mlx_lm.server`;
+//          Docs research: unified MLX server via `uvx` serving embeddings + reranker).
+//         It never attaches to a server started outside og.
+//   D-10: models are chosen in og's settings.
 //
-// ASSUME-1 (confirmed 2026-11-09, scoped 2026-11-26): one inline-completion server
-//   for the whole app, started when AI completion is enabled (including at launch)
-//   and stopped when it is disabled or the app quits. Offline Go Docs lookup
-//   (`spec/req/research.fsl`) is modeled separately; Phase 2 research models will
-//   run under the same D-9 (og-owned loopback) contract without sharing this slot.
+// ASSUME-1 (confirmed 2026-11-09, refined for Q-2 in Issue #21 on 2026-11-26):
+//   this lifecycle contract governs each role-dedicated local server slot independently:
+//   (1) the inline-completion server slot (1 process for the app), and
+//   (2) the Docs research inference server slot (1 MLX process hosting both embedding
+//       and cross-encoder reranker models when Docs semantic search is enabled).
+//   Each slot is started when its feature is enabled, stopped when disabled or on quit,
+//   and can stay resident simultaneously on separate loopback ports without sharing state.
 // ASSUME-2: an unexpected exit is restarted automatically; after MAXR consecutive
 //   failures og stops retrying and shows an error until the user retries.
 // ASSUME-3: completion requests are sent only while the server is ready; while it

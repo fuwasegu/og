@@ -596,6 +596,9 @@ public actor DocsPackManager {
             if let embedder {
                 let model = embedder.descriptor
                 let completedRefs = try stageIndex.vectorReferences()
+                let batchSize = max(1, embedder.preferredBatchSize)
+                var pendingBatch: [(chunk: DocsChunk, key: SharedVectorKey)] = []
+                pendingBatch.reserveCapacity(batchSize)
 
                 for chunk in chunks {
                     if Task.isCancelled || cancelRequested[goVersion] == true {
@@ -634,14 +637,34 @@ public actor DocsPackManager {
                     if try await sharedVectorStore.contains(key) {
                         try stageIndex.recordVectorReference(stableID: chunk.stableID, key: key)
                         reusedCount += 1
+                        processed += 1
+                        emit(.embedding)
                     } else {
-                        let vector = try await embedder.embed(chunk.embeddingText)
-                        try await sharedVectorStore.store(key: key, vector: vector)
-                        try stageIndex.recordVectorReference(stableID: chunk.stableID, key: key)
-                        computedCount += 1
+                        pendingBatch.append((chunk, key))
+                        if pendingBatch.count >= batchSize {
+                            let batch = pendingBatch
+                            pendingBatch.removeAll(keepingCapacity: true)
+                            let vectors = try await computeBatchVectors(batch.map(\.chunk.embeddingText), with: embedder)
+                            for (item, vector) in zip(batch, vectors) {
+                                try await sharedVectorStore.store(key: item.key, vector: vector)
+                                try stageIndex.recordVectorReference(stableID: item.chunk.stableID, key: item.key)
+                                computedCount += 1
+                                processed += 1
+                            }
+                            emit(.embedding)
+                        }
                     }
-
-                    processed += 1
+                }
+                if !pendingBatch.isEmpty && !(Task.isCancelled || cancelRequested[goVersion] == true) {
+                    let batch = pendingBatch
+                    pendingBatch.removeAll(keepingCapacity: true)
+                    let vectors = try await computeBatchVectors(batch.map(\.chunk.embeddingText), with: embedder)
+                    for (item, vector) in zip(batch, vectors) {
+                        try await sharedVectorStore.store(key: item.key, vector: vector)
+                        try stageIndex.recordVectorReference(stableID: item.chunk.stableID, key: item.key)
+                        computedCount += 1
+                        processed += 1
+                    }
                     emit(.embedding)
                 }
                 finalStatus = .ready
@@ -716,6 +739,117 @@ public actor DocsPackManager {
             emit(.failed, error: error.localizedDescription)
             throw error
         }
+    }
+
+    /// Re-embeds an already-installed pack in place (preserving its extracted chunks) using `embedder` (FR-27, FR-30).
+    /// Returns `nil` if no pack is installed for `goVersion`.
+    public func reembedExistingPack(
+        goVersion: String,
+        embedder: any DocsEmbedder,
+        onProgress: (@Sendable (DocsBatchProgress) -> Void)? = nil
+    ) async throws -> DocsIngestionReport? {
+        guard let index = try openIndex(for: goVersion) else { return nil }
+        let chunks: [DocsChunk]
+        do {
+            chunks = try index.allChunks()
+        } catch {
+            index.close()
+            throw error
+        }
+        index.close()
+        return try await ingest(goVersion: goVersion, chunks: chunks, embedder: embedder, onProgress: onProgress)
+    }
+
+    /// JSON payload exported for reproducible offline Phase 2 evaluation (`scripts/eval-docs-phase2.py`, V-7).
+    public struct ExportedEvalChunk: Codable, Sendable, Hashable {
+        public var stable_id: String
+        public var title: String
+        public var package_name: String
+        public var symbol: String
+        public var source: String
+        public var provenance: String
+        public var content_hash: String
+        public var text: String
+        public var rerank_text: String
+
+        public init(from chunk: DocsChunk) {
+            self.stable_id = chunk.stableID
+            self.title = chunk.title
+            self.package_name = chunk.packageName
+            self.symbol = chunk.symbol
+            self.source = chunk.source.rawValue
+            self.provenance = chunk.provenance.rawValue
+            self.content_hash = chunk.contentHash
+            self.text = chunk.embeddingText
+            self.rerank_text = chunk.rerankDocumentText
+        }
+    }
+
+    /// Exports all chunks from an installed documentation pack to JSON for `scripts/eval-docs-phase2.py` (V-7).
+    @discardableResult
+    public func exportChunksJSON(forGoVersion goVersion: String, to destinationURL: URL) throws -> Int {
+        guard let index = try openIndex(for: goVersion) else {
+            throw DocsStorageError.io("No installed pack for go\(goVersion)")
+        }
+        defer { index.close() }
+        let chunks = try index.allChunks()
+        return try Self.writeExportedChunksJSON(chunks, to: destinationURL)
+    }
+
+    /// Extracts real stdlib chunks from a local `GOROOT/src` directory and writes them as JSON for evaluation (V-7).
+    @discardableResult
+    public static func exportGorootChunksJSON(
+        fromGorootSrc srcURL: URL,
+        goVersion: String,
+        includeBundledComplement: Bool = true,
+        to destinationURL: URL
+    ) throws -> Int {
+        let stdlib = DocsCorpusExtractor.extractStdlib(fromGorootSrc: srcURL, goVersion: goVersion)
+        let chunks: [DocsChunk]
+        if includeBundledComplement {
+            let extractedIDs = Set(stdlib.map(\.stableID))
+            let bundled = BundledGoCorpus.chunks(forGoVersion: goVersion)
+            chunks = stdlib + bundled.filter { $0.source != .stdlib || !extractedIDs.contains($0.stableID) }
+        } else {
+            chunks = stdlib
+        }
+        return try writeExportedChunksJSON(chunks, to: destinationURL)
+    }
+
+    private static func writeExportedChunksJSON(_ chunks: [DocsChunk], to destinationURL: URL) throws -> Int {
+        try FileManager.default.createDirectory(
+            at: destinationURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let exported = chunks.map(ExportedEvalChunk.init(from:))
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(exported)
+        try data.write(to: destinationURL, options: .atomic)
+        return exported.count
+    }
+
+    private func computeBatchVectors(_ texts: [String], with embedder: any DocsEmbedder) async throws -> [[Float]] {
+        if texts.count == 1 {
+            return [try await embedder.embed(texts[0])]
+        }
+        do {
+            let vectors = try await embedder.embedBatch(texts)
+            if vectors.count == texts.count {
+                return vectors
+            }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            // W-5: degrade failed batch call to single-item embedding before failing the batch.
+        }
+        var out: [[Float]] = []
+        out.reserveCapacity(texts.count)
+        for text in texts {
+            try Task.checkCancellation()
+            out.append(try await embedder.embed(text))
+        }
+        return out
     }
 
     private func cleanupDeletedInFlightIfNeeded(goVersion: String) async {

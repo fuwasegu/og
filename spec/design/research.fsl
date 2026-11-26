@@ -3,9 +3,10 @@
 // Refines: spec/req/research.fsl (mapping: spec/design/research_refines_req.fsl)
 //
 // DES-1: The optional local model endpoint is validated on set; only loopback hosts
-//        (127.0.0.1, ::1, localhost) are accepted. Offline FTS5 search makes zero network calls.
+//        (127.0.0.1, ::1, localhost) are accepted and redirects off loopback are refused.
+//        Offline FTS5 search makes zero network calls.
 // DES-2: Ingestion batch runs in a staging directory through explicit phases
-//        (DIdle -> DExtracting -> DFTSBuilt -> DEmbedding -> DEmbedded) and activates atomically.
+//        (DIdle -> DExtracting -> DFTSBuilt -> DEmbedded) and activates atomically.
 //        Supports updating an already-Ready pack without disturbing active search, and
 //        tracks chunk-level completion (`chunks_done`) so pause/resume skips finished chunks
 //        (FR-6, FR-22..26).
@@ -14,20 +15,32 @@
 //        reuse cached vectors without recomputation (FR-30, FR-31).
 // DES-4: Switching embedding models invalidates staging and demotes Ready packs to FTS-only
 //        until rebuilt so vectors from distinct models are never mixed (FR-27).
-// DES-5: Retrieval follows a fixed deterministic pipeline (route -> pack check ->
-//        deterministic/FTS5/semantic merge -> per-chunk `since` version gate -> grounded cards).
+// DES-5: Retrieval follows a fixed two-stage deterministic pipeline:
+//        (1) route -> pack check -> collect deterministic + FTS5 + semantic candidates
+//            -> per-chunk `since` version gate -> balanced union pool capped at top N = 30
+//            -> (2) optional local MLX cross-encoder reranking
+//            -> anti-hallucination threshold -> max-3 grounded cards (`MAX_CARDS = 3`).
+//        When the local MLX Docs server is disabled or unavailable, stage (2) is skipped and
+//        retrieval falls back transparently to Phase 1 (FTS5 + deterministic).
+// DES-6: The Docs inference server runs as a dedicated og-owned MLX loopback process (`uvx`)
+//        formally specified in `spec/design/docs_server.fsl` (127.0.0.1:<free port>, own
+//        process group, bounded health timeout, windowed crash restarts with backoff, clean
+//        quit), serving both `/v1/embeddings` and `/v1/rerank`.
 //
 // ASSUME-1 (representation only): two Go versions, two embedding models, TOTAL_CHUNKS = 2.
 spec ResearchDesign {
   number GoVer
   number ModelId
   number ChunkDone
+  number CardCount
   const TOTAL_CHUNKS = 2
+  const MAX_CARDS = 3
 
   enum Host { Loopback, Elsewhere }
   enum DPackState { DMissing, DFTSOnly, DReady }
   enum DStagePhase { DIdle, DExtracting, DFTSBuilt, DEmbedded }
   enum DAnswerKind { DNoAnswer, DGroundedCards, DGroundedNotFound, DMissingPack }
+  enum RetrievalSource { RFTSOnly, RHybridUnion }
 
   state {
     endpoint:                Host,
@@ -40,6 +53,7 @@ spec ResearchDesign {
     shared_model:            ModelId,
     last_batch_reused:       Bool,
     llm_available:           Bool,
+    reranker_available:      Bool,
     // DES-2: staging & chunk-level resumable batch state
     batch_ver:               Option<GoVer>,
     stage_phase:             DStagePhase,
@@ -51,11 +65,14 @@ spec ResearchDesign {
     answer_kind:             DAnswerKind,
     answer_ver:              Option<GoVer>,
     answer_card_since:       Option<GoVer>,
+    answer_card_count:       CardCount,
+    answer_retrieval_source: RetrievalSource,
     answer_has_newer_notes:  Bool,
     answer_has_citation:     Bool,
     answer_has_scope:        Bool,
     answer_grounded:         Bool,
     answer_used_semantic:    Bool,
+    answer_used_reranker:    Bool,
     inserted:                Bool,
     sent_remote:             Bool       // MODEL-1: ghost — off-machine transmission
   }
@@ -69,6 +86,7 @@ spec ResearchDesign {
     shared_model = 0
     last_batch_reused = false
     llm_available = false
+    reranker_available = false
     batch_ver = none
     stage_phase = DIdle
     batch_model = 0
@@ -78,11 +96,14 @@ spec ResearchDesign {
     answer_kind = DNoAnswer
     answer_ver = none
     answer_card_since = none
+    answer_card_count = 0
+    answer_retrieval_source = RFTSOnly
     answer_has_newer_notes = false
     answer_has_citation = false
     answer_has_scope = false
     answer_grounded = false
     answer_used_semantic = false
+    answer_used_reranker = false
     inserted = false
     sent_remote = false
     forall v: GoVer {
@@ -107,11 +128,14 @@ spec ResearchDesign {
     answer_kind = DNoAnswer
     answer_ver = none
     answer_card_since = none
+    answer_card_count = 0
+    answer_retrieval_source = RFTSOnly
     answer_has_newer_notes = false
     answer_has_citation = false
     answer_has_scope = false
     answer_grounded = false
     answer_used_semantic = false
+    answer_used_reranker = false
   }
 
   action set_project_version(v: GoVer) "DES-DOC-3: update detected Go version from go.mod/go.work/toolchain" {
@@ -120,16 +144,52 @@ spec ResearchDesign {
     answer_kind = DNoAnswer
     answer_ver = none
     answer_card_since = none
+    answer_card_count = 0
+    answer_retrieval_source = RFTSOnly
     answer_has_newer_notes = false
     answer_has_citation = false
     answer_has_scope = false
     answer_grounded = false
     answer_used_semantic = false
+    answer_used_reranker = false
   }
 
   action toggle_llm(avail: Bool) "DES-DOC-4: update local LLM readiness" {
     requires avail != llm_available
     llm_available = avail
+  }
+
+  action toggle_reranker(avail: Bool) "DES-6: update local MLX cross-encoder reranker readiness" {
+    requires avail != reranker_available
+    reranker_available = avail
+    if not avail and answer_used_reranker {
+      answer_kind = DNoAnswer
+      answer_ver = none
+      answer_card_since = none
+      answer_card_count = 0
+      answer_retrieval_source = RFTSOnly
+      answer_has_newer_notes = false
+      answer_has_citation = false
+      answer_has_scope = false
+      answer_grounded = false
+      answer_used_semantic = false
+      answer_used_reranker = false
+    }
+  }
+
+  action switch_rerank_model() "DES-6: switch cross-encoder reranker model without invalidating embedding vectors" {
+    requires answer_used_reranker
+    answer_kind = DNoAnswer
+    answer_ver = none
+    answer_card_since = none
+    answer_card_count = 0
+    answer_retrieval_source = RFTSOnly
+    answer_has_newer_notes = false
+    answer_has_citation = false
+    answer_has_scope = false
+    answer_grounded = false
+    answer_used_semantic = false
+    answer_used_reranker = false
   }
 
   // MARK: - Staging & chunk-level resumable ingestion / update batch (DES-2, DES-3)
@@ -156,11 +216,14 @@ spec ResearchDesign {
       answer_kind = DNoAnswer
       answer_ver = none
       answer_card_since = none
+      answer_card_count = 0
+      answer_retrieval_source = RFTSOnly
       answer_has_newer_notes = false
       answer_has_citation = false
       answer_has_scope = false
       answer_grounded = false
       answer_used_semantic = false
+      answer_used_reranker = false
     }
   }
 
@@ -228,11 +291,14 @@ spec ResearchDesign {
       answer_kind = DNoAnswer
       answer_ver = none
       answer_card_since = none
+      answer_card_count = 0
+      answer_retrieval_source = RFTSOnly
       answer_has_newer_notes = false
       answer_has_citation = false
       answer_has_scope = false
       answer_grounded = false
       answer_used_semantic = false
+      answer_used_reranker = false
     }
   }
 
@@ -255,11 +321,14 @@ spec ResearchDesign {
       answer_kind = DNoAnswer
       answer_ver = none
       answer_card_since = none
+      answer_card_count = 0
+      answer_retrieval_source = RFTSOnly
       answer_has_newer_notes = false
       answer_has_citation = false
       answer_has_scope = false
       answer_grounded = false
       answer_used_semantic = false
+      answer_used_reranker = false
     }
   }
 
@@ -286,11 +355,14 @@ spec ResearchDesign {
       answer_kind = DNoAnswer
       answer_ver = none
       answer_card_since = none
+      answer_card_count = 0
+      answer_retrieval_source = RFTSOnly
       answer_has_newer_notes = false
       answer_has_citation = false
       answer_has_scope = false
       answer_grounded = false
       answer_used_semantic = false
+      answer_used_reranker = false
     }
   }
 
@@ -312,42 +384,58 @@ spec ResearchDesign {
       answer_kind = DNoAnswer
       answer_ver = none
       answer_card_since = none
+      answer_card_count = 0
+      answer_retrieval_source = RFTSOnly
       answer_has_newer_notes = false
       answer_has_citation = false
       answer_has_scope = false
       answer_grounded = false
       answer_used_semantic = false
+      answer_used_reranker = false
     }
   }
 
-  // MARK: - Fixed retrieval pipeline (DES-5)
+  // MARK: - Fixed two-stage retrieval pipeline (DES-5, DES-6)
 
-  action query_found(card_since: GoVer, has_newer_feature: Bool) "DES-5: fixed pipeline returns grounded, cited, since-gated cards from project_ver pack" {
+  action query_found(
+    card_since: GoVer,
+    has_newer_feature: Bool,
+    source: RetrievalSource,
+    card_count: CardCount
+  ) "DES-5: fixed two-stage pipeline returns 1..MAX_CARDS grounded, cited, since-gated, threshold-verified cards from top-N union pool with optional local reranking" {
     requires enabled
     requires pack_state[project_ver] != DMissing
     requires card_since <= project_ver
+    requires card_count >= 1 and card_count <= MAX_CARDS
+    requires source == RFTSOnly or (pack_state[project_ver] == DReady and pack_model[project_ver] == selected_model)
     answer_kind = DGroundedCards
     answer_ver = some(project_ver)
     answer_card_since = some(card_since)
+    answer_card_count = card_count
+    answer_retrieval_source = source
     answer_has_newer_notes = has_newer_feature
     answer_has_citation = true
     answer_has_scope = true
     answer_grounded = true
-    answer_used_semantic = pack_state[project_ver] == DReady and pack_model[project_ver] == selected_model
+    answer_used_semantic = source != RFTSOnly
+    answer_used_reranker = reranker_available
     sent_remote = sent_remote or endpoint == Elsewhere
   }
 
-  action query_not_found(has_newer_feature: Bool) "DES-5: return grounded Not Found with searched scope when zero version-gated matches exist" {
+  action query_not_found(has_newer_feature: Bool) "DES-5: return grounded Not Found with searched scope when zero version-gated matches pass threshold" {
     requires enabled
     requires pack_state[project_ver] != DMissing
     answer_kind = DGroundedNotFound
     answer_ver = some(project_ver)
     answer_card_since = none
+    answer_card_count = 0
+    answer_retrieval_source = if pack_state[project_ver] == DReady and pack_model[project_ver] == selected_model then RHybridUnion else RFTSOnly
     answer_has_newer_notes = has_newer_feature
     answer_has_citation = false
     answer_has_scope = true
     answer_grounded = true
     answer_used_semantic = pack_state[project_ver] == DReady and pack_model[project_ver] == selected_model
+    answer_used_reranker = false
     sent_remote = sent_remote or endpoint == Elsewhere
   }
 
@@ -357,11 +445,14 @@ spec ResearchDesign {
     answer_kind = DMissingPack
     answer_ver = some(project_ver)
     answer_card_since = none
+    answer_card_count = 0
+    answer_retrieval_source = RFTSOnly
     answer_has_newer_notes = false
     answer_has_citation = false
     answer_has_scope = true
     answer_grounded = true
     answer_used_semantic = false
+    answer_used_reranker = false
   }
 
   action insert_card() "DES-DOC-6: insert version-gated grounded code snippet into the active editor" {
@@ -427,7 +518,21 @@ spec ResearchDesign {
   }
 
   invariant DisabledHasNoAnswer "MODEL-7: induction aid" {
-    not enabled => answer_kind == DNoAnswer
+    not enabled => (answer_kind == DNoAnswer and not answer_used_reranker)
+  }
+
+  invariant RerankRequiresAvailableAndGroundedCards "DES-5: reranking is reported only for grounded cards when the local reranker is ready" {
+    answer_used_reranker => (enabled and reranker_available and answer_kind == DGroundedCards)
+  }
+
+  invariant CardsBoundedByMax "DES-5: grounded answers return 1..MAX_CARDS cards and non-card answers carry 0" {
+    (answer_kind == DGroundedCards => (answer_card_count >= 1 and answer_card_count <= MAX_CARDS)) and
+    (answer_kind != DGroundedCards => answer_card_count == 0)
+  }
+
+  invariant RetrievalSourceMatchesSemantic "DES-5: semantic/hybrid retrieval requires a Ready pack matching selected_model" {
+    answer_used_semantic == (answer_retrieval_source != RFTSOnly) and
+    (answer_retrieval_source != RFTSOnly => (pack_state[project_ver] == DReady and pack_model[project_ver] == selected_model))
   }
 
   leadsTo BatchSettles "DES-2: an unpaused ingestion batch eventually finishes or pauses" {
@@ -439,4 +544,5 @@ verify {
   values GoVer = 0..1
   values ModelId = 0..1
   values ChunkDone = 0..2
+  values CardCount = 0..3
 }

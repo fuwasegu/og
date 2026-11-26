@@ -34,21 +34,51 @@ public struct SharedVectorKey: Sendable, Hashable, Codable {
 /// Protocol for computing text embeddings (implemented by local loopback servers in Phase 2 or test doubles).
 public protocol DocsEmbedder: Sendable {
     var descriptor: EmbeddingModelDescriptor { get }
+    /// Preferred number of chunks per batch during pack ingestion (1 for simple/test doubles; 32 for HTTP MLX server).
+    var preferredBatchSize: Int { get }
     func embed(_ text: String) async throws -> [Float]
+    /// Embeds a user search query (allows asymmetric models such as E5 to apply a `query:` prefix).
+    func embedQuery(_ text: String) async throws -> [Float]
+    /// Batch-embeds multiple document chunks in order.
+    func embedBatch(_ texts: [String]) async throws -> [[Float]]
 }
 
-/// Loopback-only HTTP embedding client for local `llama-server` / OpenAI-compatible `/v1/embeddings` (FR-16, DES-1).
-/// Refuses non-loopback URLs at initialization (`NeverLeavesMachine`) and reuses a single URLSession (L-8).
+public extension DocsEmbedder {
+    var preferredBatchSize: Int { 1 }
+
+    func embedQuery(_ text: String) async throws -> [Float] {
+        try await embed(text)
+    }
+
+    func embedBatch(_ texts: [String]) async throws -> [[Float]] {
+        var out: [[Float]] = []
+        out.reserveCapacity(texts.count)
+        for text in texts {
+            try Task.checkCancellation()
+            out.append(try await embed(text))
+        }
+        return out
+    }
+}
+
+/// Loopback-only HTTP embedding client for the og-owned MLX / OpenAI-compatible `/v1/embeddings` endpoint
+/// (FR-16, DES-1, D-9). Refuses non-loopback URLs at initialization (`NeverLeavesMachine`) and reuses a single URLSession (L-8).
 public final class LoopbackEmbeddingClient: DocsEmbedder, Sendable {
     public let endpoint: URL
     public let descriptor: EmbeddingModelDescriptor
+    public let preferredBatchSize: Int = 32
     private let session: URLSession
 
-    public init?(endpoint: URL, descriptor: EmbeddingModelDescriptor) {
+    public init?(endpoint: URL, descriptor: EmbeddingModelDescriptor, timeoutInterval: TimeInterval? = nil) {
         guard LocalCompletionClient.isLoopback(endpoint) else { return nil }
         self.endpoint = endpoint
         self.descriptor = descriptor
-        self.session = URLSession(configuration: LocalCompletionClient.sessionConfiguration)
+        let cfg = LocalCompletionClient.sessionConfiguration.copy() as? URLSessionConfiguration ?? .ephemeral
+        if let timeoutInterval {
+            cfg.timeoutIntervalForRequest = timeoutInterval
+            cfg.timeoutIntervalForResource = timeoutInterval
+        }
+        self.session = URLSession(configuration: cfg, delegate: LoopbackOnlySessionDelegate.shared, delegateQueue: nil)
     }
 
     deinit {
@@ -56,10 +86,35 @@ public final class LoopbackEmbeddingClient: DocsEmbedder, Sendable {
     }
 
     public func embed(_ text: String) async throws -> [Float] {
+        let vecs = try await requestEmbeddings(input: [text], inputType: "passage")
+        guard let first = vecs.first else {
+            throw DocsStorageError.embeddingFailed("empty embedding response")
+        }
+        return first
+    }
+
+    public func embedQuery(_ text: String) async throws -> [Float] {
+        let vecs = try await requestEmbeddings(input: [text], inputType: "query")
+        guard let first = vecs.first else {
+            throw DocsStorageError.embeddingFailed("empty query embedding response")
+        }
+        return first
+    }
+
+    public func embedBatch(_ texts: [String]) async throws -> [[Float]] {
+        guard !texts.isEmpty else { return [] }
+        return try await requestEmbeddings(input: texts, inputType: "passage")
+    }
+
+    private func requestEmbeddings(input: [String], inputType: String) async throws -> [[Float]] {
         var req = URLRequest(url: endpoint.appendingPathComponent("v1/embeddings"))
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let body: [String: Any] = ["model": descriptor.id, "input": text]
+        let body: [String: Any] = [
+            "model": descriptor.id,
+            "input": input.count == 1 ? input[0] : input,
+            "input_type": inputType
+        ]
         req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
 
         let (data, response) = try await session.data(for: req)
@@ -67,12 +122,24 @@ public final class LoopbackEmbeddingClient: DocsEmbedder, Sendable {
             throw DocsStorageError.embeddingFailed("HTTP \(http.statusCode)")
         }
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let items = obj["data"] as? [[String: Any]],
-              let first = items.first,
-              let raw = first["embedding"] as? [NSNumber] else {
+              let items = obj["data"] as? [[String: Any]] else {
             throw DocsStorageError.embeddingFailed("invalid embedding response")
         }
-        return raw.map(\.floatValue)
+        let sortedItems = items.sorted {
+            (($0["index"] as? NSNumber)?.intValue ?? 0) < (($1["index"] as? NSNumber)?.intValue ?? 0)
+        }
+        var out: [[Float]] = []
+        out.reserveCapacity(sortedItems.count)
+        for item in sortedItems {
+            guard let raw = item["embedding"] as? [NSNumber] else {
+                throw DocsStorageError.embeddingFailed("missing embedding array")
+            }
+            out.append(raw.map(\.floatValue))
+        }
+        guard out.count == input.count else {
+            throw DocsStorageError.embeddingFailed("embedding count mismatch (\(out.count) vs \(input.count))")
+        }
+        return out
     }
 }
 
@@ -81,6 +148,7 @@ public enum DocsStorageError: Error, LocalizedError, Sendable {
     case sqlite(String)
     case io(String)
     case embeddingFailed(String)
+    case rerankFailed(String)
     case nonLoopbackEndpoint(String)
     case batchAlreadyRunning(String)
 
@@ -89,6 +157,7 @@ public enum DocsStorageError: Error, LocalizedError, Sendable {
         case .sqlite(let msg): return "SQLite error: \(msg)"
         case .io(let msg): return "Storage I/O error: \(msg)"
         case .embeddingFailed(let msg): return "Embedding error: \(msg)"
+        case .rerankFailed(let msg): return "Reranking error: \(msg)"
         case .nonLoopbackEndpoint(let url): return "Refused non-loopback endpoint: \(url)"
         case .batchAlreadyRunning(let ver): return "An ingestion batch for go\(ver) is already running."
         }

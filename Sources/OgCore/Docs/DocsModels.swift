@@ -235,6 +235,35 @@ public struct DocsChunk: Sendable, Hashable, Codable {
         if !searchAliases.isEmpty { parts.append(searchAliases.joined(separator: " ")) }
         return parts.joined(separator: "\n")
     }
+
+    /// Concise, deduplicated text passed to the local cross-encoder reranker (fits within 256 tokens, Issue #21).
+    public var rerankDocumentText: String {
+        var parts: [String] = []
+        let qualified = [packageName, symbol].filter { !$0.isEmpty }.joined(separator: ".")
+        if !title.isEmpty {
+            parts.append(title)
+        }
+        if !qualified.isEmpty && !title.contains(qualified) {
+            parts.append(qualified)
+        }
+        if let signature, !signature.isEmpty {
+            parts.append(signature)
+        }
+        if !summary.isEmpty {
+            parts.append(summary)
+        }
+        let trimmedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedBody.isEmpty && trimmedBody != summary {
+            // Avoid repeating the summary prefix when body begins with it.
+            let bodySnippet = trimmedBody.count > 500 ? String(trimmedBody.prefix(500)) : trimmedBody
+            parts.append(bodySnippet)
+        }
+        if !searchAliases.isEmpty {
+            parts.append(searchAliases.joined(separator: " "))
+        }
+        let joined = parts.joined(separator: "\n")
+        return joined.count > 700 ? String(joined.prefix(700)) : joined
+    }
 }
 
 /// Lifecycle state of an installed documentation pack (matches `spec/req/research.fsl`).

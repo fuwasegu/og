@@ -735,9 +735,9 @@ public enum BundledGoCorpus {
     /// Separated from router code so new concepts or pack-supplied rules can be added as data
     /// until Phase 2 cross-lingual embeddings replace/augment lexical expansion.
     public static let defaultConceptRules: [DocsConceptRule] = [
-        DocsConceptRule(triggers: ["1行ずつ", "一行ずつ", "行ごと", "行単位", "line by line", "read line"], expansions: ["bufio", "Scanner", "Scan", "ScanLines"]),
+        DocsConceptRule(triggers: ["1行ずつ", "一行ずつ", "行ごと", "行単位", "line by line", "read line"], expansions: ["bufio", "Scanner"]),
         DocsConceptRule(triggers: ["ファイル", "read file", "write file"], excludeIfPresent: ["1行ずつ", "一行ずつ", "行ごと", "行単位", "line by line"], expansions: ["os", "ReadFile", "WriteFile", "bufio", "Scanner"]),
-        DocsConceptRule(triggers: ["json", "整形", "インデント", "きれいに", "pretty print", "indent"], expansions: ["json", "MarshalIndent", "Encoder", "SetIndent", "Unmarshal"]),
+        DocsConceptRule(triggers: ["json", "整形", "インデント", "きれいに", "pretty print", "indent"], expansions: ["json", "MarshalIndent", "Encoder", "SetIndent", "Unmarshal", "Decoder"]),
         DocsConceptRule(triggers: ["重複", "取り除", "ユニーク", "deduplicate", "dedup", "unique"], expansions: ["slices", "Compact", "Sort", "deduplicate", "map"]),
         DocsConceptRule(triggers: ["タイムアウト", "timeout", "deadline", "期限", "キャンセル"], expansions: ["context", "WithTimeout", "deadline", "cancel"]),
         DocsConceptRule(triggers: ["正規表現", "regex", "regexp", "パターンマッチ"], expansions: ["regexp", "Compile", "MustCompile", "MatchString"]),
