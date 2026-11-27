@@ -643,11 +643,20 @@ public actor ResearchService {
                 var unindexedCachedKeys: [GoModuleKey] = []
                 var uncachedKeys: [GoModuleKey] = []
                 for dep in resolvedDeps {
-                    if let depManifest = await packManager.dependencyManifest(for: dep.packKey),
-                       let depIndex = try await packManager.openDependencyIndex(for: dep.packKey) {
-                        activeDepPacks.append((dep, depManifest, depIndex))
-                        indexedKeys.append(dep.packKey)
-                    } else if dep.isCached {
+                    // U-3: Isolate corrupt dependency pack DBs so one damaged pack degrades to unindexed
+                    // instead of aborting stdlib and remaining dependency lookup.
+                    if let depManifest = await packManager.dependencyManifest(for: dep.packKey) {
+                        do {
+                            if let depIndex = try await packManager.openDependencyIndex(for: dep.packKey) {
+                                activeDepPacks.append((dep, depManifest, depIndex))
+                                indexedKeys.append(dep.packKey)
+                                continue
+                            }
+                        } catch {
+                            // Fall through to cached-unindexed / uncached degradation below.
+                        }
+                    }
+                    if dep.isCached {
                         unindexedCachedKeys.append(dep.packKey)
                     } else {
                         uncachedKeys.append(dep.packKey)
@@ -718,8 +727,10 @@ public actor ResearchService {
             let detHits = try index.deterministicSearch(symbolOrPackage: sym, limit: 10)
             merge(detHits, weight: 2.0)
             for depPack in activeDepPacks {
-                let depDetHits = try depPack.index.deterministicSearch(symbolOrPackage: sym, limit: 10)
-                merge(depDetHits, weight: 2.0)
+                // U-3: ignore corrupt dependency SQLite errors without failing stdlib search
+                if let depDetHits = try? depPack.index.deterministicSearch(symbolOrPackage: sym, limit: 10) {
+                    merge(depDetHits, weight: 2.0)
+                }
             }
         }
 
@@ -730,8 +741,9 @@ public actor ResearchService {
             let ftsHits = try index.ftsSearch(terms: plan.searchTerms, limit: 20)
             merge(ftsHits, weight: 1.0)
             for depPack in activeDepPacks {
-                let depFtsHits = try depPack.index.ftsSearch(terms: plan.searchTerms, limit: 12)
-                merge(depFtsHits, weight: 1.0)
+                if let depFtsHits = try? depPack.index.ftsSearch(terms: plan.searchTerms, limit: 12) {
+                    merge(depFtsHits, weight: 1.0)
+                }
             }
         }
 
@@ -848,11 +860,18 @@ public actor ResearchService {
                     if entry.chunk.source == .spec { intentBonus += 18.0 }
                     else if entry.chunk.source == .guide { intentBonus += 14.0 }
                 case .exactSymbol, .existenceCheck, .needsReverseLookup:
-                    if entry.chunk.source == .stdlib || entry.chunk.source == .dependency {
+                    // U-1: Stdlib retains slight priority over dependency chunks on ambiguous ties.
+                    if entry.chunk.source == .stdlib {
                         if entry.chunk.kind == .example && plan.intent != .needsReverseLookup {
                             intentBonus += 7.0
                         } else {
                             intentBonus += 10.0
+                        }
+                    } else if entry.chunk.source == .dependency {
+                        if entry.chunk.kind == .example && plan.intent != .needsReverseLookup {
+                            intentBonus += 5.0
+                        } else {
+                            intentBonus += 8.0
                         }
                     }
                     if plan.intent == .needsReverseLookup && entry.chunk.kind != .package {
@@ -899,8 +918,12 @@ public actor ResearchService {
         }
 
         // Default Stage 1 ordering (used directly when reranker is absent or fails).
+        // U-1: Tie-break stdlib/official sources ahead of dependency chunks before comparing stableID.
         allowedEntries.sort {
             if abs($0.stage1Score - $1.stage1Score) > 0.001 { return $0.stage1Score > $1.stage1Score }
+            let p0 = $0.candidate.chunk.source == .dependency ? 1 : 0
+            let p1 = $1.candidate.chunk.source == .dependency ? 1 : 0
+            if p0 != p1 { return p0 < p1 }
             return $0.candidate.chunk.stableID < $1.candidate.chunk.stableID
         }
 
@@ -1023,6 +1046,9 @@ public actor ResearchService {
 
                 rerankedEntries.sort {
                     if abs($0.finalScore - $1.finalScore) > 0.001 { return $0.finalScore > $1.finalScore }
+                    let p0 = $0.candidate.chunk.source == .dependency ? 1 : 0
+                    let p1 = $1.candidate.chunk.source == .dependency ? 1 : 0
+                    if p0 != p1 { return p0 < p1 }
                     return $0.candidate.chunk.stableID < $1.candidate.chunk.stableID
                 }
                 allowedEntries = rerankedEntries
@@ -1082,7 +1108,12 @@ public actor ResearchService {
                     msg = "標準ライブラリ・公式ドキュメント（Go \(packKey)）には該当する機能が見つかりませんでした。根拠のないシンボルは提示しません。"
                 }
             } else {
-                msg = "No matching symbol or guide was found in the Go \(packKey) offline documentation pack."
+                if let depSummary, !depSummary.uncachedModules.isEmpty {
+                    let names = depSummary.uncachedModules.prefix(3).map(\.displayID).joined(separator: ", ")
+                    msg = "No matching symbol or guide was found in the Go \(packKey) offline documentation pack (uncached dependencies not substituted: \(names))."
+                } else {
+                    msg = "No matching symbol or guide was found in the Go \(packKey) offline documentation pack."
+                }
             }
             return DocsAnswer(
                 query: plan.originalQuery,
@@ -1184,7 +1215,9 @@ public actor ResearchService {
                 summary: card.reason,
                 example: card.example,
                 body: card.reason + "\n" + (card.example ?? ""),
-                since: card.since
+                since: card.since,
+                isDependency: card.sourceKind == .dependency,
+                moduleLabel: (card.modulePath != nil && card.moduleVersion != nil) ? "\(card.modulePath!)@\(card.moduleVersion!)" : nil
             )
         }
         return await runSynthesis(
@@ -1226,7 +1259,9 @@ public actor ResearchService {
                 summary: chunk.summary,
                 example: chunk.example,
                 body: chunk.body,
-                since: chunk.since
+                since: chunk.since,
+                isDependency: chunk.source == .dependency,
+                moduleLabel: (chunk.modulePath != nil && chunk.moduleVersion != nil) ? "\(chunk.modulePath!)@\(chunk.moduleVersion!)" : nil
             )
         }
         return await runSynthesis(
@@ -1285,13 +1320,22 @@ public actor ResearchService {
             }
         }
 
-        // Y-4: Version gate on generated output & snippet (DOC-2, DOC-11).
+        // Y-4 & U-2: Version gate and external-dependency check on generated output & snippet (DOC-2, DOC-11, Issue #27).
+        let citedDependencyLabels = evidence
+            .filter { $0.isDependency && matchedCitations.contains($0.citation) }
+            .compactMap { $0.moduleLabel ?? ($0.packageName.isEmpty ? nil : $0.packageName) }
+
         let verification: DocsSnippetVerificationStatus
         if let reqVer = output.requiredNewerGoVersion, reqVer > targetVersion {
             verification = .newerVersionRequired(since: reqVer)
         } else if let snippet = output.snippet, !snippet.isEmpty {
             if let newerHit = Self.detectNewerAPIMention(in: snippet, newerNotes: newerNotes, targetVersion: targetVersion) {
                 verification = .newerVersionRequired(since: newerHit)
+            } else if !citedDependencyLabels.isEmpty {
+                // U-2: Standalone single-module `go build` (GOPROXY=off, no require) cannot resolve external
+                // dependency packages; classify accurately as `.unverified` instead of misclassifying as `.failed`.
+                let label = citedDependencyLabels.prefix(2).joined(separator: ", ")
+                verification = .unverified(reason: "外部依存パッケージ（\(label)）を含むため単体モジュール検証の対象外です")
             } else {
                 verification = await snippetVerifier.verify(snippet: snippet, targetVersion: targetVersion)
             }

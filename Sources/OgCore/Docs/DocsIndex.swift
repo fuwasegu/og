@@ -464,18 +464,17 @@ public final class DocsIndex: @unchecked Sendable {
 
         var pkgPart: String?
         var symPart: String?
-        if let dot = needle.lastIndex(of: ".") {
+        // Package/symbol split: for import paths with `/`, the boundary is the first `.` AFTER the last `/`
+        // (so `github.com/pkg/errors.New` splits into `github.com/pkg/errors` + `New`, and
+        // `github.com/go-chi/chi/v5.Mux.Get` splits into `github.com/go-chi/chi/v5` + `Mux.Get`).
+        // For short package names without `/`, the boundary is the first `.` (`bufio.Scanner.Scan`).
+        let searchStart = needle.lastIndex(of: "/").map { needle.index(after: $0) } ?? needle.startIndex
+        if let dot = needle[searchStart...].firstIndex(of: ".") {
             let p = String(needle[..<dot]).lowercased()
             let s = String(needle[needle.index(after: dot)...]).lowercased()
-            // Handle `pkg.Type.Method` as well as `github.com/go-chi/chi/v5.NewRouter`.
             if !p.isEmpty && !s.isEmpty {
-                if let firstDot = needle.firstIndex(of: "."), firstDot != dot, !needle[..<firstDot].contains("/") && !needle[..<firstDot].contains(".") {
-                    pkgPart = String(needle[..<firstDot]).lowercased()
-                    symPart = String(needle[needle.index(after: firstDot)...]).lowercased()
-                } else {
-                    pkgPart = p
-                    symPart = s
-                }
+                pkgPart = p
+                symPart = s
             }
         }
 
@@ -531,25 +530,34 @@ public final class DocsIndex: @unchecked Sendable {
 
             var score: Double = 0
             let isExample = chunk.kind == .example
+            // U-1: When a short package name collides with stdlib (e.g. `errors.New` vs `github.com/pkg/errors`),
+            // stdlib retains deterministic priority unless the caller explicitly typed the full module path.
+            let depPenalty: Double = (chunk.source == .dependency && full != lower) ? 3.0 : 0.0
             if full == lower || shortFull == lower {
-                score = isExample ? 92.0 : 100.0
+                score = (isExample ? 92.0 : 100.0) - depPenalty
             } else if let pkgPart, let symPart, (cPkg == pkgPart || cShortPkg == pkgPart) {
                 if cSym == symPart {
-                    score = isExample ? 90.0 : 98.0
+                    score = (isExample ? 90.0 : 98.0) - depPenalty
                 } else if cSym.hasPrefix(symPart + ".") {
-                    score = isExample ? 82.0 : 88.0
+                    score = (isExample ? 82.0 : 88.0) - depPenalty
                 }
             } else if cPkg == lower || cShortPkg == lower {
-                score = cSym.isEmpty ? (isExample ? 84.0 : 95.0) : (isExample ? 74.0 : 80.0)
+                score = (cSym.isEmpty ? (isExample ? 84.0 : 95.0) : (isExample ? 74.0 : 80.0)) - depPenalty
             } else if !cSym.isEmpty && cSym == lower {
-                score = isExample ? 78.0 : 85.0
+                score = (isExample ? 78.0 : 85.0) - depPenalty
             }
 
             if score > 0 {
                 hits.append(DocsIndexHit(chunk: chunk, score: score, matchedBy: .deterministicExact))
             }
         }
-        hits.sort { ($0.score, $1.chunk.stableID) > ($1.score, $0.chunk.stableID) }
+        hits.sort {
+            if abs($0.score - $1.score) > 0.001 { return $0.score > $1.score }
+            let p0 = $0.chunk.source == .dependency ? 1 : 0
+            let p1 = $1.chunk.source == .dependency ? 1 : 0
+            if p0 != p1 { return p0 < p1 }
+            return $0.chunk.stableID < $1.chunk.stableID
+        }
         return Array(hits.prefix(limit))
     }
 

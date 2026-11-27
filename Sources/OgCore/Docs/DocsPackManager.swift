@@ -138,6 +138,8 @@ public struct DocsDependencySyncReport: Sendable, Hashable {
     public var synced: [GoModuleKey]
     public var skippedUpToDate: [GoModuleKey]
     public var uncached: [GoModuleKey]
+    /// Modules whose extraction hit safety budgets (`DocsModuleExtractionLimits`) and were partially indexed (N-1).
+    public var truncatedModules: [String: String]
     public var failed: [String: String]
     public var cancelled: Bool
 
@@ -145,12 +147,14 @@ public struct DocsDependencySyncReport: Sendable, Hashable {
         synced: [GoModuleKey] = [],
         skippedUpToDate: [GoModuleKey] = [],
         uncached: [GoModuleKey] = [],
+        truncatedModules: [String: String] = [:],
         failed: [String: String] = [:],
         cancelled: Bool = false
     ) {
         self.synced = synced
         self.skippedUpToDate = skippedUpToDate
         self.uncached = uncached
+        self.truncatedModules = truncatedModules
         self.failed = failed
         self.cancelled = cancelled
     }
@@ -373,8 +377,10 @@ public actor DocsPackManager {
         let dir = dependencyPackDirectory(for: key)
         guard let data = try? Data(contentsOf: manifestURL(in: dir)),
               var m = try? JSONDecoder().decode(DocsDependencyPackManifest.self, from: data) else { return nil }
-        // Strict verification: manifest modulePath and moduleVersion must match requested key exactly.
-        guard m.modulePath == key.modulePath && m.moduleVersion == key.version else { return nil }
+        // Strict verification: manifest modulePath, moduleVersion, and localSourcePath must match requested key exactly.
+        guard m.modulePath == key.modulePath
+            && m.moduleVersion == key.version
+            && m.localSourcePath == key.localSourcePath else { return nil }
         m.sizeBytes = Self.directorySizeBytes(dir)
         return m
     }
@@ -899,13 +905,16 @@ public actor DocsPackManager {
     public func ingestDependency(
         modulePath: String,
         moduleVersion: String,
+        localSourcePath: String? = nil,
         chunks: [DocsChunk],
         license: String? = nil,
+        truncated: Bool = false,
+        truncationReason: String? = nil,
         embedder: (any DocsEmbedder)? = nil,
         simulateSwapFailure: Bool = false,
         onProgress: (@Sendable (DocsBatchProgress) -> Void)? = nil
     ) async throws -> DocsIngestionReport {
-        let key = GoModuleKey(modulePath: modulePath, version: moduleVersion)
+        let key = GoModuleKey(modulePath: modulePath, version: moduleVersion, localSourcePath: localSourcePath)
         let batchKey = Self.depBatchKey(for: key)
         guard !inFlightVersions.contains(batchKey) else {
             throw DocsStorageError.batchAlreadyRunning(key.displayID)
@@ -1110,6 +1119,7 @@ public actor DocsPackManager {
             let manifest = DocsDependencyPackManifest(
                 modulePath: modulePath,
                 moduleVersion: moduleVersion,
+                localSourcePath: localSourcePath,
                 storageKey: key.storageKey,
                 createdAt: ISO8601DateFormatter().string(from: Date()),
                 license: license,
@@ -1117,7 +1127,9 @@ public actor DocsPackManager {
                 status: finalStatus,
                 embeddingModelID: embedder?.descriptor.id,
                 embeddingModelVersion: embedder?.descriptor.version,
-                sizeBytes: Self.directorySizeBytes(stageDir)
+                sizeBytes: Self.directorySizeBytes(stageDir),
+                truncated: truncated,
+                truncationReason: truncationReason
             )
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -1149,8 +1161,11 @@ public actor DocsPackManager {
         }
     }
 
+    /// Default total disk budget for cached dependency packs (256 MB, N-2).
+    public static let defaultDependencyStorageBudgetBytes: Int64 = 256 * 1024 * 1024
+
     /// Incrementally extracts and indexes only the dependencies of `projectRoot` that are present in local
-    /// `GOMODCACHE` and missing or outdated as dependency packs (Issue #27, DOC-12a, DOC-12b).
+    /// `GOMODCACHE` and missing or outdated as dependency packs (Issue #27, DOC-12a, DOC-12b, N-1, N-2).
     /// Uncached dependencies are reported in `report.uncached` and never auto-downloaded or substituted.
     public func syncProjectDependencies(
         projectRoot: URL,
@@ -1158,6 +1173,8 @@ public actor DocsPackManager {
         goVersion: String = BundledGoCorpus.defaultVersion,
         embedder: (any DocsEmbedder)? = nil,
         forceRebuild: Bool = false,
+        extractionLimits: DocsModuleExtractionLimits = .default,
+        storageBudgetBytes: Int64 = DocsPackManager.defaultDependencyStorageBudgetBytes,
         onProgress: (@Sendable (DocsBatchProgress) -> Void)? = nil
     ) async -> DocsDependencySyncReport {
         let deps = GoModuleResolver.resolveDependencies(projectRoot: projectRoot, moduleCacheRoot: moduleCacheRoot)
@@ -1190,19 +1207,30 @@ public actor DocsPackManager {
             }
 
             let license = GoModuleResolver.detectLicenseIdentifier(in: sourceDir)
-            let chunks = DocsCorpusExtractor.extractModule(
+            let extracted = DocsCorpusExtractor.extractModuleDetailed(
                 fromModuleRoot: sourceDir,
                 modulePath: dep.modulePath,
                 moduleVersion: dep.version,
                 goVersion: goVersion,
-                license: license
+                license: license,
+                limits: extractionLimits
             )
+            if extracted.cancelled {
+                report.cancelled = true
+                break
+            }
+            if extracted.truncated {
+                report.truncatedModules[dep.displayID] = extracted.truncationReason ?? "extraction budget reached"
+            }
             do {
                 let res = try await ingestDependency(
                     modulePath: dep.modulePath,
                     moduleVersion: dep.version,
-                    chunks: chunks,
+                    localSourcePath: dep.localReplaceDirectory?.standardizedFileURL.path,
+                    chunks: extracted.chunks,
                     license: license,
+                    truncated: extracted.truncated,
+                    truncationReason: extracted.truncationReason,
                     embedder: embedder,
                     onProgress: onProgress
                 )
@@ -1218,7 +1246,90 @@ public actor DocsPackManager {
                 report.failed[dep.displayID] = error.localizedDescription
             }
         }
+
+        // N-2: enforce total dependency pack storage budget, protecting the current project's dependencies.
+        let activeKeys = Set(deps.map(\.packKey))
+        _ = try? await enforceDependencyStorageBudget(maxTotalBytes: storageBudgetBytes, protecting: activeKeys)
         return report
+    }
+
+    /// Removes all installed dependency packs not present in `activeKeys` and garbage-collects unreferenced shared vectors (N-2).
+    @discardableResult
+    public func pruneUnusedDependencyPacks(keepingActiveKeys activeKeys: Set<GoModuleKey>) async throws -> [GoModuleKey] {
+        var removed: [GoModuleKey] = []
+        let fm = FileManager.default
+        for pack in installedDependencyPacks() {
+            let key = pack.key
+            guard !activeKeys.contains(key) else { continue }
+            let batchKey = Self.depBatchKey(for: key)
+            guard !inFlightVersions.contains(batchKey) else { continue }
+            let packDir = dependencyPackDirectory(for: key)
+            if fm.fileExists(atPath: packDir.path) {
+                try fm.removeItem(at: packDir)
+            }
+            let stageDir = dependencyStagingDirectory(for: key)
+            if fm.fileExists(atPath: stageDir.path) {
+                try? fm.removeItem(at: stageDir)
+            }
+            latestProgress.removeValue(forKey: batchKey)
+            removed.append(key)
+        }
+        if !removed.isEmpty {
+            _ = try await garbageCollectSharedVectors()
+        }
+        return removed
+    }
+
+    /// Removes dependency packs not required by any of the given project roots (N-2).
+    @discardableResult
+    public func pruneUnusedDependencyPacks(
+        forProjectRoots roots: [URL],
+        moduleCacheRoot: URL? = nil
+    ) async throws -> [GoModuleKey] {
+        var active = Set<GoModuleKey>()
+        for root in roots {
+            let deps = GoModuleResolver.resolveDependencies(projectRoot: root, moduleCacheRoot: moduleCacheRoot)
+            for dep in deps {
+                active.insert(dep.packKey)
+            }
+        }
+        return try await pruneUnusedDependencyPacks(keepingActiveKeys: active)
+    }
+
+    /// Evicts oldest non-protected dependency packs when total disk usage exceeds `maxTotalBytes`, then runs shared-vector GC (N-2).
+    @discardableResult
+    public func enforceDependencyStorageBudget(
+        maxTotalBytes: Int64 = DocsPackManager.defaultDependencyStorageBudgetBytes,
+        protecting activeKeys: Set<GoModuleKey> = []
+    ) async throws -> [GoModuleKey] {
+        guard maxTotalBytes > 0 else { return [] }
+        let packs = installedDependencyPacks()
+        var totalBytes = packs.reduce(Int64(0)) { $0 + $1.sizeBytes }
+        guard totalBytes > maxTotalBytes else { return [] }
+
+        let evictable = packs
+            .filter { !activeKeys.contains($0.key) && !inFlightVersions.contains(Self.depBatchKey(for: $0.key)) }
+            .sorted { $0.createdAt < $1.createdAt }
+
+        var evicted: [GoModuleKey] = []
+        let fm = FileManager.default
+        for pack in evictable {
+            guard totalBytes > maxTotalBytes else { break }
+            let dir = dependencyPackDirectory(for: pack.key)
+            if fm.fileExists(atPath: dir.path) {
+                try? fm.removeItem(at: dir)
+            }
+            let stageDir = dependencyStagingDirectory(for: pack.key)
+            if fm.fileExists(atPath: stageDir.path) {
+                try? fm.removeItem(at: stageDir)
+            }
+            totalBytes -= pack.sizeBytes
+            evicted.append(pack.key)
+        }
+        if !evicted.isEmpty {
+            _ = try await garbageCollectSharedVectors()
+        }
+        return evicted
     }
 
     /// JSON payload exported for reproducible offline Phase 2 evaluation (`scripts/eval-docs-phase2.py`, V-7).
@@ -1420,6 +1531,7 @@ public actor DocsPackManager {
         let manifest = DocsDependencyPackManifest(
             modulePath: key.modulePath,
             moduleVersion: key.version,
+            localSourcePath: key.localSourcePath,
             storageKey: key.storageKey,
             createdAt: ISO8601DateFormatter().string(from: Date()),
             license: license,

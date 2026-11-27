@@ -186,7 +186,11 @@ public struct DocsSnippetVerifier: DocsSnippetVerifying, Sendable {
         return found
     }
 
-    static func classifyFailure(stderr: String, targetVersion: GoVersion = GoVersion(major: 1, minor: 23)) -> DocsSnippetVerificationStatus {
+    static func classifyFailure(
+        stderr: String,
+        targetVersion: GoVersion = GoVersion(major: 1, minor: 23),
+        knownExternalPackageIdents: Set<String> = []
+    ) -> DocsSnippetVerificationStatus {
         let lower = stderr.lowercased()
         if lower.contains("mise error") || lower.contains("no version is set for shim") {
             return .unverified(reason: "Go バージョンが未有効化 (mise)")
@@ -212,6 +216,10 @@ public struct DocsSnippetVerifier: DocsSnippetVerifying, Sendable {
             .prefix(2)
             .joined(separator: " | ")
         if let undef = extractUndefinedNonStdlibSymbol(from: stderr) {
+            // U-2: Do not misclassify an omitted external dependency package selector (e.g. `undefined: chi`) as `.failed`.
+            if knownExternalPackageIdents.contains(undef) {
+                return .unverified(reason: "外部依存パッケージ '\(undef)' を含むため単体モジュール検証の対象外です")
+            }
             return .failed(errorSummary: "未定義シンボル '\(undef)'（文脈依存の変数または未定義識別子の可能性: \(summary.prefix(120))）")
         }
         return .failed(errorSummary: summary.isEmpty ? "go build failed" : String(summary.prefix(180)))

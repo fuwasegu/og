@@ -387,6 +387,8 @@ public struct DocsPackManifest: Sendable, Hashable, Codable {
 public struct DocsDependencyPackManifest: Sendable, Hashable, Codable {
     public var modulePath: String
     public var moduleVersion: String
+    /// Resolved local directory path for local `replace` directives, or `nil` for GOMODCACHE packs.
+    public var localSourcePath: String?
     public var storageKey: String
     public var createdAt: String
     /// Concise SPDX-style license identifier (e.g. `"MIT"`, `"Apache-2.0"`), or `nil` when undetected.
@@ -396,14 +398,19 @@ public struct DocsDependencyPackManifest: Sendable, Hashable, Codable {
     public var embeddingModelID: String?
     public var embeddingModelVersion: String?
     public var sizeBytes: Int64
+    /// True if extraction hit a safety budget (file/byte/chunk/time limit) and produced a partial index (N-1).
+    public var truncated: Bool
+    /// Human-readable reason when `truncated == true` (e.g. `"chunk limit (4000)"`).
+    public var truncationReason: String?
 
     public var key: GoModuleKey {
-        GoModuleKey(modulePath: modulePath, version: moduleVersion)
+        GoModuleKey(modulePath: modulePath, version: moduleVersion, localSourcePath: localSourcePath)
     }
 
     public init(
         modulePath: String,
         moduleVersion: String,
+        localSourcePath: String? = nil,
         storageKey: String? = nil,
         createdAt: String,
         license: String? = nil,
@@ -411,11 +418,18 @@ public struct DocsDependencyPackManifest: Sendable, Hashable, Codable {
         status: DocsPackStatus,
         embeddingModelID: String? = nil,
         embeddingModelVersion: String? = nil,
-        sizeBytes: Int64 = 0
+        sizeBytes: Int64 = 0,
+        truncated: Bool = false,
+        truncationReason: String? = nil
     ) {
         self.modulePath = modulePath
         self.moduleVersion = moduleVersion
-        self.storageKey = storageKey ?? GoModuleKey(modulePath: modulePath, version: moduleVersion).storageKey
+        self.localSourcePath = localSourcePath
+        self.storageKey = storageKey ?? GoModuleKey(
+            modulePath: modulePath,
+            version: moduleVersion,
+            localSourcePath: localSourcePath
+        ).storageKey
         self.createdAt = createdAt
         self.license = license
         self.chunkCount = chunkCount
@@ -423,6 +437,26 @@ public struct DocsDependencyPackManifest: Sendable, Hashable, Codable {
         self.embeddingModelID = embeddingModelID
         self.embeddingModelVersion = embeddingModelVersion
         self.sizeBytes = sizeBytes
+        self.truncated = truncated
+        self.truncationReason = truncationReason
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        modulePath = try c.decode(String.self, forKey: .modulePath)
+        moduleVersion = try c.decode(String.self, forKey: .moduleVersion)
+        localSourcePath = try c.decodeIfPresent(String.self, forKey: .localSourcePath)
+        storageKey = try c.decodeIfPresent(String.self, forKey: .storageKey)
+            ?? GoModuleKey(modulePath: modulePath, version: moduleVersion, localSourcePath: localSourcePath).storageKey
+        createdAt = try c.decode(String.self, forKey: .createdAt)
+        license = try c.decodeIfPresent(String.self, forKey: .license)
+        chunkCount = try c.decode(Int.self, forKey: .chunkCount)
+        status = try c.decode(DocsPackStatus.self, forKey: .status)
+        embeddingModelID = try c.decodeIfPresent(String.self, forKey: .embeddingModelID)
+        embeddingModelVersion = try c.decodeIfPresent(String.self, forKey: .embeddingModelVersion)
+        sizeBytes = try c.decodeIfPresent(Int64.self, forKey: .sizeBytes) ?? 0
+        truncated = try c.decodeIfPresent(Bool.self, forKey: .truncated) ?? false
+        truncationReason = try c.decodeIfPresent(String.self, forKey: .truncationReason)
     }
 }
 

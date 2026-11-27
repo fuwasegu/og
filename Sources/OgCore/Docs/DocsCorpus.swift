@@ -27,6 +27,55 @@ public struct GoBuildTarget: Sendable, Hashable {
     }
 }
 
+/// Safety limits for dependency module extraction so huge modules (e.g. aws-sdk-go-v2, k8s)
+/// never block indexing indefinitely (Issue #27, N-1).
+public struct DocsModuleExtractionLimits: Sendable, Hashable {
+    public var maxFiles: Int
+    public var maxTotalBytes: Int64
+    public var maxChunks: Int
+    public var maxDurationSeconds: TimeInterval
+
+    public init(
+        maxFiles: Int = 500,
+        maxTotalBytes: Int64 = 16 * 1024 * 1024,
+        maxChunks: Int = 4_000,
+        maxDurationSeconds: TimeInterval = 15.0
+    ) {
+        self.maxFiles = maxFiles
+        self.maxTotalBytes = maxTotalBytes
+        self.maxChunks = maxChunks
+        self.maxDurationSeconds = maxDurationSeconds
+    }
+
+    public static let `default` = DocsModuleExtractionLimits()
+}
+
+/// Detailed result of extracting a dependency module, recording partial truncation or cancellation (N-1).
+public struct DocsModuleExtractionResult: Sendable, Hashable {
+    public var chunks: [DocsChunk]
+    public var truncated: Bool
+    public var truncationReason: String?
+    public var cancelled: Bool
+    public var filesProcessed: Int
+    public var bytesProcessed: Int64
+
+    public init(
+        chunks: [DocsChunk],
+        truncated: Bool = false,
+        truncationReason: String? = nil,
+        cancelled: Bool = false,
+        filesProcessed: Int = 0,
+        bytesProcessed: Int64 = 0
+    ) {
+        self.chunks = chunks
+        self.truncated = truncated
+        self.truncationReason = truncationReason
+        self.cancelled = cancelled
+        self.filesProcessed = filesProcessed
+        self.bytesProcessed = bytesProcessed
+    }
+}
+
 /// Extracts structured `DocsChunk` items from authoritative Go sources without HTML scraping (FR-4, FR-7):
 /// 1. Local GOROOT `src/` `.go` files (GoDoc comments + exported `func`/`method`/`type`/`interface`/`const`/`var` + `Example*` tests)
 /// 2. `golang/website` Markdown guides (stripping Hugo front matter and shortcode tags while keeping inner prose)
@@ -94,14 +143,43 @@ public enum DocsCorpusExtractor {
         moduleVersion: String,
         goVersion: String = BundledGoCorpus.defaultVersion,
         license: String? = nil,
-        target: GoBuildTarget = .hostDefault
+        target: GoBuildTarget = .hostDefault,
+        limits: DocsModuleExtractionLimits = .default
     ) -> [DocsChunk] {
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: moduleRoot.path) else { return [] }
+        extractModuleDetailed(
+            fromModuleRoot: moduleRoot,
+            modulePath: modulePath,
+            moduleVersion: moduleVersion,
+            goVersion: goVersion,
+            license: license,
+            target: target,
+            limits: limits
+        ).chunks
+    }
 
+    /// Detailed module extraction enforcing file, byte, chunk, and time budgets with cooperative cancellation (Issue #27, N-1).
+    public static func extractModuleDetailed(
+        fromModuleRoot moduleRoot: URL,
+        modulePath: String,
+        moduleVersion: String,
+        goVersion: String = BundledGoCorpus.defaultVersion,
+        license: String? = nil,
+        target: GoBuildTarget = .hostDefault,
+        limits: DocsModuleExtractionLimits = .default,
+        isCancelled: (@Sendable () -> Bool)? = nil
+    ) -> DocsModuleExtractionResult {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: moduleRoot.path) else {
+            return DocsModuleExtractionResult(chunks: [])
+        }
+
+        let startTime = Date()
         let detectedLicense = license ?? GoModuleResolver.detectLicenseIdentifier(in: moduleRoot)
         let rootStd = moduleRoot.standardizedFileURL
         var packageDirs: [URL] = [rootStd]
+        var truncated = false
+        var truncationReason: String?
+        var cancelled = false
 
         if let enumerator = fm.enumerator(
             at: rootStd,
@@ -109,6 +187,15 @@ public enum DocsCorpusExtractor {
             options: [.skipsHiddenFiles]
         ) {
             for case let url as URL in enumerator {
+                if Task.isCancelled || isCancelled?() == true {
+                    cancelled = true
+                    break
+                }
+                if Date().timeIntervalSince(startTime) >= limits.maxDurationSeconds {
+                    truncated = true
+                    truncationReason = "time limit (\(Int(limits.maxDurationSeconds))s)"
+                    break
+                }
                 let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
                 guard isDir else { continue }
                 let name = url.lastPathComponent
@@ -125,12 +212,46 @@ public enum DocsCorpusExtractor {
             }
         }
 
+        guard !cancelled else {
+            return DocsModuleExtractionResult(chunks: [], truncated: false, truncationReason: nil, cancelled: true)
+        }
+
         let resolvedTarget = target.withDefaultVersion(goVersion)
         var chunks: [DocsChunk] = []
+        var filesProcessed = 0
+        var bytesProcessed: Int64 = 0
+
         for dir in packageDirs.sorted(by: { $0.path < $1.path }) {
+            if Task.isCancelled || isCancelled?() == true {
+                cancelled = true
+                break
+            }
+            if Date().timeIntervalSince(startTime) >= limits.maxDurationSeconds {
+                truncated = true
+                truncationReason = "time limit (\(Int(limits.maxDurationSeconds))s)"
+                break
+            }
+            if filesProcessed >= limits.maxFiles {
+                truncated = true
+                truncationReason = "file limit (\(limits.maxFiles))"
+                break
+            }
+            if bytesProcessed >= limits.maxTotalBytes {
+                truncated = true
+                truncationReason = "size limit (\(max(1, limits.maxTotalBytes / (1024 * 1024))) MB)"
+                break
+            }
+            if chunks.count >= limits.maxChunks {
+                truncated = true
+                truncationReason = "chunk limit (\(limits.maxChunks))"
+                break
+            }
+
             let relPath = relativePackagePath(dir: dir, root: rootStd)
             let importPath = relPath.isEmpty ? modulePath : "\(modulePath)/\(relPath)"
-            chunks.append(contentsOf: extractPackage(
+            let remainingFiles = max(0, limits.maxFiles - filesProcessed)
+            let remainingBytes = max(0, limits.maxTotalBytes - bytesProcessed)
+            let pkgRes = extractPackageBudgeted(
                 directory: dir,
                 importPath: importPath,
                 goVersion: goVersion,
@@ -138,10 +259,195 @@ public enum DocsCorpusExtractor {
                 modulePath: modulePath,
                 moduleVersion: moduleVersion,
                 license: detectedLicense,
-                target: resolvedTarget
+                target: resolvedTarget,
+                maxFiles: remainingFiles,
+                maxBytes: remainingBytes,
+                isCancelled: isCancelled
+            )
+            filesProcessed += pkgRes.filesProcessed
+            bytesProcessed += pkgRes.bytesProcessed
+            if pkgRes.cancelled {
+                cancelled = true
+                break
+            }
+            if chunks.count + pkgRes.chunks.count > limits.maxChunks {
+                let take = max(0, limits.maxChunks - chunks.count)
+                chunks.append(contentsOf: pkgRes.chunks.prefix(take))
+                truncated = true
+                truncationReason = "chunk limit (\(limits.maxChunks))"
+                break
+            }
+            chunks.append(contentsOf: pkgRes.chunks)
+            if pkgRes.truncated {
+                truncated = true
+                truncationReason = pkgRes.truncationReason
+                break
+            }
+        }
+
+        let deduped = deduplicateByStableID(chunks)
+        return DocsModuleExtractionResult(
+            chunks: deduped,
+            truncated: truncated,
+            truncationReason: truncationReason,
+            cancelled: cancelled,
+            filesProcessed: filesProcessed,
+            bytesProcessed: bytesProcessed
+        )
+    }
+
+    private struct BudgetedPackageResult {
+        var chunks: [DocsChunk]
+        var filesProcessed: Int
+        var bytesProcessed: Int64
+        var truncated: Bool
+        var truncationReason: String?
+        var cancelled: Bool
+    }
+
+    private static func extractPackageBudgeted(
+        directory: URL,
+        importPath: String,
+        goVersion: String,
+        source: DocsSourceKind,
+        modulePath: String?,
+        moduleVersion: String?,
+        license: String?,
+        target: GoBuildTarget,
+        maxFiles: Int,
+        maxBytes: Int64,
+        isCancelled: (@Sendable () -> Bool)?
+    ) -> BudgetedPackageResult {
+        let target = target.withDefaultVersion(goVersion)
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.fileSizeKey]) else {
+            return BudgetedPackageResult(chunks: [], filesProcessed: 0, bytesProcessed: 0, truncated: false, truncationReason: nil, cancelled: false)
+        }
+        let goFiles = entries
+            .filter { $0.pathExtension == "go" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+
+        var filesProcessed = 0
+        var bytesProcessed: Int64 = 0
+        var truncated = false
+        var truncationReason: String?
+        var cancelled = false
+
+        var examplesBySymbol: [String: String] = [:]
+        var detailedExamples: [ParsedGoExample] = []
+        var chunks: [DocsChunk] = []
+        var packageDoc: String?
+
+        func readWithBudget(_ file: URL) -> String? {
+            if Task.isCancelled || isCancelled?() == true {
+                cancelled = true
+                return nil
+            }
+            if filesProcessed >= maxFiles {
+                truncated = true
+                truncationReason = "file limit"
+                return nil
+            }
+            let size = Int64((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+            if bytesProcessed + size > maxBytes {
+                truncated = true
+                truncationReason = "size limit"
+                return nil
+            }
+            guard let text = try? String(contentsOf: file, encoding: .utf8) else { return nil }
+            filesProcessed += 1
+            bytesProcessed += max(size, Int64(text.utf8.count))
+            return text
+        }
+
+        for file in goFiles where file.lastPathComponent.hasSuffix("_test.go") {
+            guard matchesBuildFilename(file.lastPathComponent, target: target) else { continue }
+            guard let text = readWithBudget(file) else {
+                if cancelled || truncated { break }
+                continue
+            }
+            guard matchesBuildConstraints(in: text, target: target) else { continue }
+            let parsedExamples = parseDetailedExamples(from: text, fileName: file.lastPathComponent)
+            detailedExamples.append(contentsOf: parsedExamples)
+            for ex in parsedExamples {
+                if examplesBySymbol[ex.targetSymbol] == nil {
+                    examplesBySymbol[ex.targetSymbol] = ex.code
+                }
+            }
+        }
+
+        if !cancelled && !truncated {
+            for file in goFiles where !file.lastPathComponent.hasSuffix("_test.go") {
+                guard matchesBuildFilename(file.lastPathComponent, target: target) else { continue }
+                guard let text = readWithBudget(file) else {
+                    if cancelled || truncated { break }
+                    continue
+                }
+                guard matchesBuildConstraints(in: text, target: target) else { continue }
+                if source == .dependency && isMainPackageFile(text) {
+                    continue
+                }
+                let parsed = parseGoDocFile(
+                    text: text,
+                    importPath: importPath,
+                    goVersion: goVersion,
+                    source: source,
+                    modulePath: modulePath,
+                    moduleVersion: moduleVersion,
+                    license: license,
+                    examples: examplesBySymbol
+                )
+                if packageDoc == nil, let doc = parsed.packageDoc, !doc.isEmpty {
+                    packageDoc = doc
+                }
+                chunks.append(contentsOf: parsed.chunks)
+            }
+        }
+
+        if let doc = packageDoc {
+            let summary = firstSentence(of: doc)
+            let pkgExample = examplesBySymbol[""]
+            let pkgChunk = DocsChunk(
+                goVersion: goVersion,
+                source: source,
+                packageName: importPath,
+                documentID: importPath,
+                symbol: "",
+                kind: .package,
+                title: "package \(importPath)",
+                anchor: importPath,
+                since: nil,
+                summary: summary,
+                signature: "import \"\(importPath)\"",
+                example: pkgExample,
+                body: doc,
+                modulePath: modulePath,
+                moduleVersion: moduleVersion,
+                license: license
+            )
+            chunks.insert(pkgChunk, at: 0)
+        }
+
+        for ex in detailedExamples {
+            chunks.append(makeExampleChunk(
+                example: ex,
+                importPath: importPath,
+                goVersion: goVersion,
+                source: source,
+                modulePath: modulePath,
+                moduleVersion: moduleVersion,
+                license: license
             ))
         }
-        return deduplicateByStableID(chunks)
+
+        return BudgetedPackageResult(
+            chunks: deduplicateByStableID(chunks),
+            filesProcessed: filesProcessed,
+            bytesProcessed: bytesProcessed,
+            truncated: truncated,
+            truncationReason: truncationReason,
+            cancelled: cancelled
+        )
     }
 
     /// Extracts exported symbols (`func`, `method`, `type`/`interface`, `const`, `var`, including grouped declarations)

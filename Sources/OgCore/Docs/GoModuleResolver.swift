@@ -2,13 +2,17 @@ import CryptoKit
 import Foundation
 
 /// Unique identifier for a Go module dependency at an exact version (Issue #27, DOC-12).
+/// For local `replace` directives, `localSourcePath` is included so two projects replacing the same
+/// module with different local directories never collide on a shared pack directory.
 public struct GoModuleKey: Sendable, Hashable, Codable, Comparable {
     public var modulePath: String
     public var version: String
+    public var localSourcePath: String?
 
-    public init(modulePath: String, version: String) {
+    public init(modulePath: String, version: String, localSourcePath: String? = nil) {
         self.modulePath = modulePath
         self.version = version
+        self.localSourcePath = localSourcePath
     }
 
     /// Human-readable `"module@version"` label.
@@ -18,7 +22,8 @@ public struct GoModuleKey: Sendable, Hashable, Codable, Comparable {
 
     /// Filesystem-safe deterministic directory name for storing a dependency pack.
     public var storageKey: String {
-        let digest = SHA256.hash(data: Data(displayID.utf8))
+        let hashInput = localSourcePath.map { "\(displayID)|local:\($0)" } ?? displayID
+        let digest = SHA256.hash(data: Data(hashInput.utf8))
         let hex = digest.prefix(8).map { String(format: "%02x", $0) }.joined()
         let rawTail = modulePath.split(separator: "/").last.map(String.init) ?? "mod"
         let safeTail = rawTail.map { ch -> Character in
@@ -32,7 +37,8 @@ public struct GoModuleKey: Sendable, Hashable, Codable, Comparable {
 
     public static func < (lhs: GoModuleKey, rhs: GoModuleKey) -> Bool {
         if lhs.modulePath != rhs.modulePath { return lhs.modulePath < rhs.modulePath }
-        return lhs.version < rhs.version
+        if lhs.version != rhs.version { return lhs.version < rhs.version }
+        return (lhs.localSourcePath ?? "") < (rhs.localSourcePath ?? "")
     }
 }
 
@@ -46,7 +52,7 @@ public enum GoModuleReplaceTarget: Sendable, Hashable {
 public struct GoModuleDependency: Sendable, Hashable {
     /// Import path prefix declared in `require` (used as the package import prefix).
     public var modulePath: String
-    /// Exact version required by `go.mod` / `go.work` (or replacement version / `"local"` for local path replace).
+    /// Exact version required by `go.mod` / `go.work` (or module replacement target version; for local path replace, retains the required version while `localReplaceDirectory` holds the source path).
     public var version: String
     /// Whether the dependency is marked `// indirect` in all referencing `go.mod` files.
     public var isIndirect: Bool
@@ -85,7 +91,11 @@ public struct GoModuleDependency: Sendable, Hashable {
 
     /// Pack key under which this dependency's documentation pack is stored.
     public var packKey: GoModuleKey {
-        GoModuleKey(modulePath: modulePath, version: version)
+        GoModuleKey(
+            modulePath: modulePath,
+            version: version,
+            localSourcePath: localReplaceDirectory?.standardizedFileURL.path
+        )
     }
 
     /// Human-readable `"module@version"` string.
@@ -358,14 +368,17 @@ public enum GoModuleResolver {
         locator: ToolLocator = .shared
     ) -> [GoModuleDependency] {
         let fm = FileManager.default
-        let resolvedCacheRoot = moduleCacheRoot ?? fallbackModuleCacheRoot(environment: locator.environment)
+        // L-2: when moduleCacheRoot is not explicitly supplied, consult `go env GOMODCACHE` (covers `go env -w`) before env/default fallbacks.
+        let resolvedCacheRoot = moduleCacheRoot ?? detectModuleCacheRoot(locator: locator)
 
         var parsedMods: [ParsedGoMod] = []
+        var isWorkspaceMode = false
         var workReplaces: [ParsedGoMod.ReplaceEntry] = []
         var workspaceModulePaths = Set<String>()
 
         if let workURL = findFileWalkingUp(from: projectRoot, fileName: "go.work"),
            let workText = try? String(contentsOf: workURL, encoding: .utf8) {
+            isWorkspaceMode = true
             let work = parseGoWork(text: workText, baseDirectory: workURL.deletingLastPathComponent())
             workReplaces = work.replaces
             for useDir in work.useDirectories {
@@ -381,6 +394,7 @@ public enum GoModuleResolver {
         if parsedMods.isEmpty,
            let modURL = findFileWalkingUp(from: projectRoot, fileName: "go.mod"),
            let modText = try? String(contentsOf: modURL, encoding: .utf8) {
+            isWorkspaceMode = false
             let parsed = parseGoMod(text: modText, baseDirectory: modURL.deletingLastPathComponent())
             if let mp = parsed.modulePath { workspaceModulePaths.insert(mp) }
             parsedMods.append(parsed)
@@ -412,13 +426,14 @@ public enum GoModuleResolver {
             }
         }
 
-        // `go.work` replace takes precedence over `go.mod` replace; version-specific replace beats unversioned.
-        let allReplaces = workReplaces + modReplaces
+        // L-3: Per Go workspace semantics, in `go.work` mode only `go.work` `replace` directives apply
+        // (individual module `go.mod` replaces are ignored in workspace mode).
+        let activeReplaces = isWorkspaceMode ? workReplaces : modReplaces
         func matchReplace(path: String, version: String) -> GoModuleReplaceTarget? {
-            if let exact = allReplaces.first(where: { $0.oldPath == path && $0.oldVersion == version }) {
+            if let exact = activeReplaces.first(where: { $0.oldPath == path && $0.oldVersion == version }) {
                 return exact.target
             }
-            if let generic = allReplaces.first(where: { $0.oldPath == path && $0.oldVersion == nil }) {
+            if let generic = activeReplaces.first(where: { $0.oldPath == path && $0.oldVersion == nil }) {
                 return generic.target
             }
             return nil
@@ -573,14 +588,43 @@ public enum GoModuleResolver {
         if l.major != r.major { return l.major < r.major ? .orderedAscending : .orderedDescending }
         if l.minor != r.minor { return l.minor < r.minor ? .orderedAscending : .orderedDescending }
         if l.patch != r.patch { return l.patch < r.patch ? .orderedAscending : .orderedDescending }
-        // No prerelease > prerelease (semver 2.0)
+        // No prerelease > prerelease (SemVer 2.0 §11)
         switch (l.prerelease, r.prerelease) {
         case (nil, nil): return .orderedSame
         case (nil, _): return .orderedDescending
         case (_, nil): return .orderedAscending
         case (let lp?, let rp?):
-            return lp.compare(rp, options: .numeric)
+            return comparePrerelease(lp, rp)
         }
+    }
+
+    /// SemVer 2.0 §11.4 dot-separated prerelease identifier comparison (L-4).
+    private static func comparePrerelease(_ lhs: String, _ rhs: String) -> ComparisonResult {
+        let lParts = lhs.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
+        let rParts = rhs.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
+        let count = min(lParts.count, rParts.count)
+        for i in 0..<count {
+            let lp = lParts[i]
+            let rp = rParts[i]
+            if lp == rp { continue }
+            let lNum = lp.allSatisfy(\.isNumber) ? Int(lp) : nil
+            let rNum = rp.allSatisfy(\.isNumber) ? Int(rp) : nil
+            switch (lNum, rNum) {
+            case (let ln?, let rn?):
+                return ln < rn ? .orderedAscending : .orderedDescending
+            case (_?, nil):
+                // Numeric identifiers always have lower precedence than non-numeric identifiers.
+                return .orderedAscending
+            case (nil, _?):
+                return .orderedDescending
+            case (nil, nil):
+                return lp < rp ? .orderedAscending : .orderedDescending
+            }
+        }
+        if lParts.count != rParts.count {
+            return lParts.count < rParts.count ? .orderedAscending : .orderedDescending
+        }
+        return .orderedSame
     }
 
     private struct ParsedSemver {

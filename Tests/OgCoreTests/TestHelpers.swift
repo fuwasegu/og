@@ -880,6 +880,10 @@ final class LocalMockHTTPServer: @unchecked Sendable {
 
 func makeUUID() -> UUID { UUID() }
 
+func writeTextFile(at url: URL, contents: String) throws {
+    try contents.write(to: url, atomically: true, encoding: .utf8)
+}
+
 func isGoToolchainActive() -> Bool {
     let locator = ToolLocator()
     guard let goExe = locator.find("go") else { return false }

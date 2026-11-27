@@ -168,6 +168,19 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
                 self?.updateModeLabelForProgress()
             }
         })
+        // Invalidate displayed dependency answers immediately when go.mod/go.work changes in this project window (DOC-12c).
+        observers.append(NotificationCenter.default.addObserver(forName: .ogFilesChanged, object: context, queue: .main) { [weak self] note in
+            let paths = note.userInfo?["paths"] as? [String] ?? []
+            guard paths.contains(where: { $0.hasSuffix("/go.mod") || $0.hasSuffix("/go.work") }) else { return }
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.searchTask?.cancel()
+                self.synthesisTask?.cancel()
+                self.lastAnswer = nil
+                self.refreshVersionPopup()
+                self.renderIdleOrStatus()
+            }
+        })
         refreshVersionPopup()
         renderIdleOrStatus()
     }

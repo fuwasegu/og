@@ -351,9 +351,10 @@ final class DocsManager {
             proc.standardInput = FileHandle.nullDevice
             do {
                 try proc.run()
+                // Drain stderr BEFORE waitUntilExit so a verbose `go mod download` never deadlocks on a full pipe buffer.
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
                 proc.waitUntilExit()
                 if proc.terminationStatus != 0 {
-                    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
                     let errMsg = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
                     await DocsManager.shared.finishBatch(
                         goVersion: taskKey,
@@ -369,6 +370,21 @@ final class DocsManager {
                 DocsManager.shared.batchTasks.removeValue(forKey: taskKey)
                 DocsManager.shared.syncProjectDependencies(projectRoot: projectRoot)
             }
+        }
+    }
+
+    /// Removes dependency packs not required by any of the given open project roots and runs shared-vector GC (N-2).
+    func pruneUnusedDependencyPacks(keepingProjectRoots roots: [URL]) {
+        guard let pm = packManager else { return }
+        let modCache = detectedModuleCacheRoot
+        Task { [weak self] in
+            do {
+                _ = try await pm.pruneUnusedDependencyPacks(forProjectRoots: roots, moduleCacheRoot: modCache)
+                self?.lastError = nil
+            } catch {
+                self?.lastError = error.localizedDescription
+            }
+            await self?.refreshPacks()
         }
     }
 

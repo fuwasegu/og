@@ -2221,7 +2221,8 @@ struct DocsDependencyTests {
         let localRep = dir.subdir("local-helper")
         _ = dir.file("local-helper/helper.go", "package helper\n")
 
-        // Workspace with two modules requiring different versions of chi (MVS picks v5.1.0)
+        // Workspace with two modules requiring different versions of chi (MVS picks v5.1.0).
+        // Per Go workspace semantics (L-3), go.work replace directives govern; go.mod replaces are ignored in workspace mode.
         let ws = dir.subdir("ws")
         _ = dir.file("ws/go.work", """
         go 1.23
@@ -2230,6 +2231,8 @@ struct DocsDependencyTests {
             ./svc-a
             ./svc-b
         )
+
+        replace example.com/helper => ../local-helper
         """)
         _ = dir.file("ws/svc-a/go.mod", """
         module example.com/svc-a
@@ -2243,7 +2246,7 @@ struct DocsDependencyTests {
             example.com/helper v0.0.0
         )
 
-        replace example.com/helper => ../../local-helper
+        replace github.com/example/strict => ../nonexistent-mod-replace
         """)
         _ = dir.file("ws/svc-b/go.mod", """
         module example.com/svc-b
@@ -2565,6 +2568,211 @@ struct DocsDependencyTests {
         let demotedV11 = await mgr.dependencyManifest(for: GoModuleKey(modulePath: "github.com/example/biglib", version: "v1.1.0"))
         #expect(demotedV1?.status == .indexingFTSOnly)
         #expect(demotedV11?.status == .indexingFTSOnly)
+    }
+
+    @Test("Enforces extraction budgets (N-1), prunes unused dependency packs (N-2), and isolates local replace keys")
+    func extractionBudgetsPruningAndLocalReplaceIsolation() async throws {
+        let dir = TempDir()
+        let packDir = TempDir()
+        defer {
+            dir.cleanup()
+            packDir.cleanup()
+        }
+
+        // N-1: Module with 4 files and 8 symbols truncated by tight extraction limits (maxFiles=2)
+        let cache = dir.subdir("modcache")
+        for i in 0..<4 {
+            _ = dir.file("modcache/github.com/example/huge@v1.0.0/file\(i).go", """
+            package huge
+            // Fn\(i)A does work.
+            func Fn\(i)A() {}
+            // Fn\(i)B does work.
+            func Fn\(i)B() {}
+            """)
+        }
+        let proj = dir.subdir("proj")
+        _ = dir.file("proj/go.mod", "module example.com/p\n\ngo 1.23\n\nrequire github.com/example/huge v1.0.0\n")
+
+        let mgr = try makeDocsPackManager(in: packDir)
+        let syncReport = await mgr.syncProjectDependencies(
+            projectRoot: proj,
+            moduleCacheRoot: cache,
+            goVersion: "1.23",
+            extractionLimits: DocsModuleExtractionLimits(maxFiles: 2, maxTotalBytes: 1_000_000, maxChunks: 100, maxDurationSeconds: 10)
+        )
+        #expect(syncReport.synced.count == 1)
+        #expect(syncReport.truncatedModules["github.com/example/huge@v1.0.0"] != nil)
+        let hugeManifest = await mgr.dependencyManifest(for: GoModuleKey(modulePath: "github.com/example/huge", version: "v1.0.0"))
+        #expect(hugeManifest?.truncated == true)
+        #expect(hugeManifest?.truncationReason != nil)
+
+        // Local replace key isolation: two projects replacing the same module with two different local directories
+        let localA = dir.subdir("local-a")
+        let localB = dir.subdir("local-b")
+        _ = dir.file("local-a/a.go", "package myrep\nfunc FromLocalA() {}\n")
+        _ = dir.file("local-b/b.go", "package myrep\nfunc FromLocalB() {}\n")
+        let keyA = GoModuleKey(modulePath: "example.com/myrep", version: "v0.0.0", localSourcePath: localA.standardizedFileURL.path)
+        let keyB = GoModuleKey(modulePath: "example.com/myrep", version: "v0.0.0", localSourcePath: localB.standardizedFileURL.path)
+        #expect(keyA.storageKey != keyB.storageKey)
+
+        // N-2: Prune unused dependency packs keeping only `keyA`
+        _ = try await mgr.ingestDependency(modulePath: keyA.modulePath, moduleVersion: keyA.version, localSourcePath: keyA.localSourcePath, chunks: [])
+        _ = try await mgr.ingestDependency(modulePath: keyB.modulePath, moduleVersion: keyB.version, localSourcePath: keyB.localSourcePath, chunks: [])
+        let pruned = try await mgr.pruneUnusedDependencyPacks(keepingActiveKeys: [keyA])
+        #expect(pruned.contains(keyB))
+        #expect(pruned.contains(GoModuleKey(modulePath: "github.com/example/huge", version: "v1.0.0")))
+        #expect(await mgr.dependencyManifest(for: keyA) != nil)
+        #expect(await mgr.dependencyManifest(for: keyB) == nil)
+    }
+
+    @Test("Preserves stdlib priority on collisions (U-1), degrades corrupt dep packs safely (U-3), and classifies dep snippets as unverified (U-2)")
+    func stdlibPriorityCorruptPackDegradationAndDepSnippetVerification() async throws {
+        let dir = TempDir()
+        let packDir = TempDir()
+        defer {
+            dir.cleanup()
+            packDir.cleanup()
+        }
+
+        let cache = dir.subdir("modcache")
+        // Dependency whose short package name (`errors`) and symbol (`New`) collide with stdlib `errors.New`
+        _ = dir.file("modcache/github.com/pkg/errors@v0.9.1/errors.go", """
+        package errors
+        // New returns an error with stack trace.
+        func New(message string) error { return nil }
+        """)
+        _ = dir.file("modcache/github.com/example/corrupt@v1.0.0/c.go", """
+        package corrupt
+        func Broken() {}
+        """)
+
+        let proj = dir.subdir("proj")
+        _ = dir.file("proj/go.mod", """
+        module example.com/collide
+
+        go 1.23
+
+        require (
+            github.com/pkg/errors v0.9.1
+            github.com/example/corrupt v1.0.0
+        )
+        """)
+
+        let mgr = try makeDocsPackManager(in: packDir)
+        var stdChunks = BundledGoCorpus.chunks(forGoVersion: "1.23")
+        stdChunks.append(DocsChunk(
+            goVersion: "1.23",
+            source: .stdlib,
+            packageName: "errors",
+            documentID: "errors",
+            symbol: "New",
+            kind: .function,
+            title: "errors.New",
+            anchor: "errors.New",
+            summary: "New returns an error that formats as the given text.",
+            signature: "func New(text string) error",
+            body: "func New(text string) error\n\nNew returns an error that formats as the given text."
+        ))
+        _ = try await mgr.ingest(goVersion: "1.23", chunks: stdChunks, embedder: nil)
+        _ = await mgr.syncProjectDependencies(projectRoot: proj, moduleCacheRoot: cache, goVersion: "1.23")
+
+        // Corrupt the SQLite file of `github.com/example/corrupt@v1.0.0` (U-3)
+        let corruptKey = GoModuleKey(modulePath: "github.com/example/corrupt", version: "v1.0.0")
+        let corruptDB = await mgr.dependencyIndexURL(for: corruptKey)
+        try writeTextFile(at: corruptDB, contents: "NOT A VALID SQLITE DATABASE!!!")
+
+        let svc = ResearchService(packManager: mgr, enabled: true)
+
+        // U-1 & U-3: `errors.New` still succeeds despite corrupt sibling dep pack, and stdlib ranks #1 over `github.com/pkg/errors`!
+        let collide = try await svc.search(query: "errors.New", projectRoot: proj, moduleCacheRoot: cache)
+        #expect(collide.status == .found)
+        #expect(collide.cards.first?.sourceKind == .stdlib)
+        // Explicit full module path still finds the dependency #1!
+        let explicitDep = try await svc.search(query: "github.com/pkg/errors.New", projectRoot: proj, moduleCacheRoot: cache)
+        #expect(explicitDep.status == .found)
+        #expect(explicitDep.cards.first?.sourceKind == .dependency)
+        #expect(explicitDep.cards.first?.modulePath == "github.com/pkg/errors")
+
+        // U-1: Stdlib golden query ("json のデコード") stays stdlib #1 even when dependency packs are active.
+        let golden = try await svc.search(query: "json のデコード", projectRoot: proj, moduleCacheRoot: cache)
+        #expect(golden.status == .found)
+        #expect(golden.cards.first?.sourceKind == .stdlib)
+
+        // U-2: Dependency-grounded Phase 3 snippet classifies as `.unverified` (never misclassified as `.failed`).
+        let depEvidence = DocsAnswerEvidence(
+            citation: "github.com/go-chi/chi/v5@v5.1.0 [MIT]: github.com/go-chi/chi/v5.NewRouter",
+            title: "github.com/go-chi/chi/v5.NewRouter",
+            packageName: "github.com/go-chi/chi/v5",
+            symbol: "NewRouter",
+            signature: "func NewRouter() *Mux",
+            summary: "NewRouter creates a chi router.",
+            example: "r := chi.NewRouter()",
+            body: "NewRouter creates a chi router.",
+            since: nil,
+            isDependency: true,
+            moduleLabel: "github.com/go-chi/chi/v5@v5.1.0"
+        )
+        let fakeGen = StubDocsAnswerGenerator { _ in
+            DocsAnswerGenerationOutput(
+                explanation: "chi.NewRouter を使ってルーターを作成します。",
+                snippet: "r := chi.NewRouter()\n_ = r",
+                citedLabels: [depEvidence.citation],
+                insufficientEvidence: false
+            )
+        }
+        await svc.setAnswerGenerator(fakeGen)
+        let depCard = DocsAnswerCard(
+            stableID: "dep-chi",
+            title: depEvidence.title,
+            reason: depEvidence.summary,
+            signature: depEvidence.signature,
+            example: depEvidence.example,
+            citation: depEvidence.citation,
+            sourceKind: .dependency,
+            packageName: depEvidence.packageName,
+            symbol: depEvidence.symbol,
+            anchor: depEvidence.title,
+            goVersion: "1.23",
+            since: nil,
+            canInsert: true,
+            matchedBy: .deterministicExact,
+            modulePath: "github.com/go-chi/chi/v5",
+            moduleVersion: "v5.1.0",
+            license: "MIT"
+        )
+        let fakeAnswer = DocsAnswer(
+            query: "chi ルーターを作りたい",
+            status: .found,
+            language: .japanese,
+            intent: .needsReverseLookup,
+            conclusion: "found",
+            cards: [depCard],
+            targetVersion: GoVersion(major: 1, minor: 23)
+        )
+        let synthesized = await svc.synthesizeAnswer(for: fakeAnswer)
+        #expect(synthesized != nil)
+        if case .unverified(let reason) = synthesized?.verification {
+            #expect(stringContains(reason, "github.com/go-chi/chi/v5@v5.1.0"))
+        } else {
+            Issue.record("Expected .unverified for dependency-grounded snippet, got \(String(describing: synthesized?.verification))")
+        }
+        #expect(synthesized?.canInsert == false)
+
+        // U-2: Verifier failure classifier also maps known external dependency ident to `.unverified`.
+        let classified = DocsSnippetVerifier.classifyFailure(
+            stderr: "./main.go:4:7: undefined: chi\n",
+            knownExternalPackageIdents: ["chi"]
+        )
+        if case .unverified = classified {
+            // expected
+        } else {
+            Issue.record("Expected .unverified for known external dependency ident, got \(classified)")
+        }
+
+        // L-3 & L-4: SemVer prerelease dot-identifier precedence & go.work replace precedence
+        #expect(GoModuleResolver.compareModuleVersions("v1.0.0-alpha.2", "v1.0.0-alpha.10") == .orderedAscending)
+        #expect(GoModuleResolver.compareModuleVersions("v1.0.0-1", "v1.0.0-alpha") == .orderedAscending)
+        #expect(GoModuleResolver.compareModuleVersions("v1.0.0-alpha", "v1.0.0-alpha.1") == .orderedAscending)
     }
 }
 
