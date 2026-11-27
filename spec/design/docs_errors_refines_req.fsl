@@ -1,0 +1,27 @@
+// DocsErrorsDesign ⊑ DocsErrors
+// Loopback-validated dual-signal error-driven Docs hints refine the DOC-13 requirements contract.
+refinement DocsErrorsRefinesReq {
+  impl DocsErrorsDesign
+  abs  DocsErrors
+  maps auto
+
+  map diag_source[s: DiagSlot] =
+    if diag_source[s] == DGopls then Gopls
+    else Build
+
+  map hint_kind[s: DiagSlot] =
+    if hint_kind[s] == DCards then Cards
+    else if hint_kind[s] == DDepReport then DepReport
+    else NoHint
+
+  map hint_state[s: DiagSlot] =
+    if hint_state[s] == DShown then Shown
+    else if hint_state[s] == DDismissed then Dismissed
+    else None
+
+  action set_endpoint(h) -> stutter
+  action diagnostic_appears(f, d, src)
+    -> diagnostic_appears(f, d, if src == DGopls then Gopls else Build)
+  action present_hint(f, d, card_count)
+    -> present_hint(Local, f, d, card_count, true, true, false, true)
+}

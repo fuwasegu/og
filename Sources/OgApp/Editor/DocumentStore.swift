@@ -149,6 +149,7 @@ final class DocumentStore {
     // MARK: - Editing
 
     private func didEdit(_ doc: Document) {
+        context?.notifyDocumentEdited(uri: doc.uri, version: doc.version)
         // Coalesced didChange to gopls (DES-1: ordered stream, last version wins).
         if doc.isGo {
             syncTimers[doc.url]?.invalidate()

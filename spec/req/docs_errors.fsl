@@ -1,0 +1,350 @@
+// og — Error-driven Go documentation lookup requirements (Issue #28)
+//
+// Source: GitHub issue #28 (diagnostics & build errors surface cited Docs cards).
+//   DOC-13a: When a diagnostic (gopls) or a build/vet error appears, og may surface a
+//            hint carrying Docs cards for that error — but only when the existing search
+//            pipeline returns grounded, cited candidates that pass the same top-N /
+//            threshold / version gates as an interactive query. No evidence, no hint:
+//            silence is the correct behavior, never a fabricated explanation.
+//   DOC-13b: A hint is bound to the exact diagnostic it was derived from, including the
+//            document version. When the diagnostic disappears or the document moves on,
+//            the hint is cleared; stale hints never survive.
+//   DOC-13c: Hints never interrupt: they do not open panels, steal focus, or modify the
+//            document. Dismissing a hint suppresses it for that diagnostic. Applying a
+//            snippet from a hint is an explicit user action behind the usual insert gates.
+//   DOC-13d: Everything stays on the machine: diagnostic text and derived queries are
+//            loopback-only, like every other Docs query.
+//
+// ASSUME-1 (representation only): two files (0, 1), two diagnostic slots per file,
+//   flattened into DiagSlot = 0..3 (`slot = f * NUM_DIAGS + d`), two document versions
+//   (0, 1), and MAX_CARDS = 3 are sufficient to expose stale-hint, wrong-version,
+//   dismissed-reshow, ungrounded-hint, and interruption bugs.
+requirements DocsErrors {
+  number FileId
+  number DiagId
+  number DiagSlot
+  number DocVer
+  number CardCount
+  const NUM_DIAGS = 2
+  const MAX_CARDS = 3
+
+  enum Endpoint { Local, Remote }
+  enum DiagSource { Gopls, Build }
+  enum HintKind { NoHint, Cards, DepReport }
+  enum HintAnswer { None, Shown, Dismissed }
+
+  state {
+    enabled:           Bool,        // Docs lookup enabled (research.fsl DOC-1)
+    hints_enabled:     Bool,        // separate user switch: error hints may be silenced alone
+    // per-file current document version (build-source slots ignore it)
+    doc_version:       Map<FileId, DocVer>,
+    // per-slot diagnostic presence and the doc version it belongs to
+    diag_present:      Map<DiagSlot, Bool>,
+    diag_source:       Map<DiagSlot, DiagSource>,
+    diag_doc_ver:      Map<DiagSlot, DocVer>,
+    // per-slot hint state
+    hint_kind:         Map<DiagSlot, HintKind>,
+    hint_state:        Map<DiagSlot, HintAnswer>,
+    hint_card_count:   Map<DiagSlot, CardCount>,
+    hint_has_citation: Map<DiagSlot, Bool>,
+    hint_grounded:     Map<DiagSlot, Bool>,
+    hint_dismissed:    Map<DiagSlot, Bool>,   // sticky while the same diagnostic persists
+    inserted:          Bool,
+    sent_remote:       Bool,        // MODEL-1: ghost — diagnostic/query ever sent off-machine
+    panel_auto_opened: Bool,        // MODEL-2: ghost — a hint ever opened a panel / stole focus
+    document_modified: Bool         // MODEL-3: ghost — a hint ever modified the document
+  }
+
+  init {
+    enabled = false
+    hints_enabled = false
+    inserted = false
+    sent_remote = false
+    panel_auto_opened = false
+    document_modified = false
+    forall f: FileId {
+      doc_version[f] = 0
+    }
+    forall s: DiagSlot {
+      diag_present[s] = false
+      diag_source[s] = Gopls
+      diag_doc_ver[s] = 0
+      hint_kind[s] = NoHint
+      hint_state[s] = None
+      hint_card_count[s] = 0
+      hint_has_citation[s] = false
+      hint_grounded[s] = false
+      hint_dismissed[s] = false
+    }
+  }
+
+  action enable() "DOC-1: enable offline Go docs lookup" {
+    requires not enabled
+    enabled = true
+  }
+
+  action disable() "DOC-1: disable lookup and clear every error hint" {
+    requires enabled
+    enabled = false
+    forall s: DiagSlot {
+      hint_kind[s] = NoHint
+      hint_state[s] = None
+      hint_card_count[s] = 0
+      hint_has_citation[s] = false
+      hint_grounded[s] = false
+    }
+  }
+
+  action set_hints_enabled(on: Bool) "DOC-13c: user toggles error hints independently of Docs lookup; turning off clears shown hints" {
+    requires on != hints_enabled
+    hints_enabled = on
+    if not on {
+      forall s: DiagSlot {
+        hint_kind[s] = NoHint
+        hint_state[s] = None
+        hint_card_count[s] = 0
+        hint_has_citation[s] = false
+        hint_grounded[s] = false
+      }
+    }
+  }
+
+  // MARK: - Diagnostic lifecycle (gopls publishDiagnostics / build runs)
+
+  action diagnostic_appears(f: FileId, d: DiagId, src: DiagSource) "DOC-13a: a diagnostic appears for file f at its current document version" {
+    requires not diag_present[f * NUM_DIAGS + d]
+    diag_present[f * NUM_DIAGS + d] = true
+    diag_source[f * NUM_DIAGS + d] = src
+    diag_doc_ver[f * NUM_DIAGS + d] = doc_version[f]
+    hint_dismissed[f * NUM_DIAGS + d] = false
+  }
+
+  action publish_diagnostics(f: FileId, d: DiagId) "DOC-13b: a fresh diagnostics publication for file f no longer contains diagnostic d — it and its hint are gone" {
+    requires diag_present[f * NUM_DIAGS + d]
+    diag_present[f * NUM_DIAGS + d] = false
+    hint_kind[f * NUM_DIAGS + d] = NoHint
+    hint_state[f * NUM_DIAGS + d] = None
+    hint_card_count[f * NUM_DIAGS + d] = 0
+    hint_has_citation[f * NUM_DIAGS + d] = false
+    hint_grounded[f * NUM_DIAGS + d] = false
+    hint_dismissed[f * NUM_DIAGS + d] = false
+  }
+
+  action edit_document(f: FileId, v: DocVer) "DOC-13b: document f advances to version v; gopls hints bound to older versions are stale and cleared" {
+    requires v != doc_version[f]
+    doc_version[f] = v
+    forall s: DiagSlot {
+      if s >= f * NUM_DIAGS and s < (f + 1) * NUM_DIAGS and diag_source[s] == Gopls and diag_doc_ver[s] != v {
+        hint_kind[s] = NoHint
+        hint_state[s] = None
+        hint_card_count[s] = 0
+        hint_has_citation[s] = false
+        hint_grounded[s] = false
+      }
+    }
+  }
+
+  action new_build_run() "DOC-13b: a new build/vet run supersedes all build-source diagnostics and their hints" {
+    forall s: DiagSlot {
+      if diag_source[s] == Build {
+        diag_present[s] = false
+        hint_kind[s] = NoHint
+        hint_state[s] = None
+        hint_card_count[s] = 0
+        hint_has_citation[s] = false
+        hint_grounded[s] = false
+        hint_dismissed[s] = false
+      }
+    }
+  }
+
+  // MARK: - Hint presentation (same gates as interactive queries)
+
+  action present_hint(
+    to: Endpoint,
+    f: FileId,
+    d: DiagId,
+    card_count: CardCount,
+    within_top_n: Bool,
+    passed_threshold: Bool,
+    has_newer_feature: Bool,
+    dep_version_matches: Bool
+  ) "DOC-13a: surface grounded, cited cards for a live diagnostic — only through the same top-N / threshold / version gates as query_found" {
+    requires enabled
+    requires hints_enabled
+    requires to == Local
+    requires diag_present[f * NUM_DIAGS + d]
+    requires diag_source[f * NUM_DIAGS + d] == Build or diag_doc_ver[f * NUM_DIAGS + d] == doc_version[f]
+    requires not hint_dismissed[f * NUM_DIAGS + d]
+    requires card_count >= 1 and card_count <= MAX_CARDS
+    requires within_top_n
+    requires passed_threshold
+    requires not has_newer_feature
+    requires dep_version_matches
+    hint_kind[f * NUM_DIAGS + d] = Cards
+    hint_state[f * NUM_DIAGS + d] = Shown
+    hint_card_count[f * NUM_DIAGS + d] = card_count
+    hint_has_citation[f * NUM_DIAGS + d] = true
+    hint_grounded[f * NUM_DIAGS + d] = true
+    sent_remote = sent_remote or to == Remote
+    panel_auto_opened = panel_auto_opened or false
+  }
+
+  action present_dep_report_hint(f: FileId, d: DiagId) "DOC-13a: an unresolved-import diagnostic for an uncached/unindexed dependency surfaces the honest dep report (Issue #27), never fabricated cards" {
+    requires enabled
+    requires hints_enabled
+    requires diag_present[f * NUM_DIAGS + d]
+    requires diag_source[f * NUM_DIAGS + d] == Build or diag_doc_ver[f * NUM_DIAGS + d] == doc_version[f]
+    requires not hint_dismissed[f * NUM_DIAGS + d]
+    hint_kind[f * NUM_DIAGS + d] = DepReport
+    hint_state[f * NUM_DIAGS + d] = Shown
+    hint_card_count[f * NUM_DIAGS + d] = 0
+    hint_has_citation[f * NUM_DIAGS + d] = false
+    hint_grounded[f * NUM_DIAGS + d] = true
+  }
+
+  action dismiss_hint(f: FileId, d: DiagId) "DOC-13c: user dismisses the hint for this diagnostic; it stays dismissed while the diagnostic persists" {
+    requires hint_state[f * NUM_DIAGS + d] == Shown
+    hint_kind[f * NUM_DIAGS + d] = NoHint
+    hint_state[f * NUM_DIAGS + d] = Dismissed
+    hint_card_count[f * NUM_DIAGS + d] = 0
+    hint_has_citation[f * NUM_DIAGS + d] = false
+    hint_grounded[f * NUM_DIAGS + d] = false
+    hint_dismissed[f * NUM_DIAGS + d] = true
+  }
+
+  action insert_from_hint(f: FileId, d: DiagId) "DOC-13c: applying a snippet from a hint is an explicit user action behind the same gates as insert_card" {
+    requires enabled
+    requires hint_kind[f * NUM_DIAGS + d] == Cards
+    requires hint_state[f * NUM_DIAGS + d] == Shown
+    requires hint_has_citation[f * NUM_DIAGS + d] and hint_grounded[f * NUM_DIAGS + d]
+    inserted = true
+    document_modified = true
+  }
+
+  // MARK: - Invariants
+
+  invariant NeverLeavesMachine "DOC-6: diagnostics and derived queries never leave the machine" {
+    not sent_remote
+  }
+
+  invariant HintsNeverInterrupt "DOC-13c: presenting a hint never opens a panel or steals focus" {
+    not panel_auto_opened
+  }
+
+  invariant HintsNeverModifyDocument "DOC-13c: no hint application happens without the explicit insert_from_hint user action" {
+    document_modified => inserted
+  }
+
+  invariant HintsAreGroundedAndGated "DOC-13a: a shown Cards hint always carries 1..MAX_CARDS cited, grounded cards for a live diagnostic" {
+    forall s: DiagSlot {
+      hint_kind[s] == Cards => (
+        enabled and hints_enabled and
+        diag_present[s] and
+        hint_state[s] == Shown and
+        hint_card_count[s] >= 1 and hint_card_count[s] <= MAX_CARDS and
+        hint_has_citation[s] and hint_grounded[s]
+      )
+    }
+  }
+
+  invariant StaleHintsNeverSurvive "DOC-13b: a gopls hint is shown only while its diagnostic belongs to the file's current document version" {
+    forall f: FileId {
+      forall d: DiagId {
+        (hint_state[f * NUM_DIAGS + d] == Shown and diag_source[f * NUM_DIAGS + d] == Gopls) =>
+          diag_doc_ver[f * NUM_DIAGS + d] == doc_version[f]
+      }
+    }
+  }
+
+  invariant DismissedHintsStayDismissed "DOC-13c: a dismissed diagnostic never gets its hint re-shown while it persists" {
+    forall s: DiagSlot {
+      hint_dismissed[s] => hint_state[s] != Shown
+    }
+  }
+
+  invariant DepReportHintsCarryNoCards "DOC-13a: a dependency report hint never fabricates cards or citations" {
+    forall s: DiagSlot {
+      hint_kind[s] == DepReport => (hint_card_count[s] == 0 and not hint_has_citation[s])
+    }
+  }
+
+  invariant DisabledHasNoHints "DOC-1: disabling lookup or hints leaves no hint shown" {
+    (not enabled or not hints_enabled) => (forall s: DiagSlot { hint_state[s] != Shown })
+  }
+
+  // MARK: - Acceptance & Forbidden traces
+
+  acceptance AC-ERR-1 "DOC-13a: an undefined-symbol diagnostic surfaces grounded cards, insertable via the explicit action" {
+    enable() set_hints_enabled(true) diagnostic_appears(0, 0, Gopls) present_hint(Local, 0, 0, 2, true, true, false, true) insert_from_hint(0, 0)
+    expect hint_kind[0] == Cards and hint_card_count[0] == 2 and inserted
+  }
+
+  acceptance AC-ERR-2 "DOC-13b: when the diagnostic is resolved, its hint disappears with it" {
+    enable() set_hints_enabled(true) diagnostic_appears(0, 0, Gopls) present_hint(Local, 0, 0, 1, true, true, false, true) publish_diagnostics(0, 0)
+    expect hint_kind[0] == NoHint and hint_state[0] == None
+  }
+
+  acceptance AC-ERR-3 "DOC-13b: editing the document past the diagnostic's version clears the hint" {
+    enable() set_hints_enabled(true) diagnostic_appears(0, 0, Gopls) present_hint(Local, 0, 0, 1, true, true, false, true) edit_document(0, 1)
+    expect hint_state[0] == None
+  }
+
+  acceptance AC-ERR-4 "DOC-13c: a dismissed hint is not re-shown for the same diagnostic, but a genuinely new diagnostic can surface one" {
+    enable() set_hints_enabled(true) diagnostic_appears(0, 0, Gopls) present_hint(Local, 0, 0, 1, true, true, false, true) dismiss_hint(0, 0) publish_diagnostics(0, 0) diagnostic_appears(0, 0, Gopls) present_hint(Local, 0, 0, 1, true, true, false, true)
+    expect hint_state[0] == Shown
+  }
+
+  acceptance AC-ERR-5 "DOC-13b: a new build run supersedes build-error hints" {
+    enable() set_hints_enabled(true) diagnostic_appears(0, 0, Build) present_hint(Local, 0, 0, 1, true, true, false, true) new_build_run()
+    expect hint_state[0] == None and not diag_present[0]
+  }
+
+  acceptance AC-ERR-6 "DOC-13a: an unresolved-import diagnostic for an uncached dependency surfaces the dep report, not cards" {
+    enable() set_hints_enabled(true) diagnostic_appears(0, 0, Gopls) present_dep_report_hint(0, 0)
+    expect hint_kind[0] == DepReport and hint_card_count[0] == 0 and not hint_has_citation[0]
+  }
+
+  forbidden FB-ERR-1 "DOC-13a: a candidate below the anti-hallucination threshold cannot become a hint" {
+    enable() set_hints_enabled(true) diagnostic_appears(0, 0, Gopls) present_hint(Local, 0, 0, 1, true, false, false, true)
+    expect rejected
+  }
+
+  forbidden FB-ERR-2 "DOC-13b: a hint cannot be presented for a diagnostic bound to an older document version" {
+    enable() set_hints_enabled(true) diagnostic_appears(0, 0, Gopls) edit_document(0, 1) present_hint(Local, 0, 0, 1, true, true, false, true)
+    expect rejected
+  }
+
+  forbidden FB-ERR-3 "DOC-13a: hints cannot be derived from a remote endpoint" {
+    enable() set_hints_enabled(true) diagnostic_appears(0, 0, Gopls) present_hint(Remote, 0, 0, 1, true, true, false, true)
+    expect rejected
+  }
+
+  forbidden FB-ERR-4 "DOC-13c: a dismissed hint cannot be re-shown while the same diagnostic persists" {
+    enable() set_hints_enabled(true) diagnostic_appears(0, 0, Gopls) present_hint(Local, 0, 0, 1, true, true, false, true) dismiss_hint(0, 0) present_hint(Local, 0, 0, 1, true, true, false, true)
+    expect rejected
+  }
+
+  forbidden FB-ERR-5 "DOC-13a: a card requiring a newer Go version than the project's cannot be hinted" {
+    enable() set_hints_enabled(true) diagnostic_appears(0, 0, Gopls) present_hint(Local, 0, 0, 1, true, true, true, true)
+    expect rejected
+  }
+
+  forbidden FB-ERR-6 "DOC-13a: a dependency card whose (module, version) does not match the project cannot be hinted" {
+    enable() set_hints_enabled(true) diagnostic_appears(0, 0, Gopls) present_hint(Local, 0, 0, 1, true, true, false, false)
+    expect rejected
+  }
+
+  forbidden FB-ERR-7 "DOC-13c: a snippet cannot be inserted from a hint that is not shown grounded cards" {
+    enable() set_hints_enabled(true) diagnostic_appears(0, 0, Gopls) insert_from_hint(0, 0)
+    expect rejected
+  }
+}
+
+verify {
+  values FileId = 0..1
+  values DiagId = 0..1
+  values DiagSlot = 0..3
+  values DocVer = 0..1
+  values CardCount = 0..3
+}

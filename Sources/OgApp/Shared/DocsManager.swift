@@ -6,6 +6,8 @@ extension Notification.Name {
     static let ogDocsChanged = Notification.Name("og.docsChanged")
     /// Ingestion batch progress or batch scheduling policy changed (status UI only; never retriggers search, M-4).
     static let ogDocsBatchProgressChanged = Notification.Name("og.docsBatchProgressChanged")
+    /// Error-driven Docs hints toggle changed (independent of Docs opt-in, DOC-13c).
+    static let ogDocsErrorHintsSettingChanged = Notification.Name("og.docsErrorHintsSettingChanged")
 }
 
 /// App-level coordinator for offline Go documentation lookup and pack management (FR-19..29, DOC-1..9).
@@ -79,6 +81,15 @@ final class DocsManager {
                 }
                 self?.notifyPacksChanged()
             }
+        }
+    }
+
+    /// Independent switch for error-driven Docs hints in Problems (DOC-13c; defaults to true when Docs is enabled).
+    var errorHintsEnabled: Bool {
+        get { (UserDefaults.standard.object(forKey: "og.docs.errorHintsEnabled") as? Bool) ?? true }
+        set {
+            UserDefaults.standard.set(newValue, forKey: "og.docs.errorHintsEnabled")
+            NotificationCenter.default.post(name: .ogDocsErrorHintsSettingChanged, object: self)
         }
     }
 
