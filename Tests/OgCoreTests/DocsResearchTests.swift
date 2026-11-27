@@ -1386,7 +1386,9 @@ struct DocsPhase2Tests {
         let svc = ResearchService(packManager: mgr, enabled: true)
         let r1 = try await svc.search(query: "ファイルを1行ずつ読みたい", projectRoot: proj.url)
         #expect(r1.status == .found && r1.cards.first?.packageName == "bufio" && r1.cards.first?.symbol == "Scanner")
-        #expect(r1.cards.first?.provenance == .officialExtracted)
+        #expect(r1.cards.first?.provenance == .officialExtracted || r1.cards.first?.provenance == .officialExample)
+        // Issue #25 (E-3): real GOROOT Example chunk surfaces for line-by-line reading query with official example citation.
+        #expect(r1.cards.contains { $0.provenance == .officialExample && $0.packageName == "bufio" && $0.symbol == "Scanner" && stringContains($0.citation, "公式サンプル") })
 
         let r2 = try await svc.search(query: "処理にタイムアウトを付けたい", projectRoot: proj.url)
         #expect(r2.status == .found && r2.cards.first?.packageName == "context" && r2.cards.first?.symbol == "WithTimeout")
@@ -1421,7 +1423,7 @@ struct DocsPhase2Tests {
         #expect(p2Decode.status == .found && p2Decode.searchMode == .hybridReranked && p2Decode.usedReranker)
         #expect(p2Decode.cards.first?.packageName == "encoding/json")
         #expect(p2Decode.cards.first?.symbol == "Unmarshal" || p2Decode.cards.first?.symbol == "Decoder")
-        #expect(p2Decode.cards.first?.provenance == .officialExtracted)
+        #expect(p2Decode.cards.first?.provenance == .officialExtracted || p2Decode.cards.first?.provenance == .officialExample)
 
         let p2Neg = try await svc.search(query: "標準ライブラリに量子テレポーテーション制御ある？", projectRoot: proj.url)
         #expect(p2Neg.status == .notFound && p2Neg.cards.isEmpty && !p2Neg.usedReranker)
@@ -2017,6 +2019,34 @@ struct DocsExampleCorpusTests {
         \tfmt.Println("ignored")
         }
         """)
+        _ = dir.file("src/internal/priv/example_test.go", """
+        package priv_test
+
+        func ExampleIgnoredInternal() {
+        \tfmt.Println("ignored")
+        }
+        """)
+        _ = dir.file("src/vendor/dep/example_test.go", """
+        package dep_test
+
+        func ExampleIgnoredVendor() {
+        \tfmt.Println("ignored")
+        }
+        """)
+        _ = dir.file("src/cmd/tool/example_test.go", """
+        package tool_test
+
+        func ExampleIgnoredCmd() {
+        \tfmt.Println("ignored")
+        }
+        """)
+        _ = dir.file("src/.hidden/example_test.go", """
+        package hidden_test
+
+        func ExampleIgnoredDotDir() {
+        \tfmt.Println("ignored")
+        }
+        """)
 
         let chunks = DocsCorpusExtractor.extractStdlib(
             fromGorootSrc: src,
@@ -2037,13 +2067,13 @@ struct DocsExampleCorpusTests {
         let allIDs = chunks.map(\.stableID)
         #expect(Set(allIDs).count == allIDs.count)
 
-        // Verify ExampleFileServer_stripPrefix metadata, doc comment, code, and stripped // Output:.
+        // Verify ExampleFileServer_stripPrefix metadata, doc comment, dedented code, and stripped // Output:.
         let stripEx = exampleChunks.first { $0.anchor == "net/http.ExampleFileServer_stripPrefix" }
         #expect(stripEx != nil)
         #expect(stripEx?.symbol == "FileServer")
         #expect(stripEx?.title == "Example: net/http.FileServer (strip prefix)")
         #expect(stringContains(stripEx?.summary ?? "", "stripped URL prefix"))
-        #expect(stringContains(stripEx?.example ?? "", "http.StripPrefix"))
+        #expect(stripEx?.example == #"http.Handle("/tmpfiles/", http.StripPrefix("/tmpfiles/", http.FileServer(http.Dir("/tmp"))))"#)
         #expect(!stringContains(stripEx?.example ?? "", "// Output:"))
         #expect(stringContains(stripEx?.body ?? "", "Output:\nserving /tmpfiles/"))
         #expect(stringContains(stripEx?.citationLabel ?? "", "net/http.FileServer (ExampleFileServer_stripPrefix)"))
@@ -2065,7 +2095,7 @@ struct DocsExampleCorpusTests {
         #expect(methodEx?.stableID != methodSuffixEx?.stableID)
         #expect(stringContains(methodSuffixEx?.body ?? "", "Output:\nok"))
 
-        // Verify regular Test*, Benchmark*, Fuzz*, helpers, windows-only, testdata, and _gen are excluded.
+        // Verify regular Test*, Benchmark*, Fuzz*, helpers, windows-only, testdata, _gen, internal, vendor, cmd, and .hidden are excluded.
         #expect(!chunks.contains { stringContains($0.anchor, "TestFileServer") })
         #expect(!chunks.contains { stringContains($0.anchor, "BenchmarkFileServer") })
         #expect(!chunks.contains { stringContains($0.anchor, "FuzzFileServer") })
@@ -2075,6 +2105,10 @@ struct DocsExampleCorpusTests {
         #expect(!chunks.contains { stringContains($0.anchor, "ExampleWindowsOnly") })
         #expect(!chunks.contains { stringContains($0.anchor, "ExampleIgnoredTestdata") })
         #expect(!chunks.contains { stringContains($0.anchor, "ExampleIgnoredUnderscore") })
+        #expect(!chunks.contains { stringContains($0.anchor, "ExampleIgnoredInternal") })
+        #expect(!chunks.contains { stringContains($0.anchor, "ExampleIgnoredVendor") })
+        #expect(!chunks.contains { stringContains($0.anchor, "ExampleIgnoredCmd") })
+        #expect(!chunks.contains { stringContains($0.anchor, "ExampleIgnoredDotDir") })
     }
 
     @Test("Official Example chunks persist through DocsIndex, surface in search with citation, respect version gate, and keep primary symbol #1 on exact lookup (Issue #25)")
@@ -2129,13 +2163,16 @@ struct DocsExampleCorpusTests {
         let mgr = try makeDocsPackManager(in: packDir)
         _ = try await mgr.ingest(goVersion: "1.21", chunks: extracted, embedder: nil)
 
-        // Verify SQLite round-trip preserves `.example` kind and `.officialExample` provenance.
+        // Verify SQLite round-trip preserves `.example` kind, `.officialExample` provenance, body, and dedented snippet.
         let idx = try await mgr.openIndex(for: "1.21")
         let all = try idx?.allChunks() ?? []
         idx?.close()
         let storedEx = all.first { $0.anchor == "net/http.ExampleFileServer_dotFileHiding" }
         #expect(storedEx?.kind == .example)
         #expect(storedEx?.provenance == .officialExample)
+        #expect(stringContains(storedEx?.body ?? "", "Hide dot files"))
+        #expect(stringContains(storedEx?.body ?? "", "Output:\nhidden"))
+        #expect(storedEx?.example == "fsys := http.Dir(\"/tmp\")\n_ = http.FileServer(fsys)")
 
         let svc = ResearchService(packManager: mgr, enabled: true)
 

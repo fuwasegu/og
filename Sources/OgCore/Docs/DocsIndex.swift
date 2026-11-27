@@ -463,6 +463,7 @@ public final class DocsIndex: @unchecked Sendable {
                  FROM chunks
                 WHERE (lower(package_name) = ?1 OR lower(package_name) LIKE ?2)
                   AND (lower(symbol) = ?3 OR lower(symbol) LIKE ?4)
+                ORDER BY CASE WHEN kind = 'example' THEN 1 ELSE 0 END, stable_id ASC
                 LIMIT 64;
                 """
                 guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
@@ -480,6 +481,7 @@ public final class DocsIndex: @unchecked Sendable {
                 WHERE lower(package_name) = ?1
                    OR lower(package_name) LIKE ?2
                    OR lower(symbol) = ?1
+                ORDER BY CASE WHEN kind = 'example' THEN 1 ELSE 0 END, stable_id ASC
                 LIMIT 64;
                 """
                 guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {

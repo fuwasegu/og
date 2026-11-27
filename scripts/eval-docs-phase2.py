@@ -121,6 +121,13 @@ GOLDEN_QUERIES = [
     ("標準ライブラリにブロックチェーンのスマートコントラクトある？", [], 1),
 ]
 
+# Issue #25 diagnostic query: checks whether GOROOT official Example*() functions cover HTTP Authorization headers.
+AUTHORIZATION_DIAGNOSTIC_QUERY = "Authorization ヘッダをつけてリクエストを送りたい"
+AUTH_HEADER_RE = re.compile(
+    r"Authorization|Bearer|SetBasicAuth|BasicAuth|Header\.Set|Header\.Add|http\.Header|Header\s*\{",
+    re.IGNORECASE,
+)
+
 
 def parse_bundled_concept_rules(repo_root: Path) -> list[tuple[list[str], list[str], list[str]]]:
     """Reads `BundledGoCorpus.defaultConceptRules` directly from Swift source (no duplicated rules)."""
@@ -283,8 +290,8 @@ def _clean_doc_lines(lines: list[str]) -> str:
     return "\n".join(cleaned).strip()
 
 
-def extract_real_goroot_chunks(goroot: Path) -> list[dict]:
-    """Extracts exported GoDoc chunks from real `<GOROOT>/src` mirroring `DocsCorpusExtractor.extractStdlib`."""
+def extract_real_goroot_chunks(goroot: Path, include_examples: bool = True) -> list[dict]:
+    """Extracts exported GoDoc chunks (and optionally official Example*() chunks) from real `<GOROOT>/src`."""
     src_root = goroot / "src"
     if not src_root.is_dir():
         raise FileNotFoundError(f"GOROOT src directory not found: {src_root}")
@@ -396,7 +403,7 @@ def extract_real_goroot_chunks(goroot: Path) -> list[dict]:
 
         # Also extract official Example*() functions from *_test.go (Issue #25).
         ex_re = re.compile(r"^func\s+(Example(?:_[A-Za-z0-9_]+|[A-Z][A-Za-z0-9_]*)?)\(\)\s*\{")
-        for fname in test_files:
+        for fname in (test_files if include_examples else []):
             fpath = Path(dirpath) / fname
             try:
                 raw = fpath.read_text(encoding="utf-8", errors="ignore")
@@ -553,6 +560,8 @@ def main() -> int:
     parser.add_argument("--sample", action="store_true", help="Explicitly use tiny 8-chunk smoke sample instead of real GOROOT")
     parser.add_argument("--offline", action="store_true", help="Run uvx & HF Hub strictly offline")
     parser.add_argument("--semantic-only", action="store_true", help="Disable Stage 1 FTS5 union (ablation mode)")
+    parser.add_argument("--fts-only", action="store_true", help="Evaluate FTS5 stage only without launching MLX server (for fast Before/After regression checks)")
+    parser.add_argument("--no-examples", action="store_true", help="Exclude official Example*() chunks (reproduces pre-Issue-#25 baseline)")
     parser.add_argument("--top-n", type=int, default=30)
     parser.add_argument("--cache-file", type=Path, default=Path(tempfile.gettempdir()) / "og-eval-docs-phase2-cache.sqlite")
     parser.add_argument("--no-cache", action="store_true", help="Disable local embedding vector cache")
@@ -586,12 +595,52 @@ def main() -> int:
             return 2
         corpus_desc = f"real GOROOT/src ({goroot})"
         t_ext = time.perf_counter()
-        chunks = extract_real_goroot_chunks(goroot)
-        print(f"Extracted {len(chunks)} real GoDoc chunks from {goroot}/src in {time.perf_counter() - t_ext:.2f}s")
+        chunks = extract_real_goroot_chunks(goroot, include_examples=not args.no_examples)
+        ex_cnt = sum(1 for c in chunks if "::example::" in c["stable_id"])
+        print(f"Extracted {len(chunks)} real GoDoc chunks (doc={len(chunks) - ex_cnt}, example={ex_cnt}) from {goroot}/src in {time.perf_counter() - t_ext:.2f}s")
+
+    if args.no_examples:
+        chunks = [c for c in chunks if "::example::" not in c["stable_id"]]
 
     if not chunks:
         print("ERROR: Corpus has 0 chunks.", file=sys.stderr)
         return 2
+
+    ex_total = sum(1 for c in chunks if "::example::" in c["stable_id"])
+    net_http_ex = [c for c in chunks if "::example::" in c["stable_id"] and ("::net/http::" in c["stable_id"] or "::net/http/" in c["stable_id"])]
+    auth_ex_hits = [c["title"] for c in chunks if "::example::" in c["stable_id"] and AUTH_HEADER_RE.search(c["text"])]
+    print(f"Corpus summary: total={len(chunks)} (doc={len(chunks) - ex_total}, example={ex_total}, net/http* examples={len(net_http_ex)}, auth/header example matches={auth_ex_hits})")
+
+    if args.fts_only:
+        concept_rules = parse_bundled_concept_rules(repo_root)
+        fts_conn = build_fts_index(chunks)
+        print(f"Corpus: {corpus_desc} ({len(chunks)} chunks)")
+        print("Pipeline: fts-only (Stage 1 FTS5 baseline — MLX embedder/reranker disabled)\n")
+        failures = 0
+        for query, expected_symbols, check_top_k in GOLDEN_QUERIES:
+            tq = time.perf_counter()
+            terms = query_search_terms(query, concept_rules)
+            fts_idxs = fts_search_indices(fts_conn, terms, limit=10)
+            dt_ms = (time.perf_counter() - tq) * 1000.0
+            top3 = [chunks[i]["title"] for i in fts_idxs[:3]]
+            if expected_symbols:
+                checked = top3[:check_top_k]
+                ok = bool(checked) and any(any(exp in title for exp in expected_symbols) for title in checked)
+            else:
+                ok = len(top3) == 0
+            status = "PASS" if ok else "FAIL"
+            if not ok:
+                failures += 1
+            print(f"[{status}] {query} ({dt_ms:.1f}ms) -> {top3 if top3 else ['Not Found (0 cards)']}")
+        # Diagnostic query: Authorization header request
+        auth_terms = query_search_terms(AUTHORIZATION_DIAGNOSTIC_QUERY, concept_rules)
+        auth_idxs = fts_search_indices(fts_conn, auth_terms, limit=10)
+        auth_top3 = [chunks[i]["title"] for i in auth_idxs[:3]]
+        print(f"[DIAG] {AUTHORIZATION_DIAGNOSTIC_QUERY} -> {auth_top3 if auth_top3 else ['Not Found (0 cards)']}")
+        fts_conn.close()
+        total = len(GOLDEN_QUERIES)
+        print(f"\nSummary (FTS-only): {total - failures}/{total} PASS")
+        return 0
 
     port = free_loopback_port()
     base_url = f"http://127.0.0.1:{port}"
