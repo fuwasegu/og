@@ -2606,6 +2606,23 @@ struct DocsDependencyTests {
         #expect(hugeManifest?.truncated == true)
         #expect(hugeManifest?.truncationReason != nil)
 
+        // Time-limit truncated packs are retried on the next sync (unlike deterministic file/chunk-limit truncation).
+        let timeTruncReport = await mgr.syncProjectDependencies(
+            projectRoot: proj,
+            moduleCacheRoot: cache,
+            goVersion: "1.23",
+            forceRebuild: true,
+            extractionLimits: DocsModuleExtractionLimits(maxFiles: 500, maxTotalBytes: 1_000_000, maxChunks: 100, maxDurationSeconds: 0.0)
+        )
+        #expect(timeTruncReport.truncatedModules["github.com/example/huge@v1.0.0"] != nil)
+        let retryAfterTimeTrunc = await mgr.syncProjectDependencies(
+            projectRoot: proj,
+            moduleCacheRoot: cache,
+            goVersion: "1.23"
+        )
+        #expect(retryAfterTimeTrunc.synced == [GoModuleKey(modulePath: "github.com/example/huge", version: "v1.0.0")])
+        #expect(retryAfterTimeTrunc.skippedUpToDate.isEmpty)
+
         // Local replace key isolation: two projects replacing the same module with two different local directories
         let localA = dir.subdir("local-a")
         let localB = dir.subdir("local-b")

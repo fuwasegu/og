@@ -199,6 +199,7 @@ spec DocsDepsDesign {
     batch_model = selected_model
     batch_paused = false
     chunks_done = 0
+    // MODEL-2 (vacuity idiom): records an automatic download iff extraction ever bypassed `cache_present`.
     auto_downloaded = auto_downloaded or not cache_present[m * NUM_VERS + dv]
   }
 

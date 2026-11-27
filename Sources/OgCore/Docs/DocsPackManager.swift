@@ -1190,8 +1190,10 @@ public actor DocsPackManager {
                 continue
             }
 
-            // Skip already up-to-date immutable module-cache packs unless rebuild or upgrade to embeddings is needed.
+            // Skip already up-to-date immutable module-cache packs unless rebuild, embedding upgrade,
+            // or retry after a transient time-limit truncation is needed.
             if !forceRebuild, dep.localReplaceDirectory == nil, let existing = dependencyManifest(for: dep.packKey) {
+                let wasTimeTruncated = existing.truncated && (existing.truncationReason?.hasPrefix("time limit") == true)
                 let embeddingSatisfied: Bool
                 if let embedder {
                     embeddingSatisfied = existing.status == .ready
@@ -1200,7 +1202,7 @@ public actor DocsPackManager {
                 } else {
                     embeddingSatisfied = true
                 }
-                if embeddingSatisfied {
+                if embeddingSatisfied && !wasTimeTruncated {
                     report.skippedUpToDate.append(dep.packKey)
                     continue
                 }

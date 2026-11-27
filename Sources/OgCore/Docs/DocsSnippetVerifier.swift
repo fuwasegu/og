@@ -3,6 +3,21 @@ import Foundation
 /// Protocol for local Go snippet verification (DES-A3, DOC-11).
 public protocol DocsSnippetVerifying: Sendable {
     func verify(snippet: String, targetVersion: GoVersion) async -> DocsSnippetVerificationStatus
+    func verify(
+        snippet: String,
+        targetVersion: GoVersion,
+        knownExternalPackageIdents: Set<String>
+    ) async -> DocsSnippetVerificationStatus
+}
+
+public extension DocsSnippetVerifying {
+    func verify(
+        snippet: String,
+        targetVersion: GoVersion,
+        knownExternalPackageIdents: Set<String>
+    ) async -> DocsSnippetVerificationStatus {
+        await verify(snippet: snippet, targetVersion: targetVersion)
+    }
 }
 
 /// Verifies generated Go snippets locally in a temporary module pinned to `targetVersion`
@@ -40,6 +55,14 @@ public struct DocsSnippetVerifier: DocsSnippetVerifying, Sendable {
     }
 
     public func verify(snippet: String, targetVersion: GoVersion) async -> DocsSnippetVerificationStatus {
+        await verify(snippet: snippet, targetVersion: targetVersion, knownExternalPackageIdents: [])
+    }
+
+    public func verify(
+        snippet: String,
+        targetVersion: GoVersion,
+        knownExternalPackageIdents: Set<String>
+    ) async -> DocsSnippetVerificationStatus {
         let trimmed = snippet.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             return .failed(errorSummary: "empty snippet")
@@ -108,7 +131,11 @@ public struct DocsSnippetVerifier: DocsSnippetVerifying, Sendable {
         if result.exitCode == 0 {
             return .verified
         }
-        return Self.classifyFailure(stderr: result.stderr, targetVersion: targetVersion)
+        return Self.classifyFailure(
+            stderr: result.stderr,
+            targetVersion: targetVersion,
+            knownExternalPackageIdents: knownExternalPackageIdents
+        )
     }
 
     static func containsCgoImport(_ snippet: String) -> Bool {

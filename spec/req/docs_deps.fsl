@@ -175,6 +175,8 @@ requirements DocsDeps {
     batch_state = BRunning
     batch_slot = some(m * NUM_VERS + dv)
     batch_model = selected_model
+    // MODEL-2 (vacuity idiom, mirrors `sent_remote = sent_remote or to == Remote`):
+    // records an automatic download iff extraction ever bypassed the `cache_present` guard.
     auto_downloaded = auto_downloaded or not cache_present[m * NUM_VERS + dv]
   }
 

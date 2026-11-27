@@ -1321,9 +1321,11 @@ public actor ResearchService {
         }
 
         // Y-4 & U-2: Version gate and external-dependency check on generated output & snippet (DOC-2, DOC-11, Issue #27).
-        let citedDependencyLabels = evidence
-            .filter { $0.isDependency && matchedCitations.contains($0.citation) }
-            .compactMap { $0.moduleLabel ?? ($0.packageName.isEmpty ? nil : $0.packageName) }
+        let externalDepEvidence = evidence.filter(\.isDependency)
+        let knownExternalPackageIdents = Set(externalDepEvidence.compactMap { ev -> String? in
+            guard !ev.packageName.isEmpty else { return nil }
+            return DocsIndex.shortPackageName(for: ev.packageName)
+        })
 
         let verification: DocsSnippetVerificationStatus
         if let reqVer = output.requiredNewerGoVersion, reqVer > targetVersion {
@@ -1331,13 +1333,29 @@ public actor ResearchService {
         } else if let snippet = output.snippet, !snippet.isEmpty {
             if let newerHit = Self.detectNewerAPIMention(in: snippet, newerNotes: newerNotes, targetVersion: targetVersion) {
                 verification = .newerVersionRequired(since: newerHit)
-            } else if !citedDependencyLabels.isEmpty {
-                // U-2: Standalone single-module `go build` (GOPROXY=off, no require) cannot resolve external
-                // dependency packages; classify accurately as `.unverified` instead of misclassifying as `.failed`.
-                let label = citedDependencyLabels.prefix(2).joined(separator: ", ")
-                verification = .unverified(reason: "外部依存パッケージ（\(label)）を含むため単体モジュール検証の対象外です")
             } else {
-                verification = await snippetVerifier.verify(snippet: snippet, targetVersion: targetVersion)
+                // Only short-circuit to `.unverified` when the snippet itself references a dependency package
+                // (so a snippet using only stdlib even when a dependency was cited still gets real `go build` verification).
+                let referencedDepLabels = externalDepEvidence
+                    .filter { ev in
+                        let pkg = ev.packageName
+                        guard !pkg.isEmpty else { return false }
+                        let shortPkg = DocsIndex.shortPackageName(for: pkg)
+                        return snippet.contains("\"\(pkg)\"")
+                            || snippet.range(of: "(?<![A-Za-z0-9_])\(NSRegularExpression.escapedPattern(for: shortPkg))\\.", options: .regularExpression) != nil
+                    }
+                    .compactMap { $0.moduleLabel ?? ($0.packageName.isEmpty ? nil : $0.packageName) }
+
+                if !referencedDepLabels.isEmpty {
+                    let label = Array(Set(referencedDepLabels)).sorted().prefix(2).joined(separator: ", ")
+                    verification = .unverified(reason: "外部依存パッケージ（\(label)）を含むため単体モジュール検証の対象外です")
+                } else {
+                    verification = await snippetVerifier.verify(
+                        snippet: snippet,
+                        targetVersion: targetVersion,
+                        knownExternalPackageIdents: knownExternalPackageIdents
+                    )
+                }
             }
         } else {
             verification = .unverified(reason: "スニペットなし")
