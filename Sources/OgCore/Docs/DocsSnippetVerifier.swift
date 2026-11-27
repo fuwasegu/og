@@ -34,7 +34,7 @@ public struct DocsSnippetVerifier: DocsSnippetVerifying, Sendable {
         "url": "net/url"
     ]
 
-    public init(locator: ToolLocator = .shared, timeoutSeconds: TimeInterval = 10) {
+    public init(locator: ToolLocator = .shared, timeoutSeconds: TimeInterval = 20) {
         self.locator = locator
         self.timeoutSeconds = timeoutSeconds
     }
@@ -115,19 +115,20 @@ public struct DocsSnippetVerifier: DocsSnippetVerifying, Sendable {
         snippet.range(of: #"(?m)(?:import\s+"C"|^\s*"C"\s*$)"#, options: .regularExpression) != nil
     }
 
+    /// (d) Matches an actual top-level `import` declaration at line start (ignoring comments/strings).
     static func hasExplicitImport(_ snippet: String) -> Bool {
-        snippet.contains("import ") || snippet.contains("import(")
+        snippet.range(of: #"(?m)^\s*import(?:\s+"|\s*\()"#, options: .regularExpression) != nil
     }
 
     /// Wraps a snippet into a valid `package ogverify` file without speculative string-matching imports (Y-9).
     /// When `extraImports` are provided from compiler `undefined:` diagnostics, inserts them safely.
     public static func wrapSnippetAsGoFile(_ snippet: String, extraImports: [String] = []) -> String {
         let trimmed = snippet.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.hasPrefix("package ") {
+        if trimmed.range(of: #"(?m)^\s*package\s+"#, options: .regularExpression) != nil {
             return injectImportsIfNeeded(extraImports, into: trimmed) + "\n"
         }
 
-        let needsFuncWrap = !trimmed.hasPrefix("func ") && !trimmed.hasPrefix("type ") && !trimmed.hasPrefix("import ")
+        let isTopLevelDecl = trimmed.range(of: #"(?m)^\s*(?:func|type|import)\b"#, options: .regularExpression) != nil
         if hasExplicitImport(trimmed) {
             let withImports = injectImportsIfNeeded(extraImports, into: trimmed)
             return "package ogverify\n\n\(withImports)\n"
@@ -139,20 +140,23 @@ public struct DocsSnippetVerifier: DocsSnippetVerifying, Sendable {
             importsBlock = "import (\n\(quoted)\n)\n\n"
         }
 
-        let body = needsFuncWrap ? "func _ogVerify() {\n\(trimmed)\n}" : trimmed
+        let body = isTopLevelDecl ? trimmed : "func _ogVerify() {\n\(trimmed)\n}"
         return "package ogverify\n\n\(importsBlock)\(body)\n"
     }
 
+    /// (e) Inserts missing stdlib imports only at line-start `import` / `package` declarations.
     static func injectImportsIfNeeded(_ extraImports: [String], into source: String) -> String {
-        let unique = Set(extraImports).filter { !source.contains("\"\($0)\"") }.sorted()
+        let unique = Set(extraImports).filter { pkg in
+            source.range(of: #"(?m)^\s*(?:import\s+)?"\#(NSRegularExpression.escapedPattern(for: pkg))"\s*$"#, options: .regularExpression) == nil
+        }.sorted()
         guard !unique.isEmpty else { return source }
         let addedLines = unique.map { "\t\"\($0)\"" }.joined(separator: "\n")
-        if let range = source.range(of: "import (") {
+        if let range = source.range(of: #"(?m)^\s*import\s*\("#, options: .regularExpression) {
             var copy = source
             copy.insert(contentsOf: "\n" + addedLines, at: range.upperBound)
             return copy
         }
-        if let range = source.range(of: #"(?m)^import\s+"[^"]+"\s*$"#, options: .regularExpression) {
+        if let range = source.range(of: #"(?m)^\s*import\s+"[^"]+"\s*$"#, options: .regularExpression) {
             let existing = String(source[range])
             let singlePkg = existing.replacingOccurrences(of: "import", with: "").trimmingCharacters(in: .whitespaces)
             let replacement = "import (\n\t\(singlePkg)\n\(addedLines)\n)"
@@ -160,7 +164,7 @@ public struct DocsSnippetVerifier: DocsSnippetVerifying, Sendable {
             copy.replaceSubrange(range, with: replacement)
             return copy
         }
-        if let pkgRange = source.range(of: #"(?m)^package\s+\S+\s*$"#, options: .regularExpression) {
+        if let pkgRange = source.range(of: #"(?m)^\s*package\s+\S+\s*$"#, options: .regularExpression) {
             var copy = source
             copy.insert(contentsOf: "\n\nimport (\n\(addedLines)\n)", at: pkgRange.upperBound)
             return copy
@@ -208,7 +212,7 @@ public struct DocsSnippetVerifier: DocsSnippetVerifying, Sendable {
             .prefix(2)
             .joined(separator: " | ")
         if let undef = extractUndefinedNonStdlibSymbol(from: stderr) {
-            return .failed(errorSummary: "文脈依存の未定義シンボル '\(undef)' を参照しています（\(summary.prefix(120))）")
+            return .failed(errorSummary: "未定義シンボル '\(undef)'（文脈依存の変数または未定義識別子の可能性: \(summary.prefix(120))）")
         }
         return .failed(errorSummary: summary.isEmpty ? "go build failed" : String(summary.prefix(180)))
     }

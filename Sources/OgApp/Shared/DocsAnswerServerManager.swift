@@ -97,7 +97,10 @@ final class DocsAnswerServerManager {
         if cfg.backend == .custom { return true }
         let modelName = (ModelServerManager.shared.loadedModelName ?? cfg.model).lowercased()
         if modelName.contains("--fim-") { return false }
-        return modelName.contains("instruct") || modelName.contains("chat")
+        return modelName.contains("instruct")
+            || modelName.contains("chat")
+            || modelName.hasSuffix("-it")
+            || modelName.contains("-it-")
     }
 
     var answerGeneratorClient: LoopbackChatAnswerGenerator? {
@@ -112,7 +115,11 @@ final class DocsAnswerServerManager {
                   let modelID = ModelServerManager.shared.loadedModelName else {
                 return nil
             }
-            return LoopbackChatAnswerGenerator(endpoint: url, modelID: modelID)
+            return LoopbackChatAnswerGenerator(
+                endpoint: url,
+                modelID: modelID,
+                priorityGate: ModelServerManager.shared.priorityGate
+            )
         case .dedicated:
             guard phase == .ready, let url = endpointURL, let loaded = loadedConfig else {
                 return nil

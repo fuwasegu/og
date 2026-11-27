@@ -17,6 +17,8 @@ extension Notification.Name {
 final class ModelServerManager {
     static let shared = ModelServerManager()
     static let maxFailures = 3
+    /// Priority gate ensuring inline completion always preempts shared Docs synthesis (Y-5).
+    let priorityGate = LocalModelPriorityGate()
 
     enum Phase: Equatable {
         case off

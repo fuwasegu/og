@@ -1739,22 +1739,45 @@ struct DocsPhase3Tests {
             matchedCitations: ["Go Standard Library: net/http.NewRequest"]
         ))
 
-        // Y-4: Newer stdlib package detected even when not in search newerNotes
+        // Y-4: Newer stdlib package detected with word boundaries (no false positive on `admin(`)
         let newerHit = ResearchService.detectNewerAPIMention(
             in: "import \"iter\"\nvar _ iter.Seq[int]",
             newerNotes: [],
             targetVersion: GoVersion(major: 1, minor: 22)
         )
         #expect(newerHit == GoVersion(major: 1, minor: 23))
+        #expect(ResearchService.detectNewerAPIMention(in: "admin(x)", newerNotes: [], targetVersion: GoVersion(major: 1, minor: 20)) == nil)
+        #expect(ResearchService.detectNewerAPIMention(in: "x := min(a, b)", newerNotes: [], targetVersion: GoVersion(major: 1, minor: 20)) == GoVersion(major: 1, minor: 21))
 
-        // Y-7 & Y-8 & Y-9(c) & Y-10
+        // Y-2 word boundary: `io` must not match inside `"position"`
+        let ioEvidence = [
+            DocsAnswerEvidence(
+                citation: "Go Standard Library: io.Reader",
+                title: "io.Reader",
+                packageName: "io",
+                symbol: "Reader",
+                signature: nil,
+                summary: "Reader",
+                example: nil,
+                body: "",
+                since: "1.0"
+            )
+        ]
+        #expect(!ResearchService.verifyExplanationGroundedInEvidence(
+            explanation: "Check the position value.",
+            evidence: ioEvidence,
+            matchedCitations: ["Go Standard Library: io.Reader"]
+        ))
+
+        // Y-7 & Y-8 & Y-9(c) & Y-10 & (d)(e)
         #expect(DocsSnippetVerifier.containsCgoImport("import \"C\"\nfunc f() {}"))
         let cgoStatus = await DocsSnippetVerifier().verify(snippet: "import \"C\"\nfunc f() {}", targetVersion: GoVersion(major: 1, minor: 23))
         if case .unverified = cgoStatus { } else { Issue.record("Expected .unverified for CGO import") }
 
-        let wrapped = DocsSnippetVerifier.wrapSnippetAsGoFile("// fmt.Println comment\nvar x = 1\n_ = x")
+        let wrapped = DocsSnippetVerifier.wrapSnippetAsGoFile("// import \"fmt\" comment\nvar x = 1\n_ = x")
         #expect(wrapped.contains("package ogverify"))
-        #expect(!wrapped.contains("\"fmt\""))
+        #expect(wrapped.contains("func _ogVerify()"))
+        #expect(!wrapped.contains("\t\"fmt\""))
 
         let explicitWithExtra = DocsSnippetVerifier.wrapSnippetAsGoFile(
             "import \"bufio\"\nfunc f() { fmt.Println(bufio.ErrTooLong) }",
@@ -1774,6 +1797,45 @@ struct DocsPhase3Tests {
             targetVersion: GoVersion(major: 1, minor: 24)
         )
         if case .unverified = oldToolchainStatus { } else { Issue.record("Expected .unverified for older host toolchain") }
+    }
+
+    @Test("Natural Japanese explanation without Latin symbols passes when snippet is grounded (Y-2) and PriorityGate preempts low-priority synthesis (Y-5)")
+    func japaneseExplanationAndPriorityGate() async throws {
+        let dir = TempDir()
+        let proj = TempDir()
+        defer { dir.cleanup(); proj.cleanup() }
+        _ = proj.file("go.mod", "module example.com/jp\n\ngo 1.23\n")
+
+        let mgr = try makeDocsPackManager(in: dir)
+        _ = try await mgr.ingest(goVersion: "1.23", chunks: BundledGoCorpus.chunks(forGoVersion: "1.23"), embedder: nil)
+
+        let svc = ResearchService(packManager: mgr, enabled: true)
+        await svc.setSnippetVerifier(StubSnippetVerifier(status: .verified))
+        await svc.setAnswerGenerator(StubDocsAnswerGenerator { req in
+            DocsAnswerGenerationOutput(
+                explanation: "ファイルを先頭から一行ずつ順に読み込みます。",
+                snippet: "sc := bufio.NewScanner(f)\n_ = sc",
+                citedLabels: req.evidence.map(\.citation)
+            )
+        })
+
+        let ans = try await svc.search(query: "ファイルを1行ずつ読みたい", projectRoot: proj.url)
+        #expect(ans.generatedAnswer != nil)
+        #expect(ans.generatedAnswer?.canInsert == true)
+
+        // Y-5: High-priority inline completion preempts active low-priority synthesis
+        let gate = LocalModelPriorityGate()
+        let preempted = Locked<Bool>(false)
+        let id = makeUUID()
+        let acquired = await gate.acquireLowPriority(id: id) {
+            preempted.withLock { $0 = true }
+        }
+        #expect(acquired)
+        await gate.beginHighPriority()
+        #expect(preempted.current == true)
+        await gate.releaseLowPriority(id: id)
+        await gate.endHighPriority()
+        #expect(await gate.isHighPriorityActive() == false)
     }
 
     @Test("Two-step search(includeSynthesis: false) + synthesizeAnswer(for:) decouples card latency from LLM (Y-3)")
@@ -1812,15 +1874,24 @@ struct DocsPhase3Tests {
 
     @Test("Real go build verification against host Go toolchain (Z-11)", .enabled(if: isGoToolchainActive()))
     func realGoBuildVerification() async {
-        let verifier = DocsSnippetVerifier(locator: ToolLocator())
+        // Use generous timeout for cold Go build caches on CI runners.
+        let verifier = DocsSnippetVerifier(locator: ToolLocator(), timeoutSeconds: 30)
         let okSnippet = """
-        req, err := http.NewRequest(http.MethodGet, "https://example.com", nil)
-        if err != nil { return }
-        req.Header.Set("Authorization", "Bearer token")
-        _ = req
+        import "net/http"
+
+        func _sampleAuth() {
+            req, err := http.NewRequest(http.MethodGet, "https://example.com", nil)
+            if err != nil { return }
+            req.Header.Set("Authorization", "Bearer token")
+            _ = req
+        }
         """
         let okStatus = await verifier.verify(snippet: okSnippet, targetVersion: GoVersion(major: 1, minor: 23))
         #expect(okStatus == .verified)
+
+        let retrySnippet = "fmt.Println(\"ok\")"
+        let retryStatus = await verifier.verify(snippet: retrySnippet, targetVersion: GoVersion(major: 1, minor: 23))
+        #expect(retryStatus == .verified)
 
         let badSnippet = "var x int = \"not an int\""
         let badStatus = await verifier.verify(snippet: badSnippet, targetVersion: GoVersion(major: 1, minor: 23))

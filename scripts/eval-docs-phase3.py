@@ -204,6 +204,7 @@ def extract_goroot_chunks(goroot: Path) -> list[dict]:
                     sym = m.group(2)
                     sig = line.rstrip("{").strip()
                     summary = " ".join(doc_buf[:3]).strip() or sig
+                    doc_body = "\n".join(doc_buf).strip()
                     chunks.append({
                         "citation": f"Go Standard Library: {pkg}.{sym}",
                         "title": f"{pkg}.{sym}",
@@ -212,6 +213,7 @@ def extract_goroot_chunks(goroot: Path) -> list[dict]:
                         "signature": sig,
                         "since": "",
                         "summary": summary[:400],
+                        "doc": doc_body[:600],
                         "example": "",
                     })
                 doc_buf = []
@@ -350,20 +352,38 @@ def parse_output(raw: str) -> dict | None:
     return None
 
 
+def inject_imports_if_needed(extra_imports: list[str], source: str) -> str:
+    unique = sorted(p for p in set(extra_imports) if not re.search(rf'(?m)^\s*(?:import\s+)?"{re.escape(p)}"\s*$', source))
+    if not unique:
+        return source
+    added = "\n".join(f'\t"{p}"' for p in unique)
+    m = re.search(r"(?m)^\s*import\s*\(", source)
+    if m:
+        return source[: m.end()] + "\n" + added + source[m.end() :]
+    m = re.search(r'(?m)^\s*import\s+"([^"]+)"\s*$', source)
+    if m:
+        rep = f'import (\n\t"{m.group(1)}"\n{added}\n)'
+        return source[: m.start()] + rep + source[m.end() :]
+    m = re.search(r"(?m)^\s*package\s+\S+\s*$", source)
+    if m:
+        return source[: m.end()] + f"\n\nimport (\n{added}\n)" + source[m.end() :]
+    return f"import (\n{added}\n)\n\n" + source
+
+
 def wrap_go_snippet(snippet: str, extra_imports: list[str] | None = None) -> str:
     trimmed = snippet.strip()
-    if trimmed.startswith("package "):
-        return trimmed + "\n"
-    needs_func = not (
-        trimmed.startswith("func ")
-        or trimmed.startswith("type ")
-        or trimmed.startswith("import ")
-    )
+    extras = extra_imports or []
+    if re.match(r"(?m)^\s*package\s+", trimmed):
+        return inject_imports_if_needed(extras, trimmed) + "\n"
+    has_import = re.search(r'(?m)^\s*import(?:\s+"|\s*\()', trimmed) is not None
+    if has_import:
+        return f"package ogverify\n\n{inject_imports_if_needed(extras, trimmed)}\n"
+    is_top_level = re.search(r"(?m)^\s*(?:func|type|import)\b", trimmed) is not None
     imports_block = ""
-    if extra_imports and "import " not in trimmed and "import(" not in trimmed:
-        lines = "\n".join(f'\t"{p}"' for p in sorted(set(extra_imports)))
+    if extras:
+        lines = "\n".join(f'\t"{p}"' for p in sorted(set(extras)))
         imports_block = f"import (\n{lines}\n)\n\n"
-    body = f"func _ogVerify() {{\n{trimmed}\n}}" if needs_func else trimmed
+    body = trimmed if is_top_level else f"func _ogVerify() {{\n{trimmed}\n}}"
     return f"package ogverify\n\n{imports_block}{body}\n"
 
 
@@ -377,8 +397,8 @@ def verify_go_snippet(snippet: str, go_ver: str) -> tuple[str, str]:
         Path(tmp, "main.go").write_text(wrap_go_snippet(snippet), encoding="utf-8")
         env = dict(os.environ)
         env.update({"GOPROXY": "off", "GOSUMDB": "off", "GOWORK": "off", "GOTOOLCHAIN": "local", "CGO_ENABLED": "0"})
-        proc = subprocess.run([go_exe, "build", "-mod=readonly", "./..."], cwd=tmp, env=env, capture_output=True, text=True, timeout=15)
-        if proc.returncode != 0 and "import " not in snippet and "import(" not in snippet:
+        proc = subprocess.run([go_exe, "build", "-mod=readonly", "./..."], cwd=tmp, env=env, capture_output=True, text=True, timeout=20)
+        if proc.returncode != 0:
             missing = []
             for line in proc.stderr.splitlines():
                 if "undefined: " in line:
@@ -388,7 +408,7 @@ def verify_go_snippet(snippet: str, go_ver: str) -> tuple[str, str]:
                         missing.append(pkg)
             if missing:
                 Path(tmp, "main.go").write_text(wrap_go_snippet(snippet, missing), encoding="utf-8")
-                proc = subprocess.run([go_exe, "build", "-mod=readonly", "./..."], cwd=tmp, env=env, capture_output=True, text=True, timeout=15)
+                proc = subprocess.run([go_exe, "build", "-mod=readonly", "./..."], cwd=tmp, env=env, capture_output=True, text=True, timeout=20)
         if proc.returncode == 0:
             return "verified", "ok"
         first_lines = " | ".join(l.strip() for l in proc.stderr.splitlines() if l.strip() and not l.startswith("#"))[:160]

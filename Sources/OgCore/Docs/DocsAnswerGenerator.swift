@@ -148,16 +148,82 @@ public protocol DocsAnswerGenerator: Sendable {
     func generate(request: DocsAnswerGenerationRequest) async throws -> DocsAnswerGenerationOutput?
 }
 
+/// Priority gate for sharing a single local model server between high-priority inline completion
+/// and low-priority Docs answer synthesis (Y-5).
+///
+/// - Inline completion (`beginHighPriority` / `endHighPriority`) preempts any in-flight Docs synthesis
+///   and holds the gate until completion finishes.
+/// - Docs synthesis (`runLowPriority`) serializes behind active completions and yields immediately
+///   if a completion arrives mid-request.
+public actor LocalModelPriorityGate {
+    private var activeHighPriority = 0
+    private var lowPriorityBusy = false
+    private var waiters: [(id: UUID, continuation: CheckedContinuation<Bool, Never>)] = []
+    private var activeLowPriority: (id: UUID, cancel: @Sendable () -> Void)?
+
+    public init() {}
+
+    public func beginHighPriority() {
+        activeHighPriority += 1
+        if let active = activeLowPriority {
+            active.cancel()
+        }
+    }
+
+    public func endHighPriority() {
+        activeHighPriority = max(0, activeHighPriority - 1)
+        wakeNextIfIdle()
+    }
+
+    public func isHighPriorityActive() -> Bool {
+        activeHighPriority > 0
+    }
+
+    public func acquireLowPriority(id: UUID, onPreempt: @escaping @Sendable () -> Void) async -> Bool {
+        while activeHighPriority > 0 || lowPriorityBusy {
+            if Task.isCancelled { return false }
+            let ok = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+                waiters.append((id: id, continuation: cont))
+            }
+            if !ok || Task.isCancelled { return false }
+        }
+        lowPriorityBusy = true
+        activeLowPriority = (id: id, cancel: onPreempt)
+        return true
+    }
+
+    public func releaseLowPriority(id: UUID) {
+        if activeLowPriority?.id == id {
+            activeLowPriority = nil
+            lowPriorityBusy = false
+            wakeNextIfIdle()
+        }
+    }
+
+    private func wakeNextIfIdle() {
+        guard activeHighPriority == 0, !lowPriorityBusy, !waiters.isEmpty else { return }
+        let next = waiters.removeFirst()
+        next.continuation.resume(returning: true)
+    }
+}
+
 /// Loopback-only OpenAI-compatible `/v1/chat/completions` client for Phase 3 answer generation (DES-A1, DOC-6).
 public final class LoopbackChatAnswerGenerator: DocsAnswerGenerator, Sendable {
     public let endpoint: URL
     public let modelID: String
+    public let priorityGate: LocalModelPriorityGate?
     private let session: URLSession
 
-    public init?(endpoint: URL, modelID: String, timeoutInterval: TimeInterval = 45) {
+    public init?(
+        endpoint: URL,
+        modelID: String,
+        timeoutInterval: TimeInterval = 45,
+        priorityGate: LocalModelPriorityGate? = nil
+    ) {
         guard LocalCompletionClient.isLoopback(endpoint) else { return nil }
         self.endpoint = endpoint
         self.modelID = modelID
+        self.priorityGate = priorityGate
         let cfg = LocalCompletionClient.sessionConfiguration.copy() as? URLSessionConfiguration ?? .ephemeral
         cfg.timeoutIntervalForRequest = timeoutInterval
         cfg.timeoutIntervalForResource = timeoutInterval
@@ -185,7 +251,23 @@ public final class LoopbackChatAnswerGenerator: DocsAnswerGenerator, Sendable {
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
 
-        let (data, response) = try await session.data(for: req)
+        let (data, response): (Data, URLResponse)
+        if let gate = priorityGate {
+            let token = UUID()
+            let requestTask = Locked<Task<(Data, URLResponse), Error>?>(nil)
+            let acquired = await gate.acquireLowPriority(id: token) {
+                requestTask.current?.cancel()
+            }
+            guard acquired else { return nil }
+            defer { Task { await gate.releaseLowPriority(id: token) } }
+            let fetchTask = Task { [session, req] in
+                try await session.data(for: req)
+            }
+            requestTask.withLock { $0 = fetchTask }
+            (data, response) = try await fetchTask.value
+        } else {
+            (data, response) = try await session.data(for: req)
+        }
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             throw DocsStorageError.rerankFailed("answer generation HTTP \(http.statusCode)")
         }

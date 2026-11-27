@@ -860,6 +860,8 @@ final class LocalMockHTTPServer: @unchecked Sendable {
     }
 }
 
+func makeUUID() -> UUID { UUID() }
+
 func isGoToolchainActive() -> Bool {
     let locator = ToolLocator()
     guard let goExe = locator.find("go") else { return false }

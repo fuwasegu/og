@@ -1125,13 +1125,18 @@ public actor ResearchService {
             return nil
         }
 
-        // Y-2: Ensure both explanation and snippet are grounded in the cited evidence.
-        if !Self.verifyExplanationGroundedInEvidence(explanation: output.explanation, evidence: evidence, matchedCitations: matchedCitations) {
-            return nil
-        }
-        if let snippet = output.snippet, !snippet.isEmpty,
-           !Self.verifySnippetGroundedInEvidence(snippet: snippet, evidence: evidence, matchedCitations: matchedCitations) {
-            return nil
+        // Y-2: Grounding check with word boundaries.
+        // When a snippet is present, verify the snippet references cited symbols/packages
+        // (so natural Japanese explanations without Latin identifiers are not falsely rejected).
+        // When no snippet is present (explanation-only), verify the explanation itself.
+        if let snippet = output.snippet, !snippet.isEmpty {
+            if !Self.verifySnippetGroundedInEvidence(snippet: snippet, evidence: evidence, matchedCitations: matchedCitations) {
+                return nil
+            }
+        } else {
+            if !Self.verifyExplanationGroundedInEvidence(explanation: output.explanation, evidence: evidence, matchedCitations: matchedCitations) {
+                return nil
+            }
         }
 
         // Y-4: Version gate on generated output & snippet (DOC-2, DOC-11).
@@ -1189,7 +1194,18 @@ public actor ResearchService {
         return matched
     }
 
-    /// Y-2: Verifies that the explanation mentions at least one cited symbol or package.
+    /// Word-boundary identifier check (`(?<![A-Za-z0-9_])token(?![A-Za-z0-9_])`) to prevent substring collisions
+    /// such as `Set` matching `Settings`, `io` matching `position`, or `min(` matching `admin(`.
+    static func containsWordToken(_ token: String, in text: String, caseInsensitive: Bool = false) -> Bool {
+        guard !token.isEmpty else { return false }
+        let escaped = NSRegularExpression.escapedPattern(for: token)
+        let pattern = "(?<![A-Za-z0-9_])\(escaped)(?![A-Za-z0-9_])"
+        var opts: String.CompareOptions = [.regularExpression]
+        if caseInsensitive { opts.insert(.caseInsensitive) }
+        return text.range(of: pattern, options: opts) != nil
+    }
+
+    /// Y-2: Verifies that an explanation-only answer mentions at least one cited symbol or package (word-boundary matched).
     static func verifyExplanationGroundedInEvidence(
         explanation: String,
         evidence: [DocsAnswerEvidence],
@@ -1197,28 +1213,25 @@ public actor ResearchService {
     ) -> Bool {
         let citedEvidence = evidence.filter { matchedCitations.contains($0.citation) }
         guard !citedEvidence.isEmpty else { return false }
-        let lowerExpl = explanation.lowercased()
         for ev in citedEvidence {
-            let sym = ev.symbol.lowercased()
-            if sym.count >= 3 && lowerExpl.contains(sym) { return true }
-            let symTail = (ev.symbol.split(separator: ".").last.map(String.init) ?? "").lowercased()
-            if symTail.count >= 3 && lowerExpl.contains(symTail) { return true }
+            if ev.symbol.count >= 3 && containsWordToken(ev.symbol, in: explanation, caseInsensitive: true) { return true }
+            let symTail = ev.symbol.split(separator: ".").last.map(String.init) ?? ""
+            if symTail.count >= 3 && containsWordToken(symTail, in: explanation, caseInsensitive: true) { return true }
             if !ev.packageName.isEmpty {
-                let pkg = ev.packageName.lowercased()
-                let pkgTail = (pkg.split(separator: "/").last.map(String.init) ?? pkg)
-                if lowerExpl.contains(pkg) || (pkgTail.count >= 2 && lowerExpl.contains(pkgTail)) {
+                let pkgTail = ev.packageName.split(separator: "/").last.map(String.init) ?? ev.packageName
+                if containsWordToken(ev.packageName, in: explanation, caseInsensitive: true)
+                    || containsWordToken(pkgTail, in: explanation, caseInsensitive: true) {
                     return true
                 }
             }
-            if !ev.title.isEmpty && lowerExpl.contains(ev.title.lowercased()) {
+            if !ev.title.isEmpty && containsWordToken(ev.title, in: explanation, caseInsensitive: true) {
                 return true
             }
         }
         return false
     }
 
-    /// Y-2: Verifies that a generated snippet references symbols/packages from the cited evidence
-    /// (requiring >=3 char symbol or qualified `pkg.`/`"pkg"` match to avoid 2-letter false positives like `Do`).
+    /// Y-2: Verifies that a generated snippet references symbols/packages from the cited evidence using word boundaries.
     static func verifySnippetGroundedInEvidence(
         snippet: String,
         evidence: [DocsAnswerEvidence],
@@ -1230,22 +1243,25 @@ public actor ResearchService {
             let symTail = ev.symbol.split(separator: ".").last.map(String.init) ?? ev.symbol
             let hasPackage = !ev.packageName.isEmpty
             let pkgTail = ev.packageName.split(separator: "/").last.map(String.init) ?? ev.packageName
-            let mentionsPkg = hasPackage && (snippet.contains("\(pkgTail).") || snippet.contains("\"\(ev.packageName)\""))
+            let mentionsPkg = hasPackage && (
+                snippet.range(of: "(?<![A-Za-z0-9_])\(NSRegularExpression.escapedPattern(for: pkgTail))\\.", options: .regularExpression) != nil
+                || snippet.contains("\"\(ev.packageName)\"")
+            )
 
-            if !ev.symbol.isEmpty && ev.symbol.count >= 3 && snippet.contains(ev.symbol) {
+            if !ev.symbol.isEmpty && ev.symbol.count >= 3 && (containsWordToken(ev.symbol, in: snippet) || containsWordToken("New" + ev.symbol, in: snippet)) {
                 return true
             }
-            if symTail.count >= 3 && snippet.contains(symTail) {
+            if symTail.count >= 3 && (containsWordToken(symTail, in: snippet) || containsWordToken("New" + symTail, in: snippet)) {
                 return true
             }
-            if mentionsPkg && (symTail.isEmpty || snippet.contains(symTail)) {
+            if mentionsPkg && (symTail.isEmpty || containsWordToken(symTail, in: snippet) || containsWordToken("New" + symTail, in: snippet)) {
                 return true
             }
         }
         return false
     }
 
-    /// Y-4: Checks both gated-out search notes and known stdlib `since` entries above `targetVersion`.
+    /// Y-4: Checks both gated-out search notes and known stdlib `since` entries above `targetVersion` with word boundaries.
     static func detectNewerAPIMention(
         in snippet: String,
         newerNotes: [DocsNewerVersionNote],
@@ -1253,33 +1269,33 @@ public actor ResearchService {
     ) -> GoVersion? {
         for note in newerNotes where note.since > targetVersion {
             let symbolTail = note.title.split(separator: ".").last.map(String.init) ?? note.title
-            if symbolTail.count >= 4 && snippet.contains(symbolTail) {
+            if symbolTail.count >= 4 && containsWordToken(symbolTail, in: snippet) {
                 return note.since
             }
         }
-        let knownNewerStdlib: [(token: String, since: GoVersion)] = [
-            ("\"slices\"", GoVersion(major: 1, minor: 21)),
-            ("\"maps\"", GoVersion(major: 1, minor: 21)),
-            ("\"cmp\"", GoVersion(major: 1, minor: 21)),
-            ("\"log/slog\"", GoVersion(major: 1, minor: 21)),
-            ("sync.OnceFunc", GoVersion(major: 1, minor: 21)),
-            ("sync.OnceValue", GoVersion(major: 1, minor: 21)),
-            ("context.AfterFunc", GoVersion(major: 1, minor: 21)),
-            ("context.WithDeadlineCause", GoVersion(major: 1, minor: 21)),
-            ("min(", GoVersion(major: 1, minor: 21)),
-            ("max(", GoVersion(major: 1, minor: 21)),
-            ("clear(", GoVersion(major: 1, minor: 21)),
-            ("\"math/rand/v2\"", GoVersion(major: 1, minor: 22)),
-            ("slices.Concat", GoVersion(major: 1, minor: 22)),
-            ("cmp.Or", GoVersion(major: 1, minor: 22)),
-            ("\"iter\"", GoVersion(major: 1, minor: 23)),
-            ("\"unique\"", GoVersion(major: 1, minor: 23)),
-            ("slices.Collect", GoVersion(major: 1, minor: 23)),
-            ("maps.Keys", GoVersion(major: 1, minor: 23)),
-            ("\"weak\"", GoVersion(major: 1, minor: 24))
+        let knownNewerStdlib: [(pattern: String, since: GoVersion)] = [
+            (#""slices""#, GoVersion(major: 1, minor: 21)),
+            (#""maps""#, GoVersion(major: 1, minor: 21)),
+            (#""cmp""#, GoVersion(major: 1, minor: 21)),
+            (#""log/slog""#, GoVersion(major: 1, minor: 21)),
+            (#"(?<![A-Za-z0-9_])sync\.OnceFunc\b"#, GoVersion(major: 1, minor: 21)),
+            (#"(?<![A-Za-z0-9_])sync\.OnceValue\b"#, GoVersion(major: 1, minor: 21)),
+            (#"(?<![A-Za-z0-9_])context\.AfterFunc\b"#, GoVersion(major: 1, minor: 21)),
+            (#"(?<![A-Za-z0-9_])context\.WithDeadlineCause\b"#, GoVersion(major: 1, minor: 21)),
+            (#"(?<![A-Za-z0-9_.])min\("#, GoVersion(major: 1, minor: 21)),
+            (#"(?<![A-Za-z0-9_.])max\("#, GoVersion(major: 1, minor: 21)),
+            (#"(?<![A-Za-z0-9_.])clear\("#, GoVersion(major: 1, minor: 21)),
+            (#""math/rand/v2""#, GoVersion(major: 1, minor: 22)),
+            (#"(?<![A-Za-z0-9_])slices\.Concat\b"#, GoVersion(major: 1, minor: 22)),
+            (#"(?<![A-Za-z0-9_])cmp\.Or\b"#, GoVersion(major: 1, minor: 22)),
+            (#""iter""#, GoVersion(major: 1, minor: 23)),
+            (#""unique""#, GoVersion(major: 1, minor: 23)),
+            (#"(?<![A-Za-z0-9_])slices\.Collect\b"#, GoVersion(major: 1, minor: 23)),
+            (#"(?<![A-Za-z0-9_])maps\.Keys\b"#, GoVersion(major: 1, minor: 23)),
+            (#""weak""#, GoVersion(major: 1, minor: 24))
         ]
         for entry in knownNewerStdlib where entry.since > targetVersion {
-            if snippet.contains(entry.token) {
+            if snippet.range(of: entry.pattern, options: .regularExpression) != nil {
                 return entry.since
             }
         }
