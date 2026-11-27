@@ -59,21 +59,35 @@ E2E_QUERIES = [
     {
         "name": "authorization_header_request",
         "query": "Authorization ヘッダをつけてリクエストを送りたい",
-        "fts_terms": ["NewRequest", "Header", "Set", "Authorization", "Client", "Do", "http"],
+        "fts_terms": ["Authorization", "header", "http", "request"],
         "language": "Japanese",
         "expect_insufficient": False,
     },
     {
         "name": "read_file_line_by_line",
         "query": "ファイルを1行ずつ読みたい",
-        "fts_terms": ["bufio", "Scanner", "NewScanner", "Scan", "Text"],
+        "fts_terms": ["line", "lines", "file", "reading", "bufio"],
         "language": "Japanese",
         "expect_insufficient": False,
     },
     {
-        "name": "insufficient_evidence_guard",
+        "name": "json_indent_output",
+        "query": "JSON を整形して出したい",
+        "fts_terms": ["json", "indent", "format", "encoding"],
+        "language": "Japanese",
+        "expect_insufficient": False,
+    },
+    {
+        "name": "context_timeout",
+        "query": "処理にタイムアウトを付けたい",
+        "fts_terms": ["timeout", "deadline", "context", "cancel"],
+        "language": "Japanese",
+        "expect_insufficient": False,
+    },
+    {
+        "name": "unrelated_evidence_guard",
         "query": "量子テレポーテーション制御のAPIを使いたい",
-        "fts_terms": ["quantum", "teleportation"],
+        "fts_terms": ["Println", "fmt"],
         "language": "Japanese",
         "expect_insufficient": True,
     },
@@ -258,7 +272,7 @@ def build_messages(case: dict) -> list[dict[str, str]]:
         f"   <1-2 concise sentences in {lang_hint}>\n"
         "   SNIPPET:\n"
         "   ```go\n"
-        "   <concise compilable Go code; if writing import, include every used stdlib package>\n"
+        "   <self-contained, compilable Go code (declare/initialize any needed variables such as req/url/f instead of referencing undefined context variables; include every used stdlib package if writing import)>\n"
         "   ```"
     )
     parts = [f"Query: {case['query']}", f"Target Go version: {target_ver}", "Evidence:"]
@@ -272,6 +286,8 @@ def build_messages(case: dict) -> list[dict[str, str]]:
         )
         if ev.get("example"):
             block += f"\nexample:\n{ev['example']}"
+        if ev.get("doc"):
+            block += f"\ndoc: {ev['doc'][:600]}"
         parts.append(block)
     return [
         {"role": "system", "content": system_prompt},
@@ -324,6 +340,13 @@ def parse_output(raw: str) -> dict | None:
             return {"insufficient_evidence": True, "explanation": expl, "citations": [], "snippet": None}
         if expl:
             return {"insufficient_evidence": False, "explanation": expl, "citations": cites, "snippet": snip or None}
+    start = s.find("{")
+    end = s.rfind("}")
+    if start != -1 and end != -1 and start < end:
+        try:
+            return json.loads(s[start : end + 1])
+        except Exception:
+            return None
     return None
 
 

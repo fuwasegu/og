@@ -79,9 +79,9 @@ public struct DocsSnippetVerifier: DocsSnippetVerifying, Sendable {
             timeoutSeconds: timeoutSeconds
         )
 
-        // Y-9: Only when the snippet omitted imports and failed with `undefined: <stdlib_ident>`,
-        // retry once with the exact missing stdlib imports reported by the compiler.
-        if result.exitCode != 0 && !result.timedOut && !result.cancelled && !Self.hasExplicitImport(trimmed) {
+        // Y-9 / (c): When the compiler reports `undefined: <stdlib_ident>`, inject the missing
+        // stdlib imports (into either an omitted or existing import block) and retry once.
+        if result.exitCode != 0 && !result.timedOut && !result.cancelled {
             let missing = Self.extractMissingStdlibImports(from: result.stderr)
             if !missing.isEmpty {
                 do {
@@ -120,21 +120,52 @@ public struct DocsSnippetVerifier: DocsSnippetVerifying, Sendable {
     }
 
     /// Wraps a snippet into a valid `package ogverify` file without speculative string-matching imports (Y-9).
+    /// When `extraImports` are provided from compiler `undefined:` diagnostics, inserts them safely.
     public static func wrapSnippetAsGoFile(_ snippet: String, extraImports: [String] = []) -> String {
         let trimmed = snippet.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.hasPrefix("package ") {
-            return trimmed + "\n"
+            return injectImportsIfNeeded(extraImports, into: trimmed) + "\n"
         }
 
         let needsFuncWrap = !trimmed.hasPrefix("func ") && !trimmed.hasPrefix("type ") && !trimmed.hasPrefix("import ")
+        if hasExplicitImport(trimmed) {
+            let withImports = injectImportsIfNeeded(extraImports, into: trimmed)
+            return "package ogverify\n\n\(withImports)\n"
+        }
+
         var importsBlock = ""
-        if !extraImports.isEmpty && !hasExplicitImport(trimmed) {
+        if !extraImports.isEmpty {
             let quoted = Set(extraImports).sorted().map { "\t\"\($0)\"" }.joined(separator: "\n")
             importsBlock = "import (\n\(quoted)\n)\n\n"
         }
 
         let body = needsFuncWrap ? "func _ogVerify() {\n\(trimmed)\n}" : trimmed
         return "package ogverify\n\n\(importsBlock)\(body)\n"
+    }
+
+    static func injectImportsIfNeeded(_ extraImports: [String], into source: String) -> String {
+        let unique = Set(extraImports).filter { !source.contains("\"\($0)\"") }.sorted()
+        guard !unique.isEmpty else { return source }
+        let addedLines = unique.map { "\t\"\($0)\"" }.joined(separator: "\n")
+        if let range = source.range(of: "import (") {
+            var copy = source
+            copy.insert(contentsOf: "\n" + addedLines, at: range.upperBound)
+            return copy
+        }
+        if let range = source.range(of: #"(?m)^import\s+"[^"]+"\s*$"#, options: .regularExpression) {
+            let existing = String(source[range])
+            let singlePkg = existing.replacingOccurrences(of: "import", with: "").trimmingCharacters(in: .whitespaces)
+            let replacement = "import (\n\t\(singlePkg)\n\(addedLines)\n)"
+            var copy = source
+            copy.replaceSubrange(range, with: replacement)
+            return copy
+        }
+        if let pkgRange = source.range(of: #"(?m)^package\s+\S+\s*$"#, options: .regularExpression) {
+            var copy = source
+            copy.insert(contentsOf: "\n\nimport (\n\(addedLines)\n)", at: pkgRange.upperBound)
+            return copy
+        }
+        return "import (\n\(addedLines)\n)\n\n" + source
     }
 
     static func extractMissingStdlibImports(from stderr: String) -> [String] {
@@ -176,7 +207,22 @@ public struct DocsSnippetVerifier: DocsSnippetVerifying, Sendable {
             .filter { !$0.isEmpty && !$0.hasPrefix("#") }
             .prefix(2)
             .joined(separator: " | ")
+        if let undef = extractUndefinedNonStdlibSymbol(from: stderr) {
+            return .failed(errorSummary: "文脈依存の未定義シンボル '\(undef)' を参照しています（\(summary.prefix(120))）")
+        }
         return .failed(errorSummary: summary.isEmpty ? "go build failed" : String(summary.prefix(180)))
+    }
+
+    static func extractUndefinedNonStdlibSymbol(from stderr: String) -> String? {
+        for line in stderr.split(separator: "\n") {
+            guard let range = line.range(of: "undefined: ") else { continue }
+            let tail = line[range.upperBound...].trimmingCharacters(in: .whitespaces)
+            let ident = String(tail.prefix(while: { $0.isLetter || $0.isNumber || $0 == "_" }))
+            if !ident.isEmpty && stdlibPackageByIdent[ident] == nil {
+                return ident
+            }
+        }
+        return nil
     }
 
     private struct BuildOutcome: Sendable {
@@ -213,12 +259,18 @@ public struct DocsSnippetVerifier: DocsSnippetVerifying, Sendable {
         proc.standardOutput = FileHandle.nullDevice
         proc.standardError = errPipe
 
-        // Z-10: Drain stderr incrementally to prevent pipe-buffer deadlock on verbose compiler errors.
+        // Z-10: Drain stderr incrementally with a 64 KB cap to prevent pipe-buffer deadlock or unbounded growth.
+        let maxStderrBytes = 65_536
         let stderrBuffer = Locked<Data>(Data())
         errPipe.fileHandleForReading.readabilityHandler = { handle in
             let chunk = handle.availableData
             if !chunk.isEmpty {
-                stderrBuffer.withLock { $0.append(chunk) }
+                stderrBuffer.withLock { buf in
+                    let remaining = maxStderrBytes - buf.count
+                    if remaining > 0 {
+                        buf.append(chunk.prefix(remaining))
+                    }
+                }
             }
         }
 
@@ -236,7 +288,13 @@ public struct DocsSnippetVerifier: DocsSnippetVerifying, Sendable {
                 let timeoutTask = Task.detached(priority: .utility) {
                     try? await Task.sleep(nanoseconds: UInt64(max(1.0, timeoutSeconds) * 1_000_000_000))
                     if finished.trySet() {
-                        if proc.isRunning { proc.terminate() }
+                        if proc.isRunning {
+                            proc.terminate()
+                            try? await Task.sleep(nanoseconds: 250_000_000)
+                            if proc.isRunning {
+                                kill(proc.processIdentifier, SIGKILL)
+                            }
+                        }
                         errPipe.fileHandleForReading.readabilityHandler = nil
                         continuation.resume(returning: BuildOutcome(exitCode: -1, stderr: "", timedOut: true, cancelled: false))
                     }

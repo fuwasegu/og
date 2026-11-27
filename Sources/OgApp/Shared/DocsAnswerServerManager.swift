@@ -91,6 +91,15 @@ final class DocsAnswerServerManager {
         }
     }
 
+    /// Y-5: In sharedCompletion mode, only allow chat/instruct-capable models (never FIM-only base models).
+    var isSharedModelCompatible: Bool {
+        let cfg = ModelServerManager.shared.config
+        if cfg.backend == .custom { return true }
+        let modelName = (ModelServerManager.shared.loadedModelName ?? cfg.model).lowercased()
+        if modelName.contains("--fim-") { return false }
+        return modelName.contains("instruct") || modelName.contains("chat")
+    }
+
     var answerGeneratorClient: LoopbackChatAnswerGenerator? {
         guard DocsManager.shared.enabled else { return nil }
         let cfg = config
@@ -98,7 +107,8 @@ final class DocsAnswerServerManager {
         case .off:
             return nil
         case .sharedCompletion:
-            guard let url = ModelServerManager.shared.endpointURL,
+            guard isSharedModelCompatible,
+                  let url = ModelServerManager.shared.endpointURL,
                   let modelID = ModelServerManager.shared.loadedModelName else {
                 return nil
             }
@@ -116,6 +126,9 @@ final class DocsAnswerServerManager {
         case .off:
             return "Docs LLM: off (検索カードのみ)"
         case .sharedCompletion:
+            if !isSharedModelCompatible {
+                return "Docs LLM: disabled (補完モデルが Instruct 非対応のため共有不可)"
+            }
             if let url = ModelServerManager.shared.endpointURL {
                 return "Docs LLM: sharing inline AI server (\(url.absoluteString))"
             }

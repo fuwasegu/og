@@ -1622,7 +1622,7 @@ struct DocsPhase3Tests {
         let svc = ResearchService(packManager: mgr, enabled: true)
         await svc.setAnswerGenerator(StubDocsAnswerGenerator { req in
             DocsAnswerGenerationOutput(
-                explanation: "Sample",
+                explanation: "Use bufio.Scanner.",
                 snippet: "sc := bufio.NewScanner(f) {{{",
                 citedLabels: req.evidence.map(\.citation)
             )
@@ -1652,7 +1652,7 @@ struct DocsPhase3Tests {
         await svc.setSnippetVerifier(StubSnippetVerifier(status: .verified))
         await svc.setAnswerGenerator(StubDocsAnswerGenerator { req in
             DocsAnswerGenerationOutput(
-                explanation: "Requires Go 1.24",
+                explanation: "bufio.Scanner requires Go 1.24",
                 snippet: "sc := bufio.NewScanner(f)\n_ = sc",
                 citedLabels: req.evidence.map(\.citation),
                 requiredNewerGoVersion: GoVersion(major: 1, minor: 24)
@@ -1717,7 +1717,17 @@ struct DocsPhase3Tests {
         #expect(ResearchService.matchGroundedCitations(["net/http"], against: evidence).isEmpty)
         #expect(ResearchService.matchGroundedCitations(["net/http.NewRequest"], against: evidence) == ["Go Standard Library: net/http.NewRequest"])
 
-        // Y-2: Unrelated snippet referencing fmt instead of net/http must fail snippet grounding
+        // Y-2: Unrelated snippet or explanation must fail grounding
+        #expect(!ResearchService.verifyExplanationGroundedInEvidence(
+            explanation: "文字列を連結する方法です。",
+            evidence: evidence,
+            matchedCitations: ["Go Standard Library: net/http.NewRequest"]
+        ))
+        #expect(ResearchService.verifyExplanationGroundedInEvidence(
+            explanation: "net/http の NewRequest を使います。",
+            evidence: evidence,
+            matchedCitations: ["Go Standard Library: net/http.NewRequest"]
+        ))
         #expect(!ResearchService.verifySnippetGroundedInEvidence(
             snippet: "fmt.Println(\"unrelated\")",
             evidence: evidence,
@@ -1737,7 +1747,7 @@ struct DocsPhase3Tests {
         )
         #expect(newerHit == GoVersion(major: 1, minor: 23))
 
-        // Y-7 & Y-9 & Y-10
+        // Y-7 & Y-8 & Y-9(c) & Y-10
         #expect(DocsSnippetVerifier.containsCgoImport("import \"C\"\nfunc f() {}"))
         let cgoStatus = await DocsSnippetVerifier().verify(snippet: "import \"C\"\nfunc f() {}", targetVersion: GoVersion(major: 1, minor: 23))
         if case .unverified = cgoStatus { } else { Issue.record("Expected .unverified for CGO import") }
@@ -1745,6 +1755,19 @@ struct DocsPhase3Tests {
         let wrapped = DocsSnippetVerifier.wrapSnippetAsGoFile("// fmt.Println comment\nvar x = 1\n_ = x")
         #expect(wrapped.contains("package ogverify"))
         #expect(!wrapped.contains("\"fmt\""))
+
+        let explicitWithExtra = DocsSnippetVerifier.wrapSnippetAsGoFile(
+            "import \"bufio\"\nfunc f() { fmt.Println(bufio.ErrTooLong) }",
+            extraImports: ["fmt"]
+        )
+        #expect(explicitWithExtra.contains("\"bufio\"") && explicitWithExtra.contains("\"fmt\""))
+
+        let ctxDepFailure = DocsSnippetVerifier.classifyFailure(stderr: "./main.go:4:2: undefined: req")
+        if case .failed(let summary) = ctxDepFailure {
+            #expect(summary.contains("文脈依存"))
+        } else {
+            Issue.record("Expected .failed with context-dependent hint")
+        }
 
         let oldToolchainStatus = DocsSnippetVerifier.classifyFailure(
             stderr: "go: go.mod requires go >= 1.24 (running go 1.23.6; GOTOOLCHAIN=local)",

@@ -1125,7 +1125,10 @@ public actor ResearchService {
             return nil
         }
 
-        // Y-2: Ensure generated snippet actually uses symbols/packages from the cited evidence.
+        // Y-2: Ensure both explanation and snippet are grounded in the cited evidence.
+        if !Self.verifyExplanationGroundedInEvidence(explanation: output.explanation, evidence: evidence, matchedCitations: matchedCitations) {
+            return nil
+        }
         if let snippet = output.snippet, !snippet.isEmpty,
            !Self.verifySnippetGroundedInEvidence(snippet: snippet, evidence: evidence, matchedCitations: matchedCitations) {
             return nil
@@ -1186,7 +1189,36 @@ public actor ResearchService {
         return matched
     }
 
-    /// Y-2: Verifies that a generated snippet references at least one symbol or package from the cited evidence.
+    /// Y-2: Verifies that the explanation mentions at least one cited symbol or package.
+    static func verifyExplanationGroundedInEvidence(
+        explanation: String,
+        evidence: [DocsAnswerEvidence],
+        matchedCitations: [String]
+    ) -> Bool {
+        let citedEvidence = evidence.filter { matchedCitations.contains($0.citation) }
+        guard !citedEvidence.isEmpty else { return false }
+        let lowerExpl = explanation.lowercased()
+        for ev in citedEvidence {
+            let sym = ev.symbol.lowercased()
+            if sym.count >= 3 && lowerExpl.contains(sym) { return true }
+            let symTail = (ev.symbol.split(separator: ".").last.map(String.init) ?? "").lowercased()
+            if symTail.count >= 3 && lowerExpl.contains(symTail) { return true }
+            if !ev.packageName.isEmpty {
+                let pkg = ev.packageName.lowercased()
+                let pkgTail = (pkg.split(separator: "/").last.map(String.init) ?? pkg)
+                if lowerExpl.contains(pkg) || (pkgTail.count >= 2 && lowerExpl.contains(pkgTail)) {
+                    return true
+                }
+            }
+            if !ev.title.isEmpty && lowerExpl.contains(ev.title.lowercased()) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Y-2: Verifies that a generated snippet references symbols/packages from the cited evidence
+    /// (requiring >=3 char symbol or qualified `pkg.`/`"pkg"` match to avoid 2-letter false positives like `Do`).
     static func verifySnippetGroundedInEvidence(
         snippet: String,
         evidence: [DocsAnswerEvidence],
@@ -1196,14 +1228,18 @@ public actor ResearchService {
         guard !citedEvidence.isEmpty else { return false }
         for ev in citedEvidence {
             let symTail = ev.symbol.split(separator: ".").last.map(String.init) ?? ev.symbol
-            if symTail.count >= 2 && snippet.contains(symTail) {
+            let hasPackage = !ev.packageName.isEmpty
+            let pkgTail = ev.packageName.split(separator: "/").last.map(String.init) ?? ev.packageName
+            let mentionsPkg = hasPackage && (snippet.contains("\(pkgTail).") || snippet.contains("\"\(ev.packageName)\""))
+
+            if !ev.symbol.isEmpty && ev.symbol.count >= 3 && snippet.contains(ev.symbol) {
                 return true
             }
-            if !ev.packageName.isEmpty {
-                let pkgTail = ev.packageName.split(separator: "/").last.map(String.init) ?? ev.packageName
-                if snippet.contains("\(pkgTail).") || snippet.contains("\"\(ev.packageName)\"") {
-                    return true
-                }
+            if symTail.count >= 3 && snippet.contains(symTail) {
+                return true
+            }
+            if mentionsPkg && (symTail.isEmpty || snippet.contains(symTail)) {
+                return true
             }
         }
         return false
@@ -1226,8 +1262,16 @@ public actor ResearchService {
             ("\"maps\"", GoVersion(major: 1, minor: 21)),
             ("\"cmp\"", GoVersion(major: 1, minor: 21)),
             ("\"log/slog\"", GoVersion(major: 1, minor: 21)),
+            ("sync.OnceFunc", GoVersion(major: 1, minor: 21)),
+            ("sync.OnceValue", GoVersion(major: 1, minor: 21)),
+            ("context.AfterFunc", GoVersion(major: 1, minor: 21)),
+            ("context.WithDeadlineCause", GoVersion(major: 1, minor: 21)),
+            ("min(", GoVersion(major: 1, minor: 21)),
+            ("max(", GoVersion(major: 1, minor: 21)),
+            ("clear(", GoVersion(major: 1, minor: 21)),
             ("\"math/rand/v2\"", GoVersion(major: 1, minor: 22)),
             ("slices.Concat", GoVersion(major: 1, minor: 22)),
+            ("cmp.Or", GoVersion(major: 1, minor: 22)),
             ("\"iter\"", GoVersion(major: 1, minor: 23)),
             ("\"unique\"", GoVersion(major: 1, minor: 23)),
             ("slices.Collect", GoVersion(major: 1, minor: 23)),

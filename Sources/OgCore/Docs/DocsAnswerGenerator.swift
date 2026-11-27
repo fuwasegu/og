@@ -213,7 +213,7 @@ public final class LoopbackChatAnswerGenerator: DocsAnswerGenerator, Sendable {
            <1-2 concise sentences in \(langHint)>
            SNIPPET:
            ```go
-           <concise compilable Go code; if writing import, include every used stdlib package>
+           <self-contained, compilable Go code (declare/initialize any needed variables such as req/url/f instead of referencing undefined context variables; include every used stdlib package if writing import)>
            ```
         """
 

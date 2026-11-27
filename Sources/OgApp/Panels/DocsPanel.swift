@@ -18,6 +18,7 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
 
     private var explicitVersion: GoVersion?
     private var lastAnswer: DocsAnswer?
+    private var searchGeneration = 0
     private var searchTask: Task<Void, Never>?
     private var synthesisTask: Task<Void, Never>?
     private var insertTask: Task<Void, Never>?
@@ -252,9 +253,7 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
     }
 
     @objc private func copyGeneratedClicked() {
-        guard let gen = lastAnswer?.generatedAnswer,
-              gen.verification != .failed(errorSummary: ""),
-              let code = gen.snippet else { return }
+        guard let gen = lastAnswer?.generatedAnswer, let code = gen.snippet else { return }
         if case .failed = gen.verification {
             context.setStatus("検証失敗のスニペットはコピーできません。")
             return
@@ -289,15 +288,17 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
 
     private func runSearch() {
         let query = queryField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        searchTask?.cancel()
+        synthesisTask?.cancel()
+        synthesisTask = nil
+        searchGeneration += 1
+        let genToken = searchGeneration
+
         guard !query.isEmpty else {
-            searchTask?.cancel()
-            synthesisTask?.cancel()
             lastAnswer = nil
             renderIdleOrStatus()
             return
         }
-        searchTask?.cancel()
-        synthesisTask?.cancel()
         let root = context.root
         let overrideVer = explicitVersion
         let editorCtx = currentEditorContext()
@@ -311,7 +312,7 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
                 editorContext: editorCtx,
                 includeSynthesis: false
             )
-            guard !Task.isCancelled, let self else { return }
+            guard !Task.isCancelled, let self, self.searchGeneration == genToken else { return }
             self.lastAnswer = answer
             self.render(answer: answer)
 
@@ -323,7 +324,13 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
             self.synthesisTask = Task { [weak self] in
                 guard let self else { return }
                 let gen = await DocsManager.shared.synthesizeAnswer(for: answer, editorContext: editorCtx)
-                guard !Task.isCancelled, let gen, self.lastAnswer?.query == answer.query else { return }
+                guard !Task.isCancelled,
+                      let gen,
+                      self.searchGeneration == genToken,
+                      self.lastAnswer?.query == answer.query,
+                      self.lastAnswer?.targetVersion == answer.targetVersion else {
+                    return
+                }
                 var updated = answer
                 updated.generatedAnswer = gen
                 updated.usedLLM = true
