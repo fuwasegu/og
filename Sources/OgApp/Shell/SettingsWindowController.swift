@@ -388,6 +388,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         let dsCfg = ds.config
         docsEnabled.state = d.enabled ? .on : .off
         docsErrorHintsEnabled.state = d.errorHintsEnabled ? .on : .off
+        docsErrorHintsEnabled.isEnabled = d.enabled
         docsSemanticEnabled.state = ds.enabled ? .on : .off
         docsSemanticEnabled.isEnabled = d.enabled
         docsEmbedModel.stringValue = DocsEmbedModelPreset.matching(id: dsCfg.embedModel)?.title ?? dsCfg.embedModel

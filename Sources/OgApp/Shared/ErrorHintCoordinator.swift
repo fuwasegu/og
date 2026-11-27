@@ -9,11 +9,17 @@ import OgCore
 /// - Clears stale gopls hints immediately when `Document.version` advances (`StaleHintsNeverSurvive`).
 /// - Clears all build-source diagnostics and hints on a new build/vet run (`new_build_run`).
 /// - Clears all shown hints immediately when Docs or error hints are disabled (`DisabledHasNoHints`).
+/// - Buffers streaming build output across arbitrary chunk boundaries (E-2) and drains queued evaluations
+///   beyond the concurrency cap so diagnostics past #12 are never silently dropped (E-3).
 @MainActor
 final class ErrorHintCoordinator {
+    private static let maxConcurrentEvaluations = 12
+
     private weak var context: ProjectContext?
     private let store: DocsErrorHintStore
     private var evalTasks: [DocsErrorDiagnosticKey: Task<Void, Never>] = [:]
+    private var pendingQueue: [DocsErrorDiagnostic] = []
+    private var buildLineBuffers: [String: (buffer: DocsBuildErrorLineBuffer, directory: URL)] = [:]
     private var insertTask: Task<Void, Never>?
     private var observers: [NSObjectProtocol] = []
 
@@ -37,8 +43,8 @@ final class ErrorHintCoordinator {
     }
 
     func shutdown() {
-        for (_, task) in evalTasks { task.cancel() }
-        evalTasks.removeAll()
+        cancelAllEvaluations()
+        buildLineBuffers.removeAll()
         insertTask?.cancel()
         insertTask = nil
         for o in observers { NotificationCenter.default.removeObserver(o) }
@@ -62,9 +68,9 @@ final class ErrorHintCoordinator {
             await store.setDocsEnabled(docsOn)
             await store.setHintsEnabled(hintsOn)
             guard docsOn && hintsOn else { return }
-            let live = await store.allDiagnostics()
+            let pending = await store.unevaluatedDiagnostics()
             await MainActor.run {
-                self?.scheduleEvaluations(for: live)
+                self?.enqueueEvaluations(for: pending)
             }
         }
     }
@@ -75,7 +81,7 @@ final class ErrorHintCoordinator {
         let normalized = items.map { DocsErrorDiagnostic(fileURI: fileURI, docVersion: docVersion, lspDiagnostic: $0) }
         let incomingKeys = Set(normalized.map(\.key))
 
-        // Immediately clear resolved or older-version gopls hints from the UI snapshot.
+        // Immediately clear resolved or older-version gopls hints and queued items from the UI snapshot.
         var snapshotChanged = false
         for (key, hint) in hints where key.fileURI == fileURI && key.source == .gopls {
             if !incomingKeys.contains(key) || hint.docVersion != docVersion {
@@ -84,6 +90,9 @@ final class ErrorHintCoordinator {
                 evalTasks.removeValue(forKey: key)
                 snapshotChanged = true
             }
+        }
+        pendingQueue.removeAll { diag in
+            diag.fileURI == fileURI && diag.source == .gopls && (!incomingKeys.contains(diag.key) || diag.docVersion != docVersion)
         }
         if snapshotChanged { notifyChanged() }
 
@@ -95,7 +104,7 @@ final class ErrorHintCoordinator {
                 items: normalized
             )
             await MainActor.run {
-                self?.scheduleEvaluations(for: toEval)
+                self?.enqueueEvaluations(for: toEval)
             }
         }
     }
@@ -110,7 +119,9 @@ final class ErrorHintCoordinator {
             evalTasks[key]?.cancel()
             evalTasks.removeValue(forKey: key)
         }
+        pendingQueue.removeAll { $0.fileURI == fileURI && $0.source == .gopls && $0.docVersion != newVersion }
         if changed { notifyChanged() }
+        drainEvaluationQueue()
 
         let store = self.store
         Task {
@@ -121,6 +132,7 @@ final class ErrorHintCoordinator {
     func beginBuildRun() {
         var changed = !buildDiagnostics.isEmpty
         buildDiagnostics.removeAll()
+        buildLineBuffers.removeAll()
         for key in hints.keys where key.source == .build {
             hints.removeValue(forKey: key)
             changed = true
@@ -129,7 +141,9 @@ final class ErrorHintCoordinator {
             evalTasks[key]?.cancel()
             evalTasks.removeValue(forKey: key)
         }
+        pendingQueue.removeAll { $0.source == .build }
         if changed { notifyChanged() }
+        drainEvaluationQueue()
 
         let store = self.store
         Task {
@@ -137,12 +151,35 @@ final class ErrorHintCoordinator {
         }
     }
 
-    func consumeBuildOutput(_ text: String, workingDirectory: URL) {
+    /// Consumes a streaming build/vet/test output chunk, buffering partial trailing lines across chunk boundaries (E-2).
+    func consumeBuildOutput(_ text: String, workingDirectory: URL, streamKey: String = "stderr") {
         guard let context else { return }
+        var entry = buildLineBuffers[streamKey] ?? (DocsBuildErrorLineBuffer(), workingDirectory)
+        entry.directory = workingDirectory
+        let completeLines = entry.buffer.append(text)
+        buildLineBuffers[streamKey] = entry
+        guard !completeLines.isEmpty else { return }
+        ingestParsedBuildLines(completeLines, workingDirectory: workingDirectory, projectRoot: context.root)
+    }
+
+    /// Flushes any trailing non-newline-terminated lines at the end of a build/test run (E-2).
+    func finishBuildOutput() {
+        guard let context else { return }
+        let entries = buildLineBuffers
+        buildLineBuffers.removeAll()
+        for (_, var entry) in entries {
+            let tail = entry.buffer.flush()
+            if !tail.isEmpty {
+                ingestParsedBuildLines(tail, workingDirectory: entry.directory, projectRoot: context.root)
+            }
+        }
+    }
+
+    private func ingestParsedBuildLines(_ lines: [String], workingDirectory: URL, projectRoot: URL) {
         let parsed = DocsBuildErrorParser.parse(
-            output: text,
+            lines: lines,
             workingDirectory: workingDirectory,
-            projectRoot: context.root
+            projectRoot: projectRoot
         )
         guard !parsed.isEmpty else { return }
 
@@ -161,7 +198,7 @@ final class ErrorHintCoordinator {
         Task { [weak self] in
             let toEval = await store.addBuildDiagnostics(parsed)
             await MainActor.run {
-                self?.scheduleEvaluations(for: toEval)
+                self?.enqueueEvaluations(for: toEval)
             }
         }
     }
@@ -171,8 +208,10 @@ final class ErrorHintCoordinator {
     func dismissHint(for key: DocsErrorDiagnosticKey) {
         evalTasks[key]?.cancel()
         evalTasks.removeValue(forKey: key)
+        pendingQueue.removeAll { $0.key == key }
         hints.removeValue(forKey: key)
         notifyChanged()
+        drainEvaluationQueue()
 
         let store = self.store
         Task {
@@ -234,20 +273,35 @@ final class ErrorHintCoordinator {
         }
     }
 
-    // MARK: - Background Evaluation (DES-ERR-3)
+    // MARK: - Queued Background Evaluation (DES-ERR-3, E-3)
 
-    private func scheduleEvaluations(for items: [DocsErrorDiagnostic]) {
+    private func enqueueEvaluations(for items: [DocsErrorDiagnostic]) {
         guard DocsManager.shared.enabled && DocsManager.shared.errorHintsEnabled else { return }
+        for diag in items {
+            let key = diag.key
+            if hints[key] != nil || evalTasks[key] != nil { continue }
+            if pendingQueue.contains(where: { $0.key == key }) { continue }
+            pendingQueue.append(diag)
+        }
+        drainEvaluationQueue()
+    }
+
+    private func drainEvaluationQueue() {
+        guard DocsManager.shared.enabled && DocsManager.shared.errorHintsEnabled else {
+            pendingQueue.removeAll()
+            return
+        }
         guard let context, let service = DocsManager.shared.service else { return }
         let projectRoot = context.root
         let modCache = DocsManager.shared.detectedModuleCacheRoot
         let cachedToolchain = DocsManager.shared.detectedToolchainVersion
         let toolchainProvider: (@Sendable () -> GoVersion?)? = cachedToolchain.map { v in { @Sendable in v } }
 
-        // Cap concurrent background evaluations per burst to keep editor responsiveness crisp.
-        for diag in items.prefix(12) {
+        while evalTasks.count < Self.maxConcurrentEvaluations, !pendingQueue.isEmpty {
+            let diag = pendingQueue.removeFirst()
             let key = diag.key
-            evalTasks[key]?.cancel()
+            if hints[key] != nil || evalTasks[key] != nil { continue }
+
             let editorCtx: DocsEditorContext? = {
                 if let url = URL(string: diag.fileURI),
                    let doc = context.documents.document(for: url),
@@ -277,15 +331,19 @@ final class ErrorHintCoordinator {
                 self.evalTasks.removeValue(forKey: key)
                 if let result {
                     // Re-check UI opt-in switches before publishing.
-                    guard DocsManager.shared.enabled && DocsManager.shared.errorHintsEnabled else { return }
-                    self.hints[key] = result
-                    self.notifyChanged()
+                    if DocsManager.shared.enabled && DocsManager.shared.errorHintsEnabled {
+                        self.hints[key] = result
+                        self.notifyChanged()
+                    }
                 }
+                // Continue draining remaining queued diagnostics past the concurrency cap (E-3).
+                self.drainEvaluationQueue()
             }
         }
     }
 
     private func cancelAllEvaluations() {
+        pendingQueue.removeAll()
         for (_, task) in evalTasks { task.cancel() }
         evalTasks.removeAll()
     }

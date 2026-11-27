@@ -156,6 +156,45 @@ public struct DocsErrorHint: Sendable, Hashable {
 
 // MARK: - Build / Vet Output Parser (DES-ERR-2)
 
+/// Incremental line buffer for streaming `RunProcess` output chunks (up to 64 KiB at arbitrary boundaries).
+/// Emits only newline-terminated lines on `append(_:)` and yields any trailing partial line on `flush()`.
+public struct DocsBuildErrorLineBuffer: Sendable {
+    private var remainder: String = ""
+
+    public init() {}
+
+    public mutating func append(_ chunk: String) -> [String] {
+        guard !chunk.isEmpty else { return [] }
+        let combined = remainder + chunk
+        var lines: [String] = []
+        var lineStart = combined.startIndex
+        var idx = combined.startIndex
+        while idx < combined.endIndex {
+            let ch = combined[idx]
+            if ch == "\n" || ch == "\r\n" {
+                lines.append(String(combined[lineStart..<idx]))
+                idx = combined.index(after: idx)
+                lineStart = idx
+            } else {
+                idx = combined.index(after: idx)
+            }
+        }
+        remainder = String(combined[lineStart...])
+        return lines
+    }
+
+    public mutating func flush() -> [String] {
+        guard !remainder.isEmpty else { return [] }
+        let last = remainder
+        remainder = ""
+        return [last]
+    }
+
+    public mutating func reset() {
+        remainder = ""
+    }
+}
+
 /// Parses `go build`, `go vet`, and `go test` compiler diagnostic lines (`file.go:line:col: message`)
 /// into `DocsErrorDiagnostic` values with resolved `file://` URIs.
 public enum DocsBuildErrorParser {
@@ -165,13 +204,22 @@ public enum DocsBuildErrorParser {
         workingDirectory: URL,
         projectRoot: URL? = nil
     ) -> [DocsErrorDiagnostic] {
+        parse(lines: output.components(separatedBy: .newlines), workingDirectory: workingDirectory, projectRoot: projectRoot)
+    }
+
+    /// Parses pre-split complete lines relative to `workingDirectory` (and optional `projectRoot`).
+    public static func parse(
+        lines: [String],
+        workingDirectory: URL,
+        projectRoot: URL? = nil
+    ) -> [DocsErrorDiagnostic] {
         var results: [DocsErrorDiagnostic] = []
         var seen = Set<DocsErrorDiagnosticKey>()
         let baseDir = workingDirectory.standardizedFileURL
         let rootDir = (projectRoot ?? workingDirectory).standardizedFileURL
 
-        for rawLine in output.components(separatedBy: .newlines) {
-            let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
+        for rawLine in lines {
+            let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { continue }
             if trimmed.hasPrefix("# ") || trimmed.hasPrefix("FAIL\t") || trimmed.hasPrefix("FAIL ") {
                 continue
@@ -194,13 +242,15 @@ public enum DocsBuildErrorParser {
         projectRoot: URL
     ) -> DocsErrorDiagnostic? {
         // Match `<path>.go:<line>:<col>: <message>` or `<path>.go:<line>: <message>`.
-        let pattern = #"^([^\s:]+\.go):(\d+):(?:(\d+):)?\s+(.+)$"#
+        // Allow spaces in project paths (`[^:\r\n]+`) while rejecting colons in the file path segment.
+        let pattern = #"^([^:\r\n]+\.go):(\d+):(?:(\d+):)?\s+(.+)$"#
         guard let regex = try? NSRegularExpression(pattern: pattern),
               let match = regex.firstMatch(in: line, range: NSRange(location: 0, length: (line as NSString).length)) else {
             return nil
         }
         let ns = line as NSString
-        let rawPath = ns.substring(with: match.range(at: 1))
+        let rawPath = ns.substring(with: match.range(at: 1)).trimmingCharacters(in: .whitespaces)
+        guard !rawPath.isEmpty else { return nil }
         guard let lineNum = Int(ns.substring(with: match.range(at: 2))), lineNum >= 1 else {
             return nil
         }
@@ -542,6 +592,20 @@ public actor DocsErrorHintStore {
         Array(diagnostics.values)
     }
 
+    /// Returns only live, fresh, undismissed diagnostics that do not yet have a shown hint.
+    /// Prevents redundant re-queries on settings sync or unrelated notifications.
+    public func unevaluatedDiagnostics() -> [DocsErrorDiagnostic] {
+        guard docsEnabled && hintsEnabled else { return [] }
+        return diagnostics.values.filter { diag in
+            guard !dismissed.contains(diag.key) else { return false }
+            guard hints[diag.key] == nil else { return false }
+            if diag.source == .gopls, let currentVer = docVersions[diag.fileURI], diag.docVersion != currentVer {
+                return false
+            }
+            return true
+        }
+    }
+
     public func buildDiagnostics() -> [DocsErrorDiagnostic] {
         diagnostics.values.filter { $0.source == .build }
     }
@@ -584,6 +648,10 @@ public actor DocsErrorHintStore {
         if diag.source == .gopls, let currentVer = docVersions[diag.fileURI], diag.docVersion != currentVer {
             return nil
         }
+        // Do not re-run retrieval if this live diagnostic already has a fresh shown hint.
+        if let existing = hints[key], diag.source == .build || existing.docVersion == diag.docVersion {
+            return existing
+        }
         let capturedBuildGen = buildGeneration
         let capturedDocVer = diag.docVersion
 
@@ -593,20 +661,25 @@ public actor DocsErrorHintStore {
 
         // Check unresolved external dependency imports first so uncached/unindexed dependencies
         // produce an honest DepReport rather than fabricated cards (DOC-13a, AC-ERR-6).
+        // E-1: If the dependency IS already indexed, proceed to normal search and stay silent on Not Found
+        // (never fabricate an "uncached" DepReport for an already-indexed dependency).
         if let importPath = extracted.unresolvedImportPath,
            DocsErrorQueryExtractor.isExternalModulePath(importPath) {
-            if let depReport = await evaluateUnresolvedDependency(
+            switch await evaluateUnresolvedDependency(
                 importPath: importPath,
                 researchService: researchService,
                 projectRoot: projectRoot,
                 moduleCacheRoot: moduleCacheRoot
             ) {
+            case .depReport(let depReport):
                 let hint = DocsErrorHint(
                     diagnosticKey: key,
                     docVersion: capturedDocVer,
                     content: .depReport(depReport)
                 )
                 return storeIfStillValid(hint, diag: diag, capturedDocVer: capturedDocVer, capturedBuildGen: capturedBuildGen)
+            case .indexed:
+                break
             }
         }
 
@@ -629,22 +702,7 @@ public actor DocsErrorHintStore {
         guard answer.status == .found,
               let targetVer = answer.targetVersion,
               !answer.cards.isEmpty else {
-            // If it was an unresolved external import and lookup found nothing, report honest DepReport.
-            if let importPath = extracted.unresolvedImportPath,
-               DocsErrorQueryExtractor.isExternalModulePath(importPath) {
-                let report = DocsErrorDepReport(
-                    importPath: importPath,
-                    matchedDependency: nil,
-                    isCachedButUnindexed: false,
-                    message: "外部パッケージ `\(importPath)` は go.mod / ローカル module cache で未取得です。`go get` または `go mod download` で取得してください。"
-                )
-                let hint = DocsErrorHint(
-                    diagnosticKey: key,
-                    docVersion: capturedDocVer,
-                    content: .depReport(report)
-                )
-                return storeIfStillValid(hint, diag: diag, capturedDocVer: capturedDocVer, capturedBuildGen: capturedBuildGen)
-            }
+            // Silence is the honest behavior when no grounded cards match (DOC-13a, E-1).
             return nil
         }
 
@@ -684,19 +742,24 @@ public actor DocsErrorHintStore {
         return storeIfStillValid(hint, diag: diag, capturedDocVer: capturedDocVer, capturedBuildGen: capturedBuildGen)
     }
 
+    private enum UnresolvedDependencyOutcome {
+        case indexed
+        case depReport(DocsErrorDepReport)
+    }
+
     private func evaluateUnresolvedDependency(
         importPath: String,
         researchService: ResearchService,
         projectRoot: URL?,
         moduleCacheRoot: URL?
-    ) async -> DocsErrorDepReport? {
+    ) async -> UnresolvedDependencyOutcome {
         guard let projectRoot else {
-            return DocsErrorDepReport(
+            return .depReport(DocsErrorDepReport(
                 importPath: importPath,
                 matchedDependency: nil,
                 isCachedButUnindexed: false,
                 message: "外部パッケージ `\(importPath)` はローカル module cache に未取得です。"
-            )
+            ))
         }
         let resolvedDeps = GoModuleResolver.resolveDependencies(
             projectRoot: projectRoot,
@@ -708,33 +771,33 @@ public actor DocsErrorHintStore {
             .max { $0.modulePath.count < $1.modulePath.count }
 
         guard let dep = matched else {
-            return DocsErrorDepReport(
+            return .depReport(DocsErrorDepReport(
                 importPath: importPath,
                 matchedDependency: nil,
                 isCachedButUnindexed: false,
                 message: "依存パッケージ `\(importPath)` は go.mod に未登録またはローカル未取得です（根拠のないカードは提示しません）。"
-            )
+            ))
         }
 
-        // If already indexed in packManager, let normal ResearchService lookup serve grounded cards.
+        // If already indexed in packManager, let normal ResearchService lookup serve grounded cards (or stay silent).
         if await researchService.packManager.dependencyManifest(for: dep.packKey) != nil {
-            return nil
+            return .indexed
         }
 
         if dep.isCached {
-            return DocsErrorDepReport(
+            return .depReport(DocsErrorDepReport(
                 importPath: importPath,
                 matchedDependency: dep.packKey,
                 isCachedButUnindexed: true,
                 message: "`\(dep.displayID)` はローカル module cache にありますが未インデックスです。依存ドキュメントを抽出するとカードが表示されます。"
-            )
+            ))
         } else {
-            return DocsErrorDepReport(
+            return .depReport(DocsErrorDepReport(
                 importPath: importPath,
                 matchedDependency: dep.packKey,
                 isCachedButUnindexed: false,
                 message: "`\(dep.displayID)` はローカル module cache に未取得です（別バージョンでは代替しません）。`go mod download` を実行してください。"
-            )
+            ))
         }
     }
 

@@ -388,4 +388,190 @@ struct DocsErrorHintTests {
             Issue.record("Expected .depReport hint content")
         }
     }
+
+    // MARK: - Review Regressions (E-1, E-2, E-3 & Missing Test Cases)
+
+    @Test("E-1 & DepReport cached-unindexed: indexed dep Not Found stays silent (never lies as uncached); cached-unindexed dep reports accurately")
+    func indexedDepNotFoundStaysSilentAndCachedUnindexedReportsHonestly() async throws {
+        let storageDir = TempDir()
+        let projDir = TempDir()
+        let modCacheDir = TempDir()
+        defer {
+            storageDir.cleanup()
+            projDir.cleanup()
+            modCacheDir.cleanup()
+        }
+
+        _ = projDir.file("go.mod", """
+        module example.com/depstates
+
+        go 1.23
+
+        require (
+            github.com/example/indexed v1.0.0
+            github.com/example/cachedonly v1.2.0
+        )
+        """)
+        let mainGo = projDir.file("main.go", "package main\nfunc main() {}\n")
+        let fileURI = uri(mainGo)
+
+        // Populate local GOMODCACHE for both modules.
+        _ = modCacheDir.file("github.com/example/indexed@v1.0.0/go.mod", "module github.com/example/indexed\ngo 1.23\n")
+        _ = modCacheDir.file("github.com/example/indexed@v1.0.0/pkg.go", "package indexed\n// Hello greets.\nfunc Hello() {}\n")
+        _ = modCacheDir.file("github.com/example/cachedonly@v1.2.0/go.mod", "module github.com/example/cachedonly\ngo 1.23\n")
+        _ = modCacheDir.file("github.com/example/cachedonly@v1.2.0/pkg.go", "package cachedonly\n// World greets.\nfunc World() {}\n")
+
+        let packManager = try DocsPackManager(rootDirectory: storageDir.url)
+        _ = try await packManager.ensureBundledPackInstalled(goVersion: "1.23")
+        // Index ONLY `github.com/example/indexed@v1.0.0` (with 0 matching chunks so search returns Not Found);
+        // leave `cachedonly` cached-but-unindexed.
+        _ = try await packManager.ingestDependency(
+            modulePath: "github.com/example/indexed",
+            moduleVersion: "v1.0.0",
+            chunks: []
+        )
+
+        let service = ResearchService(packManager: packManager, enabled: true)
+        let store = DocsErrorHintStore(docsEnabled: true, hintsEnabled: true)
+
+        // E-1: `github.com/example/indexed/nonexistent` belongs to an ALREADY-INDEXED dependency.
+        // Retrieval finds no matching chunk -> must stay SILENT (`nil`), NEVER fabricate an "uncached" DepReport.
+        let indexedMissingSubpkg = DocsErrorDiagnostic(
+            fileURI: fileURI,
+            source: .gopls,
+            docVersion: 1,
+            range: LSPRange(start: LSPPosition(line: 1, character: 0), end: LSPPosition(line: 1, character: 40)),
+            message: "could not import github.com/example/indexed/nonexistent (no required module provides package \"github.com/example/indexed/nonexistent\")"
+        )
+        // Cached-but-unindexed dependency -> must return DepReport with `isCachedButUnindexed == true` and 0 cards.
+        let cachedOnlyDiag = DocsErrorDiagnostic(
+            fileURI: fileURI,
+            source: .gopls,
+            docVersion: 1,
+            range: LSPRange(start: LSPPosition(line: 2, character: 0), end: LSPPosition(line: 2, character: 35)),
+            message: "could not import github.com/example/cachedonly"
+        )
+
+        _ = await store.publishGoplsDiagnostics(fileURI: fileURI, docVersion: 1, items: [indexedMissingSubpkg, cachedOnlyDiag])
+
+        let hIndexed = await store.evaluateHint(
+            for: indexedMissingSubpkg.key,
+            researchService: service,
+            projectRoot: projDir.url,
+            moduleCacheRoot: modCacheDir.url,
+            toolchainVersionProvider: { GoVersion(major: 1, minor: 23) }
+        )
+        #expect(hIndexed == nil)
+
+        let hCached = await store.evaluateHint(
+            for: cachedOnlyDiag.key,
+            researchService: service,
+            projectRoot: projDir.url,
+            moduleCacheRoot: modCacheDir.url,
+            toolchainVersionProvider: { GoVersion(major: 1, minor: 23) }
+        )
+        #expect(hCached != nil)
+        #expect(hCached?.isDepReport == true)
+        #expect(hCached?.cards.isEmpty == true)
+        if case .depReport(let report)? = hCached?.content {
+            #expect(report.isCachedButUnindexed == true)
+            #expect(report.matchedDependency?.modulePath == "github.com/example/cachedonly")
+            #expect(report.matchedDependency?.version == "v1.2.0")
+        } else {
+            Issue.record("Expected cached-but-unindexed .depReport")
+        }
+    }
+
+    @Test("E-2: Build output line buffer handles arbitrary chunk splits and spaces in project paths")
+    func buffersSplitBuildChunksAndParsesPathsWithSpaces() {
+        let dir = TempDir()
+        defer { dir.cleanup() }
+        let spacedDir = dir.subdir("My Go Project")
+        let spacedFile = dir.file("My Go Project/main.go", "package main\nfunc main() {}\n")
+
+        var buffer = DocsBuildErrorLineBuffer()
+        // Split a single diagnostic right in the middle of the message, and leave a second line without trailing newline.
+        let chunk1 = "\(spacedFile.path):12:5: undefined: fmt."
+        let chunk2 = "Printl\n./main.go:20:3: not enough arguments in call to strings.Split"
+
+        let lines1 = buffer.append(chunk1)
+        #expect(lines1.isEmpty) // Must not emit truncated partial diagnostic!
+
+        let lines2 = buffer.append(chunk2)
+        #expect(lines2.count == 1)
+
+        let flushed = buffer.flush()
+        #expect(flushed.count == 1)
+
+        let parsed = DocsBuildErrorParser.parse(
+            lines: lines1 + lines2 + flushed,
+            workingDirectory: spacedDir,
+            projectRoot: spacedDir
+        )
+        #expect(parsed.count == 2)
+        #expect(parsed[0].fileURI == uri(spacedFile))
+        #expect(parsed[0].message == "undefined: fmt.Printl")
+        #expect(parsed[1].fileURI == uri(spacedFile))
+        #expect(parsed[1].message == "not enough arguments in call to strings.Split")
+    }
+
+    @Test("E-3 & insertableCard: insertableCard returns grounded snippet and unevaluatedDiagnostics skips already-hinted/dismissed items")
+    func insertableCardSucceedsAndUnevaluatedSkipsHintedOrDismissed() async throws {
+        let storageDir = TempDir()
+        let projDir = TempDir()
+        defer {
+            storageDir.cleanup()
+            projDir.cleanup()
+        }
+
+        _ = projDir.file("go.mod", "module example.com/insert\n\ngo 1.23\n")
+        let mainGo = projDir.file("main.go", "package main\nfunc main() {}\n")
+        let fileURI = uri(mainGo)
+
+        let packManager = try DocsPackManager(rootDirectory: storageDir.url)
+        _ = try await packManager.ensureBundledPackInstalled(goVersion: "1.23")
+        let service = ResearchService(packManager: packManager, enabled: true)
+        let store = DocsErrorHintStore(docsEnabled: true, hintsEnabled: true)
+
+        let d1 = DocsErrorDiagnostic(
+            fileURI: fileURI,
+            source: .gopls,
+            docVersion: 1,
+            range: LSPRange(start: LSPPosition(line: 1, character: 0), end: LSPPosition(line: 1, character: 10)),
+            message: "s.Scann undefined (type *bufio.Scanner has no field or method Scann)"
+        )
+        let d2 = DocsErrorDiagnostic(
+            fileURI: fileURI,
+            source: .gopls,
+            docVersion: 1,
+            range: LSPRange(start: LSPPosition(line: 3, character: 0), end: LSPPosition(line: 3, character: 10)),
+            message: "not enough arguments in call to strings.Split"
+        )
+        _ = await store.publishGoplsDiagnostics(fileURI: fileURI, docVersion: 1, items: [d1, d2])
+        #expect(await store.unevaluatedDiagnostics().count == 2)
+
+        let hint1 = await store.evaluateHint(
+            for: d1.key,
+            researchService: service,
+            projectRoot: projDir.url,
+            toolchainVersionProvider: { GoVersion(major: 1, minor: 23) }
+        )
+        #expect(hint1 != nil)
+        // Normal path of `insertableCard` returns a grounded, cited, insertable card.
+        if let insertIdx = hint1?.cards.firstIndex(where: { $0.canInsert }) {
+            let insertable = await store.insertableCard(for: d1.key, cardIndex: insertIdx)
+            #expect(insertable != nil)
+            #expect(insertable?.card.canInsert == true)
+            #expect(insertable?.card.citation.isEmpty == false)
+        }
+
+        // `unevaluatedDiagnostics()` must skip `d1` (already hinted) and return only `d2`.
+        let remaining = await store.unevaluatedDiagnostics()
+        #expect(remaining.count == 1)
+        #expect(remaining.first?.key == d2.key)
+
+        // Dismissing `d2` also removes it from `unevaluatedDiagnostics()`.
+        await store.dismissHint(for: d2.key)
+        #expect(await store.unevaluatedDiagnostics().isEmpty)
+    }
 }
