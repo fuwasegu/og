@@ -486,12 +486,18 @@ public actor ResearchService {
         includeEditorContextInGeneration = include
     }
 
+    public func hasAnswerGenerator() -> Bool {
+        answerGenerator != nil
+    }
+
     /// Executes the fixed offline retrieval pipeline (§7.3) with cancellation checkpoints (M-4).
+    /// Set `includeSynthesis` to `false` to return Phase 2 cards immediately and run `synthesizeAnswer(for:editorContext:)` asynchronously (Y-3).
     public func search(
         query rawQuery: String,
         projectRoot: URL? = nil,
         explicitVersionOverride: GoVersion? = nil,
         editorContext: DocsEditorContext? = nil,
+        includeSynthesis: Bool = true,
         toolchainVersionProvider: (@Sendable () -> GoVersion?)? = nil
     ) async throws -> DocsAnswer {
         try Task.checkCancellation()
@@ -981,14 +987,19 @@ public actor ResearchService {
 
         let conclusion = buildConclusion(plan: plan, cards: cards, targetVersion: targetVer)
         let topEntries = Array(top)
-        let generated = await synthesizeAnswerIfNeeded(
-            plan: plan,
-            topEntries: topEntries.map(\.candidate.chunk),
-            cards: cards,
-            newerNotes: newerNotes,
-            targetVersion: targetVer,
-            editorContext: includeEditorContextInGeneration ? editorContext : nil
-        )
+        let generated: DocsGeneratedAnswer?
+        if includeSynthesis {
+            generated = await synthesizeAnswerIfNeeded(
+                plan: plan,
+                topEntries: topEntries.map(\.candidate.chunk),
+                cards: cards,
+                newerNotes: newerNotes,
+                targetVersion: targetVer,
+                editorContext: includeEditorContextInGeneration ? editorContext : nil
+            )
+        } else {
+            generated = nil
+        }
 
         return DocsAnswer(
             query: plan.originalQuery,
@@ -1008,6 +1019,48 @@ public actor ResearchService {
         )
     }
 
+    /// Runs Phase 3 synthesis asynchronously for an already-rendered Phase 2 `DocsAnswer` (Y-3).
+    public func synthesizeAnswer(
+        for answer: DocsAnswer,
+        editorContext: DocsEditorContext? = nil
+    ) async -> DocsGeneratedAnswer? {
+        guard enabled, answer.status == .found, let targetVer = answer.targetVersion, !answer.cards.isEmpty else {
+            return nil
+        }
+        guard Self.shouldSynthesize(intent: answer.intent, cards: answer.cards) else { return nil }
+        let evidence = answer.cards.map { card in
+            DocsAnswerEvidence(
+                citation: card.citation,
+                title: card.title,
+                packageName: card.packageName,
+                symbol: card.symbol,
+                signature: card.signature,
+                summary: card.reason,
+                example: card.example,
+                body: card.reason + "\n" + (card.example ?? ""),
+                since: card.since
+            )
+        }
+        return await runSynthesis(
+            query: answer.query,
+            language: answer.language,
+            evidence: evidence,
+            newerNotes: answer.newerVersionNotes,
+            targetVersion: targetVer,
+            editorContext: includeEditorContextInGeneration ? editorContext : nil
+        )
+    }
+
+    public static func shouldSynthesize(intent: DocsQueryIntent, cards: [DocsAnswerCard]) -> Bool {
+        guard !cards.isEmpty else { return false }
+        switch intent {
+        case .exactSymbol, .existenceCheck:
+            return false
+        case .needsReverseLookup, .syntaxHowTo, .idiomOrWhy, .releaseSince:
+            return true
+        }
+    }
+
     private func synthesizeAnswerIfNeeded(
         plan: DocsRoutingPlan,
         topEntries: [DocsChunk],
@@ -1016,15 +1069,7 @@ public actor ResearchService {
         targetVersion: GoVersion,
         editorContext: DocsEditorContext?
     ) async -> DocsGeneratedAnswer? {
-        guard let generator = answerGenerator, !cards.isEmpty else { return nil }
-        // Only synthesize for procedural/pattern/reverse-lookup needs; symbol/existence lookups are already answered cleanly by Phase 2 cards.
-        switch plan.intent {
-        case .exactSymbol, .existenceCheck:
-            return nil
-        case .needsReverseLookup, .syntaxHowTo, .idiomOrWhy, .releaseSince:
-            break
-        }
-
+        guard Self.shouldSynthesize(intent: plan.intent, cards: cards) else { return nil }
         let evidence = topEntries.map { chunk in
             DocsAnswerEvidence(
                 citation: chunk.citationLabel,
@@ -1038,9 +1083,29 @@ public actor ResearchService {
                 since: chunk.since
             )
         }
-        let req = DocsAnswerGenerationRequest(
+        return await runSynthesis(
             query: plan.originalQuery,
             language: plan.language,
+            evidence: evidence,
+            newerNotes: newerNotes,
+            targetVersion: targetVersion,
+            editorContext: editorContext
+        )
+    }
+
+    private func runSynthesis(
+        query: String,
+        language: DocsLanguage,
+        evidence: [DocsAnswerEvidence],
+        newerNotes: [DocsNewerVersionNote],
+        targetVersion: GoVersion,
+        editorContext: DocsEditorContext?
+    ) async -> DocsGeneratedAnswer? {
+        guard let generator = answerGenerator, !evidence.isEmpty else { return nil }
+
+        let req = DocsAnswerGenerationRequest(
+            query: query,
+            language: language,
             targetVersion: targetVersion,
             evidence: evidence,
             editorContext: editorContext
@@ -1054,19 +1119,24 @@ public actor ResearchService {
         }
         guard let output = rawOutput, !output.insufficientEvidence else { return nil }
 
-        // Grounding check (DOC-11): only accept citations that match retrieved evidence cards.
-        let validCitations = evidence.map(\.citation)
-        let matchedCitations = Self.matchGroundedCitations(output.citedLabels, against: validCitations)
+        // Y-1: Strict citation matching (exact citation label or exact qualified symbol / title).
+        let matchedCitations = Self.matchGroundedCitations(output.citedLabels, against: evidence)
         guard !matchedCitations.isEmpty else {
             return nil
         }
 
-        // Version gate on generated output & snippet (DOC-2, DOC-11).
+        // Y-2: Ensure generated snippet actually uses symbols/packages from the cited evidence.
+        if let snippet = output.snippet, !snippet.isEmpty,
+           !Self.verifySnippetGroundedInEvidence(snippet: snippet, evidence: evidence, matchedCitations: matchedCitations) {
+            return nil
+        }
+
+        // Y-4: Version gate on generated output & snippet (DOC-2, DOC-11).
         let verification: DocsSnippetVerificationStatus
         if let reqVer = output.requiredNewerGoVersion, reqVer > targetVersion {
             verification = .newerVersionRequired(since: reqVer)
         } else if let snippet = output.snippet, !snippet.isEmpty {
-            if let newerHit = Self.detectNewerAPIMention(in: snippet, newerNotes: newerNotes) {
+            if let newerHit = Self.detectNewerAPIMention(in: snippet, newerNotes: newerNotes, targetVersion: targetVersion) {
                 verification = .newerVersionRequired(since: newerHit)
             } else {
                 verification = await snippetVerifier.verify(snippet: snippet, targetVersion: targetVersion)
@@ -1085,26 +1155,88 @@ public actor ResearchService {
         )
     }
 
-    static func matchGroundedCitations(_ cited: [String], against valid: [String]) -> [String] {
+    /// Y-1: Strict citation matching without loose bidirectional substring matches.
+    static func matchGroundedCitations(_ cited: [String], against evidence: [DocsAnswerEvidence]) -> [String] {
         var matched: [String] = []
         var seen = Set<String>()
-        for label in cited {
-            let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        for raw in cited {
+            let trimmed = raw
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "`\"'"))
             guard !trimmed.isEmpty else { continue }
-            if let exact = valid.first(where: { $0 == trimmed || $0.localizedCaseInsensitiveContains(trimmed) || trimmed.localizedCaseInsensitiveContains($0) }) {
-                if seen.insert(exact).inserted {
-                    matched.append(exact)
+            let hit = evidence.first { ev in
+                if ev.citation.caseInsensitiveCompare(trimmed) == .orderedSame {
+                    return true
                 }
+                if !ev.title.isEmpty && ev.title.caseInsensitiveCompare(trimmed) == .orderedSame {
+                    return true
+                }
+                if !ev.packageName.isEmpty && !ev.symbol.isEmpty {
+                    let qualified = "\(ev.packageName).\(ev.symbol)"
+                    if qualified.caseInsensitiveCompare(trimmed) == .orderedSame {
+                        return true
+                    }
+                }
+                return false
+            }
+            if let hit, seen.insert(hit.citation).inserted {
+                matched.append(hit.citation)
             }
         }
         return matched
     }
 
-    static func detectNewerAPIMention(in snippet: String, newerNotes: [DocsNewerVersionNote]) -> GoVersion? {
-        for note in newerNotes {
+    /// Y-2: Verifies that a generated snippet references at least one symbol or package from the cited evidence.
+    static func verifySnippetGroundedInEvidence(
+        snippet: String,
+        evidence: [DocsAnswerEvidence],
+        matchedCitations: [String]
+    ) -> Bool {
+        let citedEvidence = evidence.filter { matchedCitations.contains($0.citation) }
+        guard !citedEvidence.isEmpty else { return false }
+        for ev in citedEvidence {
+            let symTail = ev.symbol.split(separator: ".").last.map(String.init) ?? ev.symbol
+            if symTail.count >= 2 && snippet.contains(symTail) {
+                return true
+            }
+            if !ev.packageName.isEmpty {
+                let pkgTail = ev.packageName.split(separator: "/").last.map(String.init) ?? ev.packageName
+                if snippet.contains("\(pkgTail).") || snippet.contains("\"\(ev.packageName)\"") {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    /// Y-4: Checks both gated-out search notes and known stdlib `since` entries above `targetVersion`.
+    static func detectNewerAPIMention(
+        in snippet: String,
+        newerNotes: [DocsNewerVersionNote],
+        targetVersion: GoVersion
+    ) -> GoVersion? {
+        for note in newerNotes where note.since > targetVersion {
             let symbolTail = note.title.split(separator: ".").last.map(String.init) ?? note.title
             if symbolTail.count >= 4 && snippet.contains(symbolTail) {
                 return note.since
+            }
+        }
+        let knownNewerStdlib: [(token: String, since: GoVersion)] = [
+            ("\"slices\"", GoVersion(major: 1, minor: 21)),
+            ("\"maps\"", GoVersion(major: 1, minor: 21)),
+            ("\"cmp\"", GoVersion(major: 1, minor: 21)),
+            ("\"log/slog\"", GoVersion(major: 1, minor: 21)),
+            ("\"math/rand/v2\"", GoVersion(major: 1, minor: 22)),
+            ("slices.Concat", GoVersion(major: 1, minor: 22)),
+            ("\"iter\"", GoVersion(major: 1, minor: 23)),
+            ("\"unique\"", GoVersion(major: 1, minor: 23)),
+            ("slices.Collect", GoVersion(major: 1, minor: 23)),
+            ("maps.Keys", GoVersion(major: 1, minor: 23)),
+            ("\"weak\"", GoVersion(major: 1, minor: 24))
+        ]
+        for entry in knownNewerStdlib where entry.since > targetVersion {
+            if snippet.contains(entry.token) {
+                return entry.since
             }
         }
         return nil

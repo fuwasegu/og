@@ -19,6 +19,7 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
     private var explicitVersion: GoVersion?
     private var lastAnswer: DocsAnswer?
     private var searchTask: Task<Void, Never>?
+    private var synthesisTask: Task<Void, Never>?
     private var insertTask: Task<Void, Never>?
     private var observers: [NSObjectProtocol] = []
 
@@ -251,10 +252,17 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
     }
 
     @objc private func copyGeneratedClicked() {
-        guard let gen = lastAnswer?.generatedAnswer, let code = gen.snippet else { return }
+        guard let gen = lastAnswer?.generatedAnswer,
+              gen.verification != .failed(errorSummary: ""),
+              let code = gen.snippet else { return }
+        if case .failed = gen.verification {
+            context.setStatus("検証失敗のスニペットはコピーできません。")
+            return
+        }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(code, forType: .string)
-        context.setStatus("Copied generated snippet (\(gen.citations.first ?? "Docs"))")
+        let warn = gen.canInsert ? "" : "（\(gen.verification.badgeLabel) — 動作確認を行ってください）"
+        context.setStatus("Copied generated snippet (\(gen.citations.first ?? "Docs"))\(warn)")
     }
 
     @objc private func insertGeneratedClicked() {
@@ -282,25 +290,46 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
     private func runSearch() {
         let query = queryField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else {
+            searchTask?.cancel()
+            synthesisTask?.cancel()
             lastAnswer = nil
             renderIdleOrStatus()
             return
         }
         searchTask?.cancel()
+        synthesisTask?.cancel()
         let root = context.root
         let overrideVer = explicitVersion
         let editorCtx = currentEditorContext()
 
         searchTask = Task { [weak self] in
+            // Y-3: Render Phase 2 retrieval cards immediately without blocking on LLM synthesis.
             let answer = await DocsManager.shared.search(
                 query: query,
                 projectRoot: root,
                 explicitVersion: overrideVer,
-                editorContext: editorCtx
+                editorContext: editorCtx,
+                includeSynthesis: false
             )
             guard !Task.isCancelled, let self else { return }
             self.lastAnswer = answer
             self.render(answer: answer)
+
+            guard answer.status == .found,
+                  ResearchService.shouldSynthesize(intent: answer.intent, cards: answer.cards),
+                  await DocsManager.shared.hasAnswerGenerator() else {
+                return
+            }
+            self.synthesisTask = Task { [weak self] in
+                guard let self else { return }
+                let gen = await DocsManager.shared.synthesizeAnswer(for: answer, editorContext: editorCtx)
+                guard !Task.isCancelled, let gen, self.lastAnswer?.query == answer.query else { return }
+                var updated = answer
+                updated.generatedAnswer = gen
+                updated.usedLLM = true
+                self.lastAnswer = updated
+                self.render(answer: updated)
+            }
         }
     }
 
@@ -632,13 +661,17 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
         ])
 
         let badgeColor: NSColor
+        var isFailedVerification = false
         switch gen.verification {
         case .verified: badgeColor = .systemGreen
         case .unverified, .newerVersionRequired: badgeColor = Theme.warning
-        case .failed: badgeColor = .systemRed
+        case .failed: badgeColor = .systemRed; isFailedVerification = true
         }
         let titleLabel = label("合成回答（ローカル LLM）", color: Theme.text, size: 12, bold: true)
         let badgeLabel = label(gen.verification.badgeLabel, color: badgeColor, size: 11, bold: true)
+        if case .verified = gen.verification {
+            badgeLabel.toolTip = "ホスト環境・単体モジュール（標準ライブラリのみ）で go build 検証済み"
+        }
         let headerRow = NSStackView(views: [titleLabel, NSView(), badgeLabel])
         headerRow.orientation = .horizontal
         headerRow.spacing = 8
@@ -655,8 +688,9 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
             codeContainer.layer?.borderWidth = 0.5
             let codeField = NSTextField(wrappingLabelWithString: snippet)
             codeField.font = Theme.editorFont.withSize(11)
-            codeField.textColor = Theme.text
-            codeField.isSelectable = true
+            codeField.textColor = isFailedVerification ? Theme.secondaryText : Theme.text
+            // Y-6: Prevent accidental copy-paste of failed snippets.
+            codeField.isSelectable = !isFailedVerification
             codeField.translatesAutoresizingMaskIntoConstraints = false
             codeContainer.addSubview(codeField)
             NSLayoutConstraint.activate([
@@ -673,7 +707,7 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
         citeField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         var footerViews: [NSView] = [citeField, NSView()]
-        if gen.snippet != nil {
+        if gen.snippet != nil && !isFailedVerification {
             let copyBtn = NSButton(title: "Copy", target: self, action: #selector(copyGeneratedClicked))
             copyBtn.bezelStyle = .rounded
             copyBtn.controlSize = .small

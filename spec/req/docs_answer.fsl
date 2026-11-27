@@ -20,6 +20,7 @@ requirements DocsAnswer {
   state {
     enabled:            Bool,
     llm_available:      Bool,
+    include_context:    Bool,
     project_ver:        GoVer,
     retrieval_status:   RetrievalStatus,
     retrieval_ver:      Option<GoVer>,
@@ -37,6 +38,7 @@ requirements DocsAnswer {
   init {
     enabled = false
     llm_available = false
+    include_context = true
     project_ver = 0
     retrieval_status = RNone
     retrieval_ver = none
@@ -87,6 +89,11 @@ requirements DocsAnswer {
   action toggle_llm(avail: Bool) "DOC-8: local answer-generation LLM availability changes" {
     requires avail != llm_available
     llm_available = avail
+  }
+
+  action toggle_editor_context(include: Bool) "DOC-11: editor context inclusion is optional and user-configurable" {
+    requires include != include_context
+    include_context = include
   }
 
   action retrieve_cards(card_since: GoVer) "DOC-2 / DOC-7: Phase 2 retrieval returns grounded, since-gated cards" {
@@ -221,6 +228,21 @@ requirements DocsAnswer {
 
   forbidden FB-DOC-14 "DOC-11: cannot mark a generated snippet using a newer Go version API as usable or insert it" {
     enable() toggle_llm(true) retrieve_cards(0) generate_answer(Local, true, true, VVerified) insert_generated()
+    expect rejected
+  }
+
+  forbidden FB-DOC-15 "DOC-11: cannot generate an answer when retrieval reported MissingPack" {
+    enable() toggle_llm(true) retrieve_missing_pack() generate_answer(Local, true, false, VVerified)
+    expect rejected
+  }
+
+  forbidden FB-DOC-16 "DOC-11: cannot insert an unverified generated snippet" {
+    enable() toggle_llm(true) retrieve_cards(0) generate_answer(Local, true, false, VUnverified) insert_generated()
+    expect rejected
+  }
+
+  forbidden FB-DOC-17 "DOC-11: cannot generate an answer when local LLM is unavailable" {
+    enable() retrieve_cards(0) generate_answer(Local, true, false, VVerified)
     expect rejected
   }
 }

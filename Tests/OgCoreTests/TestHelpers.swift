@@ -860,6 +860,24 @@ final class LocalMockHTTPServer: @unchecked Sendable {
     }
 }
 
+func isGoToolchainActive() -> Bool {
+    let locator = ToolLocator()
+    guard let goExe = locator.find("go") else { return false }
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: goExe)
+    proc.arguments = ["version"]
+    proc.environment = locator.environment
+    proc.standardOutput = FileHandle.nullDevice
+    proc.standardError = FileHandle.nullDevice
+    do {
+        try proc.run()
+        proc.waitUntilExit()
+        return proc.terminationStatus == 0
+    } catch {
+        return false
+    }
+}
+
 
 
 

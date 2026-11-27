@@ -44,7 +44,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     private let docsAnswerMode = NSPopUpButton()
     private let docsAnswerBackend = NSPopUpButton()
     private let docsAnswerModel = NSComboBox()
-    private let docsIncludeEditorContext = NSButton(checkboxWithTitle: "Include active Go file imports/context in Docs synthesis", target: nil, action: nil)
+    private let docsIncludeEditorContext = NSButton(checkboxWithTitle: "Include active Go file imports in Docs synthesis (imports only; enabled by default)", target: nil, action: nil)
     private let docsAnswerStatus = NSTextField(labelWithString: "")
     private let docsAnswerActionButton = NSButton(title: "Restart", target: nil, action: nil)
 
@@ -422,11 +422,22 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         docsIncludeEditorContext.state = ansCfg.includeEditorContext ? .on : .off
         docsIncludeEditorContext.isEnabled = d.enabled && ansCfg.mode != .off
         docsAnswerStatus.stringValue = ansMgr.statusText
-        switch ansMgr.phase {
-        case .failed: docsAnswerStatus.textColor = .systemRed; docsAnswerActionButton.title = "Retry"
-        case .ready: docsAnswerStatus.textColor = .systemGreen; docsAnswerActionButton.title = "Restart"
-        case .starting: docsAnswerStatus.textColor = .systemOrange; docsAnswerActionButton.title = "Restart"
-        case .off: docsAnswerStatus.textColor = .secondaryLabelColor; docsAnswerActionButton.title = "Start"
+        if ansCfg.mode == .sharedCompletion {
+            let modelName = ModelServerManager.shared.loadedModelName ?? ModelServerManager.shared.config.model
+            let isLikelyNonInstruct = modelName.contains("--fim-") || !modelName.lowercased().contains("instruct")
+            if isLikelyNonInstruct {
+                docsAnswerStatus.stringValue = "\(ansMgr.statusText) — 注意: FIM/非Instructモデルでは生成が不安定になる場合があります"
+                docsAnswerStatus.textColor = .systemOrange
+            } else {
+                docsAnswerStatus.textColor = .systemGreen
+            }
+        } else {
+            switch ansMgr.phase {
+            case .failed: docsAnswerStatus.textColor = .systemRed; docsAnswerActionButton.title = "Retry"
+            case .ready: docsAnswerStatus.textColor = .systemGreen; docsAnswerActionButton.title = "Restart"
+            case .starting: docsAnswerStatus.textColor = .systemOrange; docsAnswerActionButton.title = "Restart"
+            case .off: docsAnswerStatus.textColor = .secondaryLabelColor; docsAnswerActionButton.title = "Start"
+            }
         }
         docsAnswerActionButton.isEnabled = d.enabled && ansCfg.mode == .dedicated
 

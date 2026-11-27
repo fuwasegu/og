@@ -328,8 +328,8 @@ public final class LoopbackChatAnswerGenerator: DocsAnswerGenerator, Sendable {
                     insufficient = true
                     citations = []
                 } else {
-                    let sep: Character = val.contains("|") ? "|" : ","
-                    citations = val.split(separator: sep)
+                    // Z-7: Split only on `|` so spec/guide titles containing commas stay intact.
+                    citations = val.split(separator: "|")
                         .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                         .filter { !$0.isEmpty }
                 }

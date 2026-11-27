@@ -329,7 +329,8 @@ final class DocsManager {
         query: String,
         projectRoot: URL?,
         explicitVersion: GoVersion?,
-        editorContext: DocsEditorContext?
+        editorContext: DocsEditorContext?,
+        includeSynthesis: Bool = true
     ) async -> DocsAnswer {
         guard let service else {
             return DocsAnswer(
@@ -350,6 +351,7 @@ final class DocsManager {
                 projectRoot: projectRoot,
                 explicitVersionOverride: explicitVersion,
                 editorContext: editorContext,
+                includeSynthesis: includeSynthesis,
                 toolchainVersionProvider: provider
             )
             // T-3: surface any concept_rules.json decode error encountered during live reload.
@@ -382,6 +384,19 @@ final class DocsManager {
                 conclusion: error.localizedDescription
             )
         }
+    }
+
+    func hasAnswerGenerator() async -> Bool {
+        guard let service else { return false }
+        return await service.hasAnswerGenerator()
+    }
+
+    func synthesizeAnswer(
+        for answer: DocsAnswer,
+        editorContext: DocsEditorContext?
+    ) async -> DocsGeneratedAnswer? {
+        guard let service else { return nil }
+        return await service.synthesizeAnswer(for: answer, editorContext: editorContext)
     }
 
     private func finishBatch(goVersion: String, error: String?) async {

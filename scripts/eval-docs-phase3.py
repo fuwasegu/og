@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Reproducible local evaluation script for og Docs Phase 3 (Issue #24).
+Reproducible local end-to-end evaluation script for og Docs Phase 3 (Issue #24, Y-12).
 
-Launches `uvx --from mlx-lm mlx_lm.server` on 127.0.0.1:<free port>, sends the
-exact structured-output prompt used by `LoopbackChatAnswerGenerator`, and
-verifies generated Go snippets locally via `go build` (`GOPROXY=off`).
+By default, extracts REAL Go stdlib chunks from `go env GOROOT` (or `--goroot`),
+retrieves top-3 evidence chunks via SQLite FTS5, runs `uvx --from mlx-lm mlx_lm.server`
+on `127.0.0.1:<free port>`, and verifies generated Go snippets locally via `go build`
+(`GOPROXY=off`, `CGO_ENABLED=0`).
 
 Usage:
-    python3 scripts/eval-docs-phase3.py --models mlx-community/Qwen2.5-Coder-1.5B-4bit mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit mlx-community/Qwen2.5-Coder-3B-Instruct-4bit
+    mise x go@1.23.6 -- python3 scripts/eval-docs-phase3.py --models mlx-community/Qwen2.5-Coder-3B-Instruct-4bit
+    mise x go@1.23.6 -- python3 scripts/eval-docs-phase3.py --handwritten
 """
 
 from __future__ import annotations
@@ -15,8 +17,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -26,7 +30,56 @@ import urllib.request
 from pathlib import Path
 
 
-GOLDEN_CASES = [
+SKIP_DIRS = {"internal", "vendor", "testdata", "cmd"}
+
+STDLIB_PACKAGE_BY_IDENT = {
+    "bufio": "bufio",
+    "bytes": "bytes",
+    "context": "context",
+    "errors": "errors",
+    "filepath": "path/filepath",
+    "fmt": "fmt",
+    "http": "net/http",
+    "io": "io",
+    "json": "encoding/json",
+    "maps": "maps",
+    "os": "os",
+    "regexp": "regexp",
+    "slices": "slices",
+    "slog": "log/slog",
+    "sort": "sort",
+    "strconv": "strconv",
+    "strings": "strings",
+    "sync": "sync",
+    "time": "time",
+    "url": "net/url",
+}
+
+E2E_QUERIES = [
+    {
+        "name": "authorization_header_request",
+        "query": "Authorization ヘッダをつけてリクエストを送りたい",
+        "fts_terms": ["NewRequest", "Header", "Set", "Authorization", "Client", "Do", "http"],
+        "language": "Japanese",
+        "expect_insufficient": False,
+    },
+    {
+        "name": "read_file_line_by_line",
+        "query": "ファイルを1行ずつ読みたい",
+        "fts_terms": ["bufio", "Scanner", "NewScanner", "Scan", "Text"],
+        "language": "Japanese",
+        "expect_insufficient": False,
+    },
+    {
+        "name": "insufficient_evidence_guard",
+        "query": "量子テレポーテーション制御のAPIを使いたい",
+        "fts_terms": ["quantum", "teleportation"],
+        "language": "Japanese",
+        "expect_insufficient": True,
+    },
+]
+
+HANDWRITTEN_CASES = [
     {
         "name": "authorization_header_request",
         "query": "Authorization ヘッダをつけてリクエストを送りたい",
@@ -96,25 +149,78 @@ GOLDEN_CASES = [
     },
 ]
 
-STDLIB_IMPORTS = {
-    "bufio.": "bufio",
-    "bytes.": "bytes",
-    "context.": "context",
-    "errors.": "errors",
-    "filepath.": "path/filepath",
-    "fmt.": "fmt",
-    "http.": "net/http",
-    "io.": "io",
-    "json.": "encoding/json",
-    "os.": "os",
-    "regexp.": "regexp",
-    "slices.": "slices",
-    "sort.": "sort",
-    "strconv.": "strconv",
-    "strings.": "strings",
-    "sync.": "sync",
-    "time.": "time",
-}
+
+def detect_goroot(explicit: str | None) -> tuple[Path, str]:
+    if explicit:
+        p = Path(explicit)
+    else:
+        out = subprocess.check_output(["go", "env", "GOROOT"], text=True).strip()
+        p = Path(out)
+    ver_out = subprocess.check_output(["go", "version"], text=True).strip()
+    m = re.search(r"go(\d+\.\d+)", ver_out)
+    go_ver = m.group(1) if m else "1.23"
+    return p, go_ver
+
+
+def extract_goroot_chunks(goroot: Path) -> list[dict]:
+    src = goroot / "src"
+    chunks: list[dict] = []
+    decl_re = re.compile(r"^(func|type)\s+(?:\([^)]+\)\s*)?([A-Z][A-Za-z0-9_]*)(.*)$")
+    for root, dirs, files in os.walk(src):
+        dirs[:] = [
+            d for d in dirs
+            if d not in SKIP_DIRS and not d.startswith("_") and not d.startswith(".")
+        ]
+        rel_pkg = os.path.relpath(root, src)
+        if rel_pkg == ".":
+            continue
+        pkg = rel_pkg.replace(os.sep, "/")
+        for fname in sorted(files):
+            if not fname.endswith(".go") or fname.endswith("_test.go"):
+                continue
+            lines = (Path(root) / fname).read_text(encoding="utf-8", errors="ignore").splitlines()
+            doc_buf: list[str] = []
+            for line in lines:
+                s = line.strip()
+                if s.startswith("//"):
+                    doc_buf.append(s[2:].strip())
+                    continue
+                m = decl_re.match(line)
+                if m:
+                    sym = m.group(2)
+                    sig = line.rstrip("{").strip()
+                    summary = " ".join(doc_buf[:3]).strip() or sig
+                    chunks.append({
+                        "citation": f"Go Standard Library: {pkg}.{sym}",
+                        "title": f"{pkg}.{sym}",
+                        "package": pkg,
+                        "symbol": sym,
+                        "signature": sig,
+                        "since": "",
+                        "summary": summary[:400],
+                        "example": "",
+                    })
+                doc_buf = []
+    return chunks
+
+
+def build_fts_index(chunks: list[dict]) -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE VIRTUAL TABLE docs USING fts5(idx UNINDEXED, title, pkg, sym, summary)")
+    conn.executemany(
+        "INSERT INTO docs(idx, title, pkg, sym, summary) VALUES (?, ?, ?, ?, ?)",
+        [(str(i), c["title"], c["package"], c["symbol"], c["summary"]) for i, c in enumerate(chunks)],
+    )
+    return conn
+
+
+def search_fts(conn: sqlite3.Connection, chunks: list[dict], terms: list[str], limit: int = 3) -> list[dict]:
+    match_expr = " OR ".join(f'"{t}"' for t in terms)
+    rows = conn.execute(
+        "SELECT idx, bm25(docs) AS rank FROM docs WHERE docs MATCH ? ORDER BY rank LIMIT ?",
+        (match_expr, limit),
+    ).fetchall()
+    return [chunks[int(r[0])] for r in rows]
 
 
 def free_port() -> int:
@@ -162,9 +268,10 @@ def build_messages(case: dict) -> list[dict[str, str]]:
             f"title: {ev['title']}\n"
             f"signature: {ev['signature']}\n"
             f"since: {ev['since']}\n"
-            f"summary: {ev['summary']}\n"
-            f"example:\n{ev['example']}"
+            f"summary: {ev['summary']}"
         )
+        if ev.get("example"):
+            block += f"\nexample:\n{ev['example']}"
         parts.append(block)
     return [
         {"role": "system", "content": system_prompt},
@@ -172,9 +279,9 @@ def build_messages(case: dict) -> list[dict[str, str]]:
     ]
 
 
-def parse_json_output(raw: str) -> dict | None:
+def parse_output(raw: str) -> dict | None:
     s = raw.strip()
-    if "EXPLANATION:" in s or "INSUFFICIENT_EVIDENCE:" in s:
+    if "EXPLANATION:" in s or "INSUFFICIENT_EVIDENCE:" in s or "CITATIONS:" in s:
         insuff = False
         cites: list[str] = []
         expl_lines: list[str] = []
@@ -194,8 +301,7 @@ def parse_json_output(raw: str) -> dict | None:
                     insuff = True
                     cites = []
                 else:
-                    sep = "|" if "|" in val else ","
-                    cites = [c.strip() for c in val.split(sep) if c.strip()]
+                    cites = [c.strip() for c in val.split("|") if c.strip()]
                 sec = None
             elif t.startswith("EXPLANATION:"):
                 rest = t.split(":", 1)[1].strip()
@@ -218,17 +324,10 @@ def parse_json_output(raw: str) -> dict | None:
             return {"insufficient_evidence": True, "explanation": expl, "citations": [], "snippet": None}
         if expl:
             return {"insufficient_evidence": False, "explanation": expl, "citations": cites, "snippet": snip or None}
-    start = s.find("{")
-    end = s.rfind("}")
-    if start == -1 or end == -1 or start >= end:
-        return None
-    try:
-        return json.loads(s[start : end + 1])
-    except Exception:
-        return None
+    return None
 
 
-def wrap_go_snippet(snippet: str) -> str:
+def wrap_go_snippet(snippet: str, extra_imports: list[str] | None = None) -> str:
     trimmed = snippet.strip()
     if trimmed.startswith("package "):
         return trimmed + "\n"
@@ -238,11 +337,9 @@ def wrap_go_snippet(snippet: str) -> str:
         or trimmed.startswith("import ")
     )
     imports_block = ""
-    if "import " not in trimmed and "import(" not in trimmed:
-        inferred = sorted(pkg for prefix, pkg in STDLIB_IMPORTS.items() if prefix in trimmed)
-        if inferred:
-            lines = "\n".join(f'\t"{p}"' for p in inferred)
-            imports_block = f"import (\n{lines}\n)\n\n"
+    if extra_imports and "import " not in trimmed and "import(" not in trimmed:
+        lines = "\n".join(f'\t"{p}"' for p in sorted(set(extra_imports)))
+        imports_block = f"import (\n{lines}\n)\n\n"
     body = f"func _ogVerify() {{\n{trimmed}\n}}" if needs_func else trimmed
     return f"package ogverify\n\n{imports_block}{body}\n"
 
@@ -256,26 +353,28 @@ def verify_go_snippet(snippet: str, go_ver: str) -> tuple[str, str]:
         Path(tmp, "go.mod").write_text(f"module ogverify\n\ngo {go_ver}\n", encoding="utf-8")
         Path(tmp, "main.go").write_text(wrap_go_snippet(snippet), encoding="utf-8")
         env = dict(os.environ)
-        env.update({"GOPROXY": "off", "GOSUMDB": "off", "GOWORK": "off", "GOTOOLCHAIN": "local"})
-        proc = subprocess.run(
-            [go_exe, "build", "-mod=readonly", "./..."],
-            cwd=tmp,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
+        env.update({"GOPROXY": "off", "GOSUMDB": "off", "GOWORK": "off", "GOTOOLCHAIN": "local", "CGO_ENABLED": "0"})
+        proc = subprocess.run([go_exe, "build", "-mod=readonly", "./..."], cwd=tmp, env=env, capture_output=True, text=True, timeout=15)
+        if proc.returncode != 0 and "import " not in snippet and "import(" not in snippet:
+            missing = []
+            for line in proc.stderr.splitlines():
+                if "undefined: " in line:
+                    ident = line.split("undefined: ", 1)[1].strip().split()[0].rstrip(".")
+                    pkg = STDLIB_PACKAGE_BY_IDENT.get(ident)
+                    if pkg and pkg not in missing:
+                        missing.append(pkg)
+            if missing:
+                Path(tmp, "main.go").write_text(wrap_go_snippet(snippet, missing), encoding="utf-8")
+                proc = subprocess.run([go_exe, "build", "-mod=readonly", "./..."], cwd=tmp, env=env, capture_output=True, text=True, timeout=15)
         if proc.returncode == 0:
             return "verified", "ok"
-        first_lines = " | ".join(
-            l.strip() for l in proc.stderr.splitlines() if l.strip() and not l.startswith("#")
-        )[:160]
+        first_lines = " | ".join(l.strip() for l in proc.stderr.splitlines() if l.strip() and not l.startswith("#"))[:160]
         return "failed", first_lines
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def evaluate_model(model_id: str, uvx_path: str) -> dict:
+def evaluate_model(model_id: str, uvx_path: str, cases: list[dict]) -> dict:
     port = free_port()
     cmd = [uvx_path, "--from", "mlx-lm", "mlx_lm.server", "--model", model_id, "--host", "127.0.0.1", "--port", str(port)]
     env = dict(os.environ)
@@ -289,16 +388,22 @@ def evaluate_model(model_id: str, uvx_path: str) -> dict:
             return {"model": model_id, "error": "health check timed out", "cases": []}
         startup_s = round(time.time() - t0, 2)
         print(f"Ready in {startup_s}s", flush=True)
-        for case in GOLDEN_CASES:
-            req_body = json.dumps(
-                {
-                    "model": model_id,
-                    "messages": build_messages(case),
-                    "temperature": 0.1,
-                    "max_tokens": 1024,
-                    "stream": False,
-                }
-            ).encode("utf-8")
+        for case in cases:
+            if not case["evidence"]:
+                # Phase 2 retrieval returned Not Found -> Phase 3 synthesis skipped (honest Not Found)
+                results.append({
+                    "name": case["name"],
+                    "status": "pass_not_found_guard" if case["expect_insufficient"] else "fail_no_evidence",
+                    "retrieved": 0,
+                })
+                continue
+            req_body = json.dumps({
+                "model": model_id,
+                "messages": build_messages(case),
+                "temperature": 0.1,
+                "max_tokens": 1024,
+                "stream": False,
+            }).encode("utf-8")
             req = urllib.request.Request(
                 f"http://127.0.0.1:{port}/v1/chat/completions",
                 data=req_body,
@@ -306,39 +411,33 @@ def evaluate_model(model_id: str, uvx_path: str) -> dict:
                 method="POST",
             )
             q0 = time.time()
-            try:
-                with urllib.request.urlopen(req, timeout=60.0) as resp:
-                    payload = json.loads(resp.read().decode("utf-8"))
-                latency_ms = round((time.time() - q0) * 1000, 1)
-                content = payload["choices"][0]["message"]["content"]
-                parsed = parse_json_output(content)
-                if not parsed:
-                    results.append({"name": case["name"], "status": "invalid_json", "latency_ms": latency_ms, "raw": content[:200]})
-                    continue
-                insuff = bool(parsed.get("insufficient_evidence", False))
-                if case["expect_insufficient"]:
-                    passed = insuff
-                    results.append({"name": case["name"], "status": "pass" if passed else "fail_fabricated", "latency_ms": latency_ms, "insufficient": insuff})
-                else:
-                    cites = parsed.get("citations") or []
-                    valid_cites = {ev["citation"] for ev in case["evidence"]}
-                    grounded = any(any(vc in c or c in vc for vc in valid_cites) for c in cites)
-                    snippet = parsed.get("snippet") or ""
-                    verif_status, verif_msg = verify_go_snippet(snippet, case["target_go"]) if snippet else ("no_snippet", "")
-                    passed = (not insuff) and grounded and verif_status == "verified"
-                    results.append({
-                        "name": case["name"],
-                        "status": "pass" if passed else f"fail({verif_status},grounded={grounded},insuff={insuff})",
-                        "latency_ms": latency_ms,
-                        "citations": cites,
-                        "verify": verif_status,
-                        "verify_msg": verif_msg,
-                    })
-            except urllib.error.HTTPError as e:
-                err_body = e.read().decode("utf-8", errors="replace")[:200]
-                results.append({"name": case["name"], "status": f"http_{e.code}", "error": err_body})
-            except Exception as e:
-                results.append({"name": case["name"], "status": "error", "error": str(e)})
+            with urllib.request.urlopen(req, timeout=60.0) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            latency_ms = round((time.time() - q0) * 1000, 1)
+            content = payload["choices"][0]["message"]["content"]
+            parsed = parse_output(content)
+            if not parsed:
+                results.append({"name": case["name"], "status": "parse_failed", "latency_ms": latency_ms, "raw": content[:200]})
+                continue
+            insuff = bool(parsed.get("insufficient_evidence", False))
+            if case["expect_insufficient"]:
+                results.append({"name": case["name"], "status": "pass" if insuff else "fail_fabricated", "latency_ms": latency_ms})
+            else:
+                cites = parsed.get("citations") or []
+                valid_exact = {ev["citation"].lower() for ev in case["evidence"]} | {ev["title"].lower() for ev in case["evidence"]}
+                grounded = any(c.strip().strip("`\"'").lower() in valid_exact for c in cites)
+                snippet = parsed.get("snippet") or ""
+                verif_status, verif_msg = verify_go_snippet(snippet, case["target_go"]) if snippet else ("no_snippet", "")
+                passed = (not insuff) and grounded and verif_status == "verified"
+                results.append({
+                    "name": case["name"],
+                    "status": "pass" if passed else f"fail({verif_status},grounded={grounded})",
+                    "latency_ms": latency_ms,
+                    "retrieved": len(case["evidence"]),
+                    "citations": cites,
+                    "verify": verif_status,
+                    "verify_msg": verif_msg,
+                })
         return {"model": model_id, "startup_s": startup_s, "cases": results}
     finally:
         proc.terminate()
@@ -350,21 +449,40 @@ def evaluate_model(model_id: str, uvx_path: str) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--goroot", default=None)
+    parser.add_argument("--handwritten", action="store_true")
     parser.add_argument(
         "--models",
         nargs="+",
-        default=[
-            "mlx-community/Qwen2.5-Coder-1.5B-4bit",
-            "mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit",
-            "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit",
-        ],
+        default=["mlx-community/Qwen2.5-Coder-3B-Instruct-4bit"],
     )
     args = parser.parse_args()
     uvx_path = shutil.which("uvx") or os.path.expanduser("~/.local/bin/uvx")
     if not os.path.exists(uvx_path):
         print("uvx not found", file=sys.stderr)
         return 1
-    summary = [evaluate_model(m, uvx_path) for m in args.models]
+
+    if args.handwritten:
+        cases = HANDWRITTEN_CASES
+        corpus_desc = "handwritten-3"
+    else:
+        goroot, go_ver = detect_goroot(args.goroot)
+        chunks = extract_goroot_chunks(goroot)
+        conn = build_fts_index(chunks)
+        corpus_desc = f"real-GOROOT({go_ver}, {len(chunks)} chunks)"
+        cases = []
+        for q in E2E_QUERIES:
+            ev = search_fts(conn, chunks, q["fts_terms"], limit=3)
+            cases.append({
+                "name": q["name"],
+                "query": q["query"],
+                "language": q["language"],
+                "target_go": go_ver,
+                "expect_insufficient": q["expect_insufficient"],
+                "evidence": ev,
+            })
+
+    summary = {"corpus": corpus_desc, "results": [evaluate_model(m, uvx_path, cases) for m in args.models]}
     print("\n=== SUMMARY ===")
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     return 0

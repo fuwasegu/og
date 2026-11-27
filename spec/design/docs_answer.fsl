@@ -22,6 +22,7 @@ spec DocsAnswerDesign {
     endpoint:           Host,
     enabled:            Bool,
     llm_available:      Bool,
+    include_context:    Bool,
     project_ver:        GoVer,
     retrieval_status:   DRetrievalStatus,
     retrieval_ver:      Option<GoVer>,
@@ -40,6 +41,7 @@ spec DocsAnswerDesign {
     endpoint = Loopback
     enabled = false
     llm_available = false
+    include_context = true
     project_ver = 0
     retrieval_status = DRNone
     retrieval_ver = none
@@ -95,6 +97,11 @@ spec DocsAnswerDesign {
   action toggle_llm(avail: Bool) "DES-A2: update local LLM readiness" {
     requires avail != llm_available
     llm_available = avail
+  }
+
+  action toggle_editor_context(include: Bool) "DES-A2: toggle optional editor context inclusion" {
+    requires include != include_context
+    include_context = include
   }
 
   action retrieve_cards(card_since: GoVer) "DES-A2: record grounded retrieval cards" {

@@ -1623,7 +1623,7 @@ struct DocsPhase3Tests {
         await svc.setAnswerGenerator(StubDocsAnswerGenerator { req in
             DocsAnswerGenerationOutput(
                 explanation: "Sample",
-                snippet: "broken syntax {{{",
+                snippet: "sc := bufio.NewScanner(f) {{{",
                 citedLabels: req.evidence.map(\.citation)
             )
         })
@@ -1653,7 +1653,7 @@ struct DocsPhase3Tests {
         await svc.setAnswerGenerator(StubDocsAnswerGenerator { req in
             DocsAnswerGenerationOutput(
                 explanation: "Requires Go 1.24",
-                snippet: "fmt.Println(\"new\")",
+                snippet: "sc := bufio.NewScanner(f)\n_ = sc",
                 citedLabels: req.evidence.map(\.citation),
                 requiredNewerGoVersion: GoVersion(major: 1, minor: 24)
             )
@@ -1680,7 +1680,7 @@ struct DocsPhase3Tests {
             #expect(req.editorContext == nil)
             return DocsAnswerGenerationOutput(
                 explanation: "OK",
-                snippet: "fmt.Println(\"ok\")",
+                snippet: "sc := bufio.NewScanner(f)\n_ = sc",
                 citedLabels: req.evidence.map(\.citation)
             )
         })
@@ -1688,7 +1688,7 @@ struct DocsPhase3Tests {
         let ctx = DocsEditorContext.parse(goSource: "package main\nimport \"net/http\"\nfunc main() {}\n")
         _ = try await svc.search(query: "ファイルを1行ずつ読みたい", projectRoot: proj.url, editorContext: ctx)
 
-        let wrapped = DocsSnippetVerifier.wrapSnippetAsGoFile("req, _ := http.NewRequest(\"GET\", \"https://example.com\", nil)\n_ = req")
+        let wrapped = DocsSnippetVerifier.wrapSnippetAsGoFile("req, _ := http.NewRequest(\"GET\", \"https://example.com\", nil)\n_ = req", extraImports: ["net/http"])
         #expect(wrapped.contains("package ogverify"))
         #expect(wrapped.contains("\"net/http\""))
         #expect(wrapped.contains("func _ogVerify()"))
@@ -1696,31 +1696,115 @@ struct DocsPhase3Tests {
         let cfg = DocsAnswerServerConfig(mode: .dedicated, backend: .custom, model: "m", customCommand: "/bin/echo --port {port}")
         let argv = try DocsAnswerServerCommand.argv(for: cfg, port: 19234)
         #expect(argv == ["/bin/echo", "--port", "19234"])
+    }
 
-        // Real go build verification when an active go toolchain is present on PATH
-        let locator = ToolLocator()
-        if locator.find("go") != nil {
-            let verifier = DocsSnippetVerifier(locator: locator)
-            let okSnippet = """
-            req, err := http.NewRequest(http.MethodGet, "https://example.com", nil)
-            if err != nil { return }
-            req.Header.Set("Authorization", "Bearer token")
-            _ = req
-            """
-            let okStatus = await verifier.verify(snippet: okSnippet, targetVersion: GoVersion(major: 1, minor: 23))
-            if case .unverified = okStatus {
-                // e.g. mise shim present without a globally active Go version
-            } else {
-                #expect(okStatus == .verified)
+    @Test("Strict citation grounding, snippet symbol grounding, CGO block, and newer-API detection (Y-1, Y-2, Y-4, Y-7, Y-9, Y-10)")
+    func strictGroundingAndVerifierHardening() async throws {
+        // Y-1: Partial package fragment must NOT pass strict citation matching
+        let evidence = [
+            DocsAnswerEvidence(
+                citation: "Go Standard Library: net/http.NewRequest",
+                title: "net/http.NewRequest",
+                packageName: "net/http",
+                symbol: "NewRequest",
+                signature: nil,
+                summary: "NewRequest",
+                example: nil,
+                body: "",
+                since: "1.0"
+            )
+        ]
+        #expect(ResearchService.matchGroundedCitations(["net/http"], against: evidence).isEmpty)
+        #expect(ResearchService.matchGroundedCitations(["net/http.NewRequest"], against: evidence) == ["Go Standard Library: net/http.NewRequest"])
 
-                let badSnippet = "var x int = \"not an int\""
-                let badStatus = await verifier.verify(snippet: badSnippet, targetVersion: GoVersion(major: 1, minor: 23))
-                if case .failed = badStatus {
-                    // expected
-                } else {
-                    Issue.record("Expected .failed for type mismatch, got \(badStatus)")
-                }
-            }
+        // Y-2: Unrelated snippet referencing fmt instead of net/http must fail snippet grounding
+        #expect(!ResearchService.verifySnippetGroundedInEvidence(
+            snippet: "fmt.Println(\"unrelated\")",
+            evidence: evidence,
+            matchedCitations: ["Go Standard Library: net/http.NewRequest"]
+        ))
+        #expect(ResearchService.verifySnippetGroundedInEvidence(
+            snippet: "req, _ := http.NewRequest(\"GET\", \"https://example.com\", nil)\n_ = req",
+            evidence: evidence,
+            matchedCitations: ["Go Standard Library: net/http.NewRequest"]
+        ))
+
+        // Y-4: Newer stdlib package detected even when not in search newerNotes
+        let newerHit = ResearchService.detectNewerAPIMention(
+            in: "import \"iter\"\nvar _ iter.Seq[int]",
+            newerNotes: [],
+            targetVersion: GoVersion(major: 1, minor: 22)
+        )
+        #expect(newerHit == GoVersion(major: 1, minor: 23))
+
+        // Y-7 & Y-9 & Y-10
+        #expect(DocsSnippetVerifier.containsCgoImport("import \"C\"\nfunc f() {}"))
+        let cgoStatus = await DocsSnippetVerifier().verify(snippet: "import \"C\"\nfunc f() {}", targetVersion: GoVersion(major: 1, minor: 23))
+        if case .unverified = cgoStatus { } else { Issue.record("Expected .unverified for CGO import") }
+
+        let wrapped = DocsSnippetVerifier.wrapSnippetAsGoFile("// fmt.Println comment\nvar x = 1\n_ = x")
+        #expect(wrapped.contains("package ogverify"))
+        #expect(!wrapped.contains("\"fmt\""))
+
+        let oldToolchainStatus = DocsSnippetVerifier.classifyFailure(
+            stderr: "go: go.mod requires go >= 1.24 (running go 1.23.6; GOTOOLCHAIN=local)",
+            targetVersion: GoVersion(major: 1, minor: 24)
+        )
+        if case .unverified = oldToolchainStatus { } else { Issue.record("Expected .unverified for older host toolchain") }
+    }
+
+    @Test("Two-step search(includeSynthesis: false) + synthesizeAnswer(for:) decouples card latency from LLM (Y-3)")
+    func twoStepAsyncSynthesis() async throws {
+        let dir = TempDir()
+        let proj = TempDir()
+        defer { dir.cleanup(); proj.cleanup() }
+        _ = proj.file("go.mod", "module example.com/twostep\n\ngo 1.23\n")
+
+        let mgr = try makeDocsPackManager(in: dir)
+        _ = try await mgr.ingest(goVersion: "1.23", chunks: BundledGoCorpus.chunks(forGoVersion: "1.23"), embedder: nil)
+
+        let svc = ResearchService(packManager: mgr, enabled: true)
+        await svc.setSnippetVerifier(StubSnippetVerifier(status: .verified))
+        await svc.setAnswerGenerator(StubDocsAnswerGenerator { req in
+            DocsAnswerGenerationOutput(
+                explanation: "Use bufio.Scanner.",
+                snippet: "sc := bufio.NewScanner(f)\n_ = sc",
+                citedLabels: req.evidence.map(\.citation)
+            )
+        })
+
+        let fastAnswer = try await svc.search(
+            query: "ファイルを1行ずつ読みたい",
+            projectRoot: proj.url,
+            includeSynthesis: false
+        )
+        #expect(fastAnswer.status == .found && !fastAnswer.cards.isEmpty)
+        #expect(fastAnswer.generatedAnswer == nil && !fastAnswer.usedLLM)
+
+        let synth = await svc.synthesizeAnswer(for: fastAnswer)
+        #expect(synth != nil)
+        #expect(synth?.verification == .verified)
+        #expect(synth?.canInsert == true)
+    }
+
+    @Test("Real go build verification against host Go toolchain (Z-11)", .enabled(if: isGoToolchainActive()))
+    func realGoBuildVerification() async {
+        let verifier = DocsSnippetVerifier(locator: ToolLocator())
+        let okSnippet = """
+        req, err := http.NewRequest(http.MethodGet, "https://example.com", nil)
+        if err != nil { return }
+        req.Header.Set("Authorization", "Bearer token")
+        _ = req
+        """
+        let okStatus = await verifier.verify(snippet: okSnippet, targetVersion: GoVersion(major: 1, minor: 23))
+        #expect(okStatus == .verified)
+
+        let badSnippet = "var x int = \"not an int\""
+        let badStatus = await verifier.verify(snippet: badSnippet, targetVersion: GoVersion(major: 1, minor: 23))
+        if case .failed = badStatus {
+            // expected
+        } else {
+            Issue.record("Expected .failed for type mismatch, got \(badStatus)")
         }
     }
 }
