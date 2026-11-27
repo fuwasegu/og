@@ -47,7 +47,8 @@ public struct DocsWebsiteExcludedFile: Sendable, Hashable {
 /// Result of extracting a local `golang/website` snapshot checkout (Issue #26, DES-WEB-2).
 public struct DocsWebsiteExtractionResult: Sendable, Hashable {
     public var chunks: [DocsChunk]
-    public var snapshotDate: String
+    /// Git-derived or explicitly supplied snapshot date (`YYYY-MM-DD`); `nil` when unavailable (never fabricated from import execution date, C-1).
+    public var snapshotDate: String?
     public var snapshotCommit: String?
     public var includedFiles: [String]
     public var excludedFiles: [DocsWebsiteExcludedFile]
@@ -55,7 +56,7 @@ public struct DocsWebsiteExtractionResult: Sendable, Hashable {
 
     public init(
         chunks: [DocsChunk],
-        snapshotDate: String,
+        snapshotDate: String? = nil,
         snapshotCommit: String? = nil,
         includedFiles: [String] = [],
         excludedFiles: [DocsWebsiteExcludedFile] = [],
@@ -156,7 +157,9 @@ public enum DocsWebsiteCorpusExtractor {
         }
 
         let detectedGit = detectGitSnapshotMetadata(in: repoRoot)
-        let snapshotDate = options.snapshotDate ?? detectedGit.date ?? currentUTCDateString()
+        // C-1: Only record a snapshot date when explicitly supplied or derived from git commit metadata;
+        // never fabricate today's import date as the content's snapshot date.
+        let snapshotDate = options.snapshotDate ?? detectedGit.date
         let snapshotCommit = options.snapshotCommit ?? detectedGit.commit
 
         var chunks: [DocsChunk] = []
@@ -390,12 +393,14 @@ public enum DocsWebsiteCorpusExtractor {
         documentID: String,
         canonicalPageURL: String,
         baseDirectory: URL? = nil,
-        snapshotDate: String
+        snapshotDate: String?
     ) -> [DocsChunk] {
         let parsedFM = parseMarkdownFrontMatter(text)
         let docTitle = parsedFM.title ?? fallbackTitle
         let expandedCode = resolveBlogCodeDirectives(in: parsedFM.body, baseDirectory: baseDirectory)
-        let cleaned = DocsCorpusExtractor.stripHugoFrontMatterAndShortcodes(expandedCode)
+        // Strip Hugo template comments & shortcodes while keeping `{#Anchor}` intact until heading parse
+        // so duplicate heading titles with distinct `{#id}` anchors never collide.
+        let cleaned = stripHugoCommentsAndShortcodesPreservingHeadingAnchors(expandedCode)
         let lines = cleaned.components(separatedBy: "\n")
 
         var chunks: [DocsChunk] = []
@@ -444,15 +449,6 @@ public enum DocsWebsiteCorpusExtractor {
             chunks.append(chunk)
         }
 
-        // Also inspect raw lines before stripping `{#id}` so we keep official go.dev fragment IDs.
-        let rawLines = expandedCode.components(separatedBy: "\n")
-        var headingAnchorsByLine: [String: String] = [:]
-        for rawLine in rawLines {
-            if let (title, explicitID) = parseMarkdownHeadingWithAnchor(rawLine), let explicitID {
-                headingAnchorsByLine[title] = explicitID
-            }
-        }
-
         for line in lines {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if inFence {
@@ -470,10 +466,10 @@ public enum DocsWebsiteCorpusExtractor {
                 currentLines.append(line)
                 continue
             }
-            if let heading = parseMarkdownHeading(line) {
+            if let (heading, explicitID) = parseMarkdownHeadingWithAnchor(line) {
                 flush()
                 currentHeading = heading
-                currentExplicitAnchor = headingAnchorsByLine[heading]
+                currentExplicitAnchor = explicitID
                 currentLines = []
             } else {
                 currentLines.append(line)
@@ -483,6 +479,13 @@ public enum DocsWebsiteCorpusExtractor {
         return chunks
     }
 
+    private static func stripHugoCommentsAndShortcodesPreservingHeadingAnchors(_ raw: String) -> String {
+        var text = raw
+        text = text.replacingOccurrences(of: #"\{\{/\*[\s\S]*?\*/\}\}"#, with: "", options: .regularExpression)
+        text = text.replacingOccurrences(of: #"\{\{[<%][\s\S]*?[%>]\}\}"#, with: "", options: .regularExpression)
+        return text
+    }
+
     /// Extracts heading-scoped chunks from `golang/website` HTML documents (e.g. `effective_go.html`,
     /// `code.html`, `diagnostics.html`, `gc-guide.html`, `tutorial/*.html`).
     public static func extractHTMLDocument(
@@ -490,7 +493,7 @@ public enum DocsWebsiteCorpusExtractor {
         fallbackTitle: String,
         documentID: String,
         canonicalPageURL: String,
-        snapshotDate: String
+        snapshotDate: String?
     ) -> [DocsChunk] {
         let parsed = parseHTMLJSONFrontMatter(html)
         let docTitle = parsed.title ?? fallbackTitle
@@ -583,7 +586,7 @@ public enum DocsWebsiteCorpusExtractor {
         chapterSlug: String,
         fallbackTitle: String,
         tourDirectory: URL,
-        snapshotDate: String
+        snapshotDate: String?
     ) -> [DocsChunk] {
         let lines = text.components(separatedBy: "\n")
         let chapterTitle = lines.first?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -674,7 +677,7 @@ public enum DocsWebsiteCorpusExtractor {
         fileURL: URL,
         relativePath: String,
         webPath: String,
-        snapshotDate: String
+        snapshotDate: String?
     ) -> [DocsChunk] {
         guard let raw = try? String(contentsOf: fileURL, encoding: .utf8) else { return [] }
         let noExt = relativePath.replacingOccurrences(of: #"\.(md|html)$"#, with: "", options: .regularExpression)
@@ -1001,13 +1004,5 @@ public enum DocsWebsiteCorpusExtractor {
         let commit = runGit(["rev-parse", "--short", "HEAD"])
         let date = runGit(["log", "-1", "--format=%cs"])
         return (date, commit)
-    }
-
-    private static func currentUTCDateString() -> String {
-        let fmt = DateFormatter()
-        fmt.locale = Locale(identifier: "en_US_POSIX")
-        fmt.timeZone = TimeZone(identifier: "UTC")
-        fmt.dateFormat = "yyyy-MM-dd"
-        return fmt.string(from: Date())
     }
 }

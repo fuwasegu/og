@@ -33,8 +33,8 @@ refinement DocsWebsiteRefinesReq {
   action batch_commit_compute()             -> complete_website_batch_compute()
   action batch_commit_reuse()               -> complete_website_batch_reuse()
   action batch_abort()                      -> abort_website_batch()
-  action query_website_found(use_semantic, card_count)
-    -> query_website_found(Local, use_semantic, card_count, true, true)
+  action query_website_found(use_semantic, card_count, definition_exact_match, definition_shown_first)
+    -> query_website_found(Local, use_semantic, card_count, true, true, definition_exact_match, definition_shown_first)
   action query_website_not_found()
     -> query_website_not_found(Local)
 }

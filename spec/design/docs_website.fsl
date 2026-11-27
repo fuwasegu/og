@@ -64,6 +64,8 @@ spec DocsWebsiteDesign {
     answer_has_scope:               Bool,
     answer_grounded:                Bool,
     answer_used_semantic:           Bool,
+    answer_definition_exact:        Bool,
+    answer_definition_first:        Bool,
     inserted:                       Bool,
     sent_remote:                    Bool       // MODEL-1: ghost — off-machine transmission
   }
@@ -91,6 +93,8 @@ spec DocsWebsiteDesign {
     answer_has_scope = false
     answer_grounded = false
     answer_used_semantic = false
+    answer_definition_exact = false
+    answer_definition_first = false
     inserted = false
     sent_remote = false
     forall v: GoVer {
@@ -118,6 +122,8 @@ spec DocsWebsiteDesign {
     answer_has_scope = false
     answer_grounded = false
     answer_used_semantic = false
+    answer_definition_exact = false
+    answer_definition_first = false
   }
 
   action set_go_pack_installed(v: GoVer, present: Bool) "DES-WEB-4: update Go version pack availability" {
@@ -131,6 +137,8 @@ spec DocsWebsiteDesign {
       answer_has_scope = false
       answer_grounded = false
       answer_used_semantic = false
+      answer_definition_exact = false
+      answer_definition_first = false
     }
   }
 
@@ -144,6 +152,8 @@ spec DocsWebsiteDesign {
     answer_has_scope = false
     answer_grounded = false
     answer_used_semantic = false
+    answer_definition_exact = false
+    answer_definition_first = false
   }
 
   // MARK: - Staged website snapshot ingestion (DES-WEB-1, DES-WEB-2, DES-WEB-3)
@@ -266,6 +276,8 @@ spec DocsWebsiteDesign {
     answer_has_scope = false
     answer_grounded = false
     answer_used_semantic = false
+    answer_definition_exact = false
+    answer_definition_first = false
   }
 
   action select_embed_model(m: ModelId) "DES-WEB-3: switching embedding model aborts staging and demotes Ready website pack to FTS-only" {
@@ -287,17 +299,25 @@ spec DocsWebsiteDesign {
       answer_has_scope = false
       answer_grounded = false
       answer_used_semantic = false
+      answer_definition_exact = false
+      answer_definition_first = false
     }
   }
 
   // MARK: - Website search pipeline (DES-WEB-4, DES-WEB-5)
 
-  action query_website_found(use_semantic: Bool, card_count: CardCount) "DES-WEB-4: return 1..MAX_CARDS grounded website cards with snapshot provenance" {
+  action query_website_found(
+    use_semantic: Bool,
+    card_count: CardCount,
+    definition_exact_match: Bool,
+    definition_shown_first: Bool
+  ) "DES-WEB-4: return 1..MAX_CARDS grounded website cards with snapshot provenance without displacing exact definitions" {
     requires enabled
     requires go_pack_installed[project_ver]
     requires website_pack_state != DMissing
     requires website_has_snapshot_meta
     requires card_count >= 1 and card_count <= MAX_CARDS
+    requires (not definition_exact_match) or definition_shown_first
     requires (not use_semantic) or (website_pack_state == DReady and website_pack_model == selected_model)
     answer_kind = DWebsiteCards
     answer_ver = some(project_ver)
@@ -306,6 +326,8 @@ spec DocsWebsiteDesign {
     answer_has_scope = true
     answer_grounded = true
     answer_used_semantic = use_semantic
+    answer_definition_exact = definition_exact_match
+    answer_definition_first = definition_shown_first
     sent_remote = sent_remote or endpoint == Elsewhere
   }
 
@@ -320,6 +342,8 @@ spec DocsWebsiteDesign {
     answer_has_scope = true
     answer_grounded = true
     answer_used_semantic = website_pack_state == DReady and website_pack_model == selected_model
+    answer_definition_exact = false
+    answer_definition_first = false
     sent_remote = sent_remote or endpoint == Elsewhere
   }
 
@@ -373,6 +397,10 @@ spec DocsWebsiteDesign {
       answer_has_scope and
       answer_grounded
     )
+  }
+
+  invariant NarrativeNeverDisplacesExactDefinition "DES-WEB-4: exact definitions always rank ahead of website cards" {
+    (answer_kind == DWebsiteCards and answer_definition_exact) => answer_definition_first
   }
 
   invariant NotFoundHasScopeWithoutCitation "MODEL-3: induction aid" {

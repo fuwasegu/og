@@ -487,8 +487,9 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         let webSummaryLine: String? = webPack.map { w in
             let kb = max(1, w.sizeBytes / 1024)
             let mode = w.status == .ready ? "ready (FTS + semantic)" : "FTS-only"
+            let snapLabel = w.snapshotDate.map { "snapshot \($0)" } ?? "snapshot date unknown"
             let commitPart = w.snapshotCommit.map { " @\($0)" } ?? ""
-            return "• golang/website (snapshot \(w.snapshotDate)\(commitPart)): \(w.chunkCount) chunks, \(kb) KB [\(mode)]"
+            return "• golang/website (\(snapLabel)\(commitPart)): \(w.chunkCount) chunks, \(kb) KB [\(mode)]"
         }
         let depSummaryLine: String? = depPacks.isEmpty ? nil : {
             let totalKB = max(1, depPacks.reduce(Int64(0)) { $0 + $1.sizeBytes } / 1024)

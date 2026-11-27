@@ -1121,7 +1121,8 @@ public actor ResearchService {
 
         var scopeParts = ["Go \(packKey) pack (\(manifest.chunkCount) chunks: Language Spec, Official Guides, Standard Library)"]
         if let webPack = activeWebsitePack {
-            scopeParts.append("Go Website (\(webPack.manifest.chunkCount) chunks, snapshot \(webPack.manifest.snapshotDate))")
+            let snapPart = webPack.manifest.snapshotDate.map { ", snapshot \($0)" } ?? ", snapshot date unknown"
+            scopeParts.append("Go Website (\(webPack.manifest.chunkCount) chunks\(snapPart))")
         }
         if let depSummary, depSummary.hasAnyDependency {
             var depParts: [String] = []

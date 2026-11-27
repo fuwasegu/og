@@ -9,8 +9,12 @@
 //   DOC-14b: Grounded website cards require Docs to be enabled, an installed Go pack for `project_ver`
 //            (never answering from website alone when the project's Go pack is missing), and an
 //            installed website snapshot pack. Cards pass the same top-N, anti-hallucination threshold,
-//            and `1..MAX_CARDS` gates as stdlib, and always carry snapshot provenance (article title,
-//            URL, snapshot date). Not Found answers report searched scope without fabricating citations.
+//            and `1..MAX_CARDS` gates as stdlib, always carry snapshot provenance (article title,
+//            URL, optional git-derived snapshot date — never fabricated), and never displace an exact
+//            definition match (`NarrativeNeverDisplacesExactDefinition`: when `definition_exact_match`
+//            holds, the definition must rank first). Narrative sections are eligible evidence for
+//            DOC-11 grounded synthesis under its unchanged grounding/citation/verification rules.
+//            Not Found answers report searched scope without fabricating citations.
 //   DOC-14c: Website pack ingestion publishes FTS-only before Ready on initial build, supports
 //            pause/resume/abort without corrupting an active website pack, reuses vectors from the
 //            shared store when model matches, demotes Ready website pack to FTS-only on embedding
@@ -55,6 +59,8 @@ requirements DocsWebsite {
     answer_has_scope:              Bool,
     answer_grounded:               Bool,
     answer_used_semantic:          Bool,
+    answer_definition_exact:       Bool,
+    answer_definition_first:       Bool,
     inserted:                      Bool,
     sent_remote:                   Bool       // MODEL-1: ghost — off-machine transmission
   }
@@ -78,6 +84,8 @@ requirements DocsWebsite {
     answer_has_scope = false
     answer_grounded = false
     answer_used_semantic = false
+    answer_definition_exact = false
+    answer_definition_first = false
     inserted = false
     sent_remote = false
     forall v: GoVer {
@@ -100,6 +108,8 @@ requirements DocsWebsite {
     answer_has_scope = false
     answer_grounded = false
     answer_used_semantic = false
+    answer_definition_exact = false
+    answer_definition_first = false
   }
 
   action set_go_pack_installed(v: GoVer, present: Bool) "DOC-14b: Go version pack installation state changes; removing project_ver pack clears answers" {
@@ -113,6 +123,8 @@ requirements DocsWebsite {
       answer_has_scope = false
       answer_grounded = false
       answer_used_semantic = false
+      answer_definition_exact = false
+      answer_definition_first = false
     }
   }
 
@@ -126,6 +138,8 @@ requirements DocsWebsite {
     answer_has_scope = false
     answer_grounded = false
     answer_used_semantic = false
+    answer_definition_exact = false
+    answer_definition_first = false
   }
 
   // MARK: - Staged website snapshot pack ingestion (DOC-14a, DOC-14c)
@@ -197,6 +211,8 @@ requirements DocsWebsite {
     answer_has_scope = false
     answer_grounded = false
     answer_used_semantic = false
+    answer_definition_exact = false
+    answer_definition_first = false
   }
 
   action select_embed_model(m: ModelId) "DOC-14c: switching embedding model aborts incompatible website batch and demotes Ready website pack to FTS-only" {
@@ -215,6 +231,8 @@ requirements DocsWebsite {
       answer_has_scope = false
       answer_grounded = false
       answer_used_semantic = false
+      answer_definition_exact = false
+      answer_definition_first = false
     }
   }
 
@@ -225,8 +243,10 @@ requirements DocsWebsite {
     use_semantic: Bool,
     card_count: CardCount,
     within_top_n: Bool,
-    passed_threshold: Bool
-  ) "DOC-14b: local query returns 1..MAX_CARDS grounded website cards with snapshot provenance (article title, URL, snapshot date) across any project_ver with an installed Go pack" {
+    passed_threshold: Bool,
+    definition_exact_match: Bool,
+    definition_shown_first: Bool
+  ) "DOC-14b: local query returns 1..MAX_CARDS grounded website cards with snapshot provenance across any project_ver with an installed Go pack without displacing exact definitions" {
     requires enabled
     requires to == Local
     requires go_pack_installed[project_ver]
@@ -235,6 +255,7 @@ requirements DocsWebsite {
     requires card_count >= 1 and card_count <= MAX_CARDS
     requires within_top_n
     requires passed_threshold
+    requires (not definition_exact_match) or definition_shown_first
     requires (not use_semantic) or (website_pack_state == Ready and website_pack_model == selected_model)
     answer_kind = WebsiteCards
     answer_ver = some(project_ver)
@@ -243,6 +264,8 @@ requirements DocsWebsite {
     answer_has_scope = true
     answer_grounded = true
     answer_used_semantic = use_semantic
+    answer_definition_exact = definition_exact_match
+    answer_definition_first = definition_shown_first
     sent_remote = sent_remote or to == Remote
   }
 
@@ -258,6 +281,8 @@ requirements DocsWebsite {
     answer_has_scope = true
     answer_grounded = true
     answer_used_semantic = website_pack_state == Ready and website_pack_model == selected_model
+    answer_definition_exact = false
+    answer_definition_first = false
     sent_remote = sent_remote or to == Remote
   }
 
@@ -286,6 +311,10 @@ requirements DocsWebsite {
       answer_has_scope and
       answer_grounded
     )
+  }
+
+  invariant NarrativeNeverDisplacesExactDefinition "DOC-14b: when an exact definition match exists, website cards never appear without the definition ranked first" {
+    (answer_kind == WebsiteCards and answer_definition_exact) => answer_definition_first
   }
 
   invariant NotFoundHasScopeWithoutFabricatedCitation "DOC-14b: Not Found answers report searched scope without claiming a website citation" {
@@ -332,17 +361,17 @@ requirements DocsWebsite {
   // MARK: - Acceptance & Forbidden traces
 
   acceptance AC-WEB-1 "DOC-14a/b: website snapshot pack serves grounded cards with snapshot provenance across multiple Go project versions without re-importing" {
-    enable() set_go_pack_installed(0, true) set_go_pack_installed(1, true) start_website_batch() publish_website_fts() query_website_found(Local, false, 2, true, true) set_project_version(1) query_website_found(Local, false, 1, true, true) insert_website_snippet()
+    enable() set_go_pack_installed(0, true) set_go_pack_installed(1, true) start_website_batch() publish_website_fts() query_website_found(Local, false, 2, true, true, false, false) set_project_version(1) query_website_found(Local, false, 1, true, true, false, false) insert_website_snippet()
     expect answer_kind == WebsiteCards and answer_ver == some(1) and answer_has_snapshot_provenance and inserted
   }
 
   acceptance AC-WEB-2 "DOC-14c: pausing, resuming, and updating a Ready website pack reuses shared vectors atomically" {
-    enable() set_go_pack_installed(0, true) start_website_batch() publish_website_fts() pause_website_batch() resume_website_batch() complete_website_batch_compute() start_website_batch() complete_website_batch_reuse() query_website_found(Local, true, 3, true, true)
+    enable() set_go_pack_installed(0, true) start_website_batch() publish_website_fts() pause_website_batch() resume_website_batch() complete_website_batch_compute() start_website_batch() complete_website_batch_reuse() query_website_found(Local, true, 3, true, true, false, false)
     expect website_pack_state == Ready and last_batch_reused and answer_used_semantic and answer_card_count == 3
   }
 
   acceptance AC-WEB-3 "DOC-14c: switching embedding model demotes Ready website pack to FTS-only until rebuilt" {
-    enable() set_go_pack_installed(0, true) start_website_batch() publish_website_fts() complete_website_batch_compute() select_embed_model(1) query_website_found(Local, false, 1, true, true)
+    enable() set_go_pack_installed(0, true) start_website_batch() publish_website_fts() complete_website_batch_compute() select_embed_model(1) query_website_found(Local, false, 1, true, true, false, false)
     expect website_pack_state == IndexingFTSOnly and not answer_used_semantic
   }
 
@@ -351,28 +380,43 @@ requirements DocsWebsite {
     expect answer_kind == WebsiteNotFound and answer_has_scope and not answer_has_snapshot_provenance
   }
 
+  acceptance AC-WEB-5 "DOC-14c: aborting a re-ingestion batch leaves the previously active Ready website pack intact and queryable" {
+    enable() set_go_pack_installed(0, true) start_website_batch() publish_website_fts() complete_website_batch_compute() start_website_batch() abort_website_batch() query_website_found(Local, true, 1, true, true, false, false)
+    expect website_pack_state == Ready and answer_kind == WebsiteCards and answer_used_semantic
+  }
+
+  acceptance AC-WEB-6 "DOC-14b: an exact-definition query may include a website card only when the definition ranks first" {
+    enable() set_go_pack_installed(0, true) start_website_batch() publish_website_fts() query_website_found(Local, false, 2, true, true, true, true)
+    expect answer_kind == WebsiteCards and answer_definition_exact and answer_definition_first
+  }
+
   forbidden FB-WEB-1 "DOC-14b: cannot answer from website pack when project_ver Go pack is missing" {
-    enable() start_website_batch() publish_website_fts() query_website_found(Local, false, 1, true, true)
+    enable() start_website_batch() publish_website_fts() query_website_found(Local, false, 1, true, true, false, false)
     expect rejected
   }
 
   forbidden FB-WEB-2 "DOC-14c: remote queries for website docs are refused" {
-    enable() set_go_pack_installed(0, true) start_website_batch() publish_website_fts() query_website_found(Remote, false, 1, true, true)
+    enable() set_go_pack_installed(0, true) start_website_batch() publish_website_fts() query_website_found(Remote, false, 1, true, true, false, false)
     expect rejected
   }
 
   forbidden FB-WEB-3 "DOC-14b: website candidates below anti-hallucination threshold cannot be returned" {
-    enable() set_go_pack_installed(0, true) start_website_batch() publish_website_fts() query_website_found(Local, false, 1, true, false)
+    enable() set_go_pack_installed(0, true) start_website_batch() publish_website_fts() query_website_found(Local, false, 1, true, false, false, false)
     expect rejected
   }
 
   forbidden FB-WEB-4 "DOC-14c: cannot run semantic search on an FTS-only website pack" {
-    enable() set_go_pack_installed(0, true) start_website_batch() publish_website_fts() query_website_found(Local, true, 1, true, true)
+    enable() set_go_pack_installed(0, true) start_website_batch() publish_website_fts() query_website_found(Local, true, 1, true, true, false, false)
     expect rejected
   }
 
   forbidden FB-WEB-5 "DOC-14d: cannot insert snippet after deleting website pack" {
-    enable() set_go_pack_installed(0, true) start_website_batch() publish_website_fts() query_website_found(Local, false, 1, true, true) delete_website_pack() insert_website_snippet()
+    enable() set_go_pack_installed(0, true) start_website_batch() publish_website_fts() query_website_found(Local, false, 1, true, true, false, false) delete_website_pack() insert_website_snippet()
+    expect rejected
+  }
+
+  forbidden FB-WEB-6 "DOC-14b: when an exact definition match exists, cannot return website cards without the definition ranked first" {
+    enable() set_go_pack_installed(0, true) start_website_batch() publish_website_fts() query_website_found(Local, false, 1, true, true, true, false)
     expect rejected
   }
 }

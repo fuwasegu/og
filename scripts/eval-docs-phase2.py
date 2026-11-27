@@ -128,6 +128,14 @@ AUTH_HEADER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Issue #26 (E-1) positive surfacing queries: verify golang/website narrative content actually surfaces in top-k.
+WEBSITE_POSITIVE_QUERIES = [
+    ("defer cleanup LIFO", ["Effective Go", "A Tour of Go", "Defer"], 3),
+    ("Why is there no type inheritance", ["Frequently Asked Questions"], 3),
+    ("canceling database operations timeout", ["Cancel Operations"], 3),
+    ("goroutine leak profile", ["Goroutine Leak"], 3),
+]
+
 
 def parse_bundled_concept_rules(repo_root: Path) -> list[tuple[list[str], list[str], list[str]]]:
     """Reads `BundledGoCorpus.defaultConceptRules` directly from Swift source (no duplicated rules)."""
@@ -772,10 +780,25 @@ def main() -> int:
         auth_idxs = fts_search_indices(fts_conn, auth_terms, limit=10)
         auth_top3 = [chunks[i]["title"] for i in auth_idxs[:3]]
         print(f"[DIAG] {AUTHORIZATION_DIAGNOSTIC_QUERY} -> {auth_top3 if auth_top3 else ['Not Found (0 cards)']}")
+
+        # Issue #26 (E-1): Positive surfacing check when --website is supplied
+        web_failures = 0
+        if args.website is not None:
+            print("\nWebsite positive surfacing checks (Issue #26 E-1):")
+            for wq, w_expected, w_k in WEBSITE_POSITIVE_QUERIES:
+                wt = query_search_terms(wq, concept_rules)
+                w_idxs = fts_search_indices(fts_conn, wt, limit=10)
+                w_top = [chunks[i]["title"] for i in w_idxs[:3]]
+                w_ok = bool(w_top[:w_k]) and any(any(exp.lower() in title.lower() for exp in w_expected) for title in w_top[:w_k])
+                if not w_ok:
+                    web_failures += 1
+                print(f"[{'PASS' if w_ok else 'FAIL'}] {wq} -> {w_top if w_top else ['Not Found (0 cards)']}")
+            print(f"Website positive summary: {len(WEBSITE_POSITIVE_QUERIES) - web_failures}/{len(WEBSITE_POSITIVE_QUERIES)} PASS")
+
         fts_conn.close()
         total = len(GOLDEN_QUERIES)
         print(f"\nSummary (FTS-only): {total - failures}/{total} PASS")
-        return 1 if failures else 0
+        return 1 if (failures or web_failures) else 0
 
     port = free_loopback_port()
     base_url = f"http://127.0.0.1:{port}"

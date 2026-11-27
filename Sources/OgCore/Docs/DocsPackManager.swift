@@ -985,7 +985,7 @@ public actor DocsPackManager {
     /// atomic activation, chunk-level pause/resume checkpoints, and shared vector store reuse.
     public func ingestWebsite(
         chunks: [DocsChunk],
-        snapshotDate: String,
+        snapshotDate: String? = nil,
         snapshotCommit: String? = nil,
         sourceRepository: String = DocsWebsitePackManifest.defaultSourceRepository,
         includedCategories: [String] = [],
@@ -1019,8 +1019,9 @@ public actor DocsPackManager {
         var computedCount = 0
 
         func emit(_ phase: DocsBatchPhase, error: String? = nil) {
+            let label = snapshotDate.map { "golang/website (\($0))" } ?? "golang/website"
             let p = DocsBatchProgress(
-                goVersion: "golang/website (\(snapshotDate))",
+                goVersion: label,
                 phase: phase,
                 processedChunks: processed,
                 totalChunks: chunks.count,
@@ -1938,7 +1939,7 @@ public actor DocsPackManager {
 
     private func publishInitialWebsiteFTSOnlySnapshot(
         fromStageDB stageDB: URL,
-        snapshotDate: String,
+        snapshotDate: String?,
         snapshotCommit: String?,
         sourceRepository: String,
         includedCategories: [String],

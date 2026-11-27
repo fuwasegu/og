@@ -486,8 +486,8 @@ public struct DocsWebsitePackManifest: Sendable, Hashable, Codable {
     public static let defaultSourceRepository = "https://github.com/golang/website"
 
     public var sourceRepository: String
-    /// ISO-8601 snapshot date (`YYYY-MM-DD`) of the ingested `golang/website` checkout.
-    public var snapshotDate: String
+    /// ISO-8601 snapshot date (`YYYY-MM-DD`) derived from git commit metadata or explicit option; `nil` when unknown (never fabricated from import date, Issue #26 C-1).
+    public var snapshotDate: String?
     /// Optional git commit SHA / tag of the ingested `golang/website` checkout.
     public var snapshotCommit: String?
     public var createdAt: String
@@ -501,7 +501,7 @@ public struct DocsWebsitePackManifest: Sendable, Hashable, Codable {
 
     public init(
         sourceRepository: String = DocsWebsitePackManifest.defaultSourceRepository,
-        snapshotDate: String,
+        snapshotDate: String? = nil,
         snapshotCommit: String? = nil,
         createdAt: String,
         license: String = DocsLicense.goBSD3Clause,
@@ -528,7 +528,7 @@ public struct DocsWebsitePackManifest: Sendable, Hashable, Codable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         sourceRepository = try c.decodeIfPresent(String.self, forKey: .sourceRepository) ?? Self.defaultSourceRepository
-        snapshotDate = try c.decode(String.self, forKey: .snapshotDate)
+        snapshotDate = try c.decodeIfPresent(String.self, forKey: .snapshotDate)
         snapshotCommit = try c.decodeIfPresent(String.self, forKey: .snapshotCommit)
         createdAt = try c.decode(String.self, forKey: .createdAt)
         license = try c.decodeIfPresent(String.self, forKey: .license) ?? DocsLicense.goBSD3Clause

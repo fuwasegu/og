@@ -131,7 +131,7 @@ public enum DocsQueryRouter {
         "ある", "あります", "ありますか", "ない", "できる", "できますか", "どう", "使う", "使い方",
         "したい", "やりたい", "教えて", "調べたい", "について", "とは", "なぜ", "なんで",
         "how", "to", "in", "of", "the", "a", "an", "is", "are", "does", "do", "can", "use",
-        "with", "for", "from", "what", "when", "why", "there", "have", "has", "using"
+        "with", "for", "from", "what", "when", "why", "there", "have", "has", "using", "no", "not"
     ]
 
     public static func route(
@@ -151,7 +151,7 @@ public enum DocsQueryRouter {
             intent = .exactSymbol(sym)
         } else if lower.contains("いつから") || lower.contains("since") || lower.contains("変わった") || lower.contains("release note") {
             intent = .releaseSince
-        } else if lower.contains("ある？") || lower.contains("ある?") || lower.contains("ありますか") || lower.contains("標準ライブラリに") || lower.contains("does go have") || lower.contains("is there") {
+        } else if lower.contains("ある？") || lower.contains("ある?") || lower.contains("ありますか") || lower.contains("標準ライブラリに") || lower.contains("does go have") || (lower.contains("is there") && !lower.contains("why ")) {
             intent = .existenceCheck
         } else if lower.contains("書き方") || lower.contains("構文") || lower.contains("syntax") || lower.contains("how to write") || lower.contains("ループ") {
             intent = .syntaxHowTo

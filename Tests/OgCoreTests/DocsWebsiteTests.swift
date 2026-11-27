@@ -357,4 +357,174 @@ struct DocsWebsiteTests {
         #expect(jsonAns.status == .found)
         #expect(jsonAns.cards.first?.packageName == "encoding/json")
     }
+
+    @Test("C-1 & duplicate anchors: non-git checkout leaves snapshotDate nil without fabricating today's date, and duplicate headings with distinct {#id} anchors do not collide")
+    func honestSnapshotDateAndDuplicateHeadingAnchors() async throws {
+        let dir = TempDir()
+        defer { dir.cleanup() }
+
+        _ = dir.file("_content/doc/faq.md", """
+        ---
+        title: "Frequently Asked Questions (FAQ)"
+        ---
+
+        ### Overview {#overview_types}
+
+        First overview discussing Go types and interfaces.
+
+        ### Overview {#overview_concurrency}
+
+        Second overview discussing goroutines and channels.
+        """)
+
+        // No `.git` directory and no explicit `options.snapshotDate`: must NOT fabricate today's date (C-1).
+        let extracted = DocsWebsiteCorpusExtractor.extractWebsite(fromWebsiteRoot: dir.url)
+        #expect(extracted.snapshotDate == nil)
+        #expect(extracted.snapshotCommit == nil)
+        #expect(extracted.chunks.count == 2)
+
+        let urls = Set(extracted.chunks.compactMap(\.sourceURL))
+        #expect(urls.contains("https://go.dev/doc/faq#overview_types"))
+        #expect(urls.contains("https://go.dev/doc/faq#overview_concurrency"))
+        for chunk in extracted.chunks {
+            #expect(chunk.snapshotDate == nil)
+            #expect(stringContains(chunk.citationLabel, "[golang/website snapshot]"))
+            #expect(!stringContains(chunk.citationLabel, "[golang/website snapshot 20"))
+        }
+
+        let pm = try makeDocsPackManager(in: dir)
+        _ = try await pm.ingest(goVersion: "1.23", chunks: BundledGoCorpus.chunks(forGoVersion: "1.23"))
+        _ = try await pm.ingestWebsite(chunks: extracted.chunks, snapshotDate: extracted.snapshotDate)
+        let service = ResearchService(packManager: pm, enabled: true)
+        let ans = try await service.search(
+            query: "overview goroutines channels",
+            explicitVersionOverride: GoVersion(major: 1, minor: 23)
+        )
+        #expect(ans.status == .found)
+        #expect(stringContains(ans.searchedScope, "snapshot date unknown"))
+        #expect(ans.cards.contains { $0.provenance == .officialWebsiteSnapshot && $0.snapshotDate == nil })
+    }
+
+    @Test("Atomic swap failure preserves previously active Ready website pack (AC-WEB-5) and exact definitions always rank ahead of website cards (W-1, E-1)")
+    func swapFailurePreservesActivePackAndDefinitionRanksFirst() async throws {
+        let dir = TempDir()
+        defer { dir.cleanup() }
+        let pm = try makeDocsPackManager(in: dir)
+        let embed = CountingFakeEmbedder(id: "embed-web", version: "v1")
+        _ = try await pm.selectEmbeddingModel(embed.descriptor)
+
+        let snap1Chunks = [
+            DocsChunk(
+                goVersion: "website",
+                source: .guide,
+                provenance: .officialWebsiteSnapshot,
+                packageName: "",
+                documentID: "website/doc/effective_go",
+                symbol: "Defer",
+                kind: .section,
+                title: "Effective Go: Defer",
+                anchor: "#defer",
+                since: nil,
+                summary: "Schedule cleanup calls in LIFO order with defer before function return.",
+                example: "defer f.Close()",
+                body: "Go's defer statement schedules a function call to run in LIFO order when the surrounding function returns.",
+                sourceURL: "https://go.dev/doc/effective_go#defer",
+                snapshotDate: "2026-11-26"
+            ),
+            DocsChunk(
+                goVersion: "website",
+                source: .guide,
+                provenance: .officialWebsiteSnapshot,
+                packageName: "",
+                documentID: "website/doc/faq",
+                symbol: "Why is there no type inheritance?",
+                kind: .section,
+                title: "Frequently Asked Questions (FAQ): Why is there no type inheritance?",
+                anchor: "#inheritance",
+                since: nil,
+                summary: "Go uses composition and interfaces instead of type inheritance hierarchies.",
+                body: "Object-oriented programming often involves too much discussion of type inheritance; Go favors interfaces and embedding.",
+                sourceURL: "https://go.dev/doc/faq#inheritance",
+                snapshotDate: "2026-11-26"
+            ),
+            DocsChunk(
+                goVersion: "website",
+                source: .guide,
+                provenance: .officialWebsiteSnapshot,
+                packageName: "",
+                documentID: "website/blog/scanner-guide",
+                symbol: "Using bufio.Scanner",
+                kind: .section,
+                title: "Blog: Reading lines with bufio.Scanner",
+                anchor: "#scanner",
+                since: nil,
+                summary: "Narrative walkthrough of bufio.Scanner for reading text streams.",
+                body: "bufio.Scanner is a convenient wrapper around io.Reader for scanning lines.",
+                sourceURL: "https://go.dev/blog/scanner-guide#scanner",
+                snapshotDate: "2026-11-26"
+            )
+        ]
+
+        _ = try await pm.ingestWebsite(chunks: snap1Chunks, snapshotDate: "2026-11-26", embedder: embed)
+        #expect(await pm.websiteManifest()?.status == .ready)
+        #expect(await pm.websiteManifest()?.snapshotDate == "2026-11-26")
+
+        // Simulate atomic swap failure during re-ingestion: previous Ready pack must remain completely intact!
+        let snap2Chunks = [
+            DocsChunk(
+                goVersion: "website",
+                source: .guide,
+                provenance: .officialWebsiteSnapshot,
+                packageName: "",
+                documentID: "website/doc/other",
+                symbol: "Other",
+                kind: .section,
+                title: "Other: Section",
+                anchor: "#other",
+                since: nil,
+                summary: "Replacement snapshot that fails to swap.",
+                body: "Should never replace active pack.",
+                sourceURL: "https://go.dev/doc/other#other",
+                snapshotDate: "2026-11-28"
+            )
+        ]
+        var swapThrew = false
+        do {
+            _ = try await pm.ingestWebsite(
+                chunks: snap2Chunks,
+                snapshotDate: "2026-11-28",
+                embedder: embed,
+                simulateSwapFailure: true
+            )
+        } catch {
+            swapThrew = true
+        }
+        #expect(swapThrew)
+        let preserved = await pm.websiteManifest()
+        #expect(preserved?.status == .ready)
+        #expect(preserved?.snapshotDate == "2026-11-26")
+        #expect(preserved?.chunkCount == 3)
+
+        // Install stdlib pack and verify BOTH:
+        // (1) E-1: concept/why queries surface FAQ / Effective Go website cards
+        // (2) W-1: exact symbol query (`bufio.Scanner`) ranks stdlib definition card FIRST
+        _ = try await pm.ingest(goVersion: "1.23", chunks: BundledGoCorpus.chunks(forGoVersion: "1.23"))
+        let service = ResearchService(packManager: pm, enabled: true)
+
+        let faqAns = try await service.search(
+            query: "Why is there no type inheritance in Go?",
+            explicitVersionOverride: GoVersion(major: 1, minor: 23)
+        )
+        #expect(faqAns.status == .found)
+        #expect(faqAns.cards.contains { $0.provenance == .officialWebsiteSnapshot && $0.sourceURL == "https://go.dev/doc/faq#inheritance" })
+
+        let exactAns = try await service.search(
+            query: "bufio.Scanner",
+            explicitVersionOverride: GoVersion(major: 1, minor: 23)
+        )
+        #expect(exactAns.status == .found)
+        #expect(exactAns.cards.first?.sourceKind == .stdlib)
+        #expect(exactAns.cards.first?.packageName == "bufio")
+        #expect(exactAns.cards.first?.symbol == "Scanner")
+    }
 }
