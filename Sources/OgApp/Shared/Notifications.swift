@@ -15,4 +15,6 @@ extension Notification.Name {
     static let ogDebugStopChanged = Notification.Name("og.debugStopChanged")
     /// object: ProjectContext
     static let ogGoplsStatusChanged = Notification.Name("og.goplsStatusChanged")
+    /// object: ProjectContext. Error-driven Docs hints or build diagnostics changed (never auto-opens panels).
+    static let ogErrorHintsChanged = Notification.Name("og.errorHintsChanged")
 }

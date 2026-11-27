@@ -21,8 +21,9 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     private let actionButton = NSButton(title: "Restart", target: nil, action: nil)
     private let logView = NSTextView()
 
-    // Offline Go Docs (FR-19, FR-20, FR-23, FR-24, FR-27, FR-29, Q-4, L-9, Issue #21)
+    // Offline Go Docs (FR-19, FR-20, FR-23, FR-24, FR-27, FR-29, Q-4, L-9, Issue #21, #28)
     private let docsEnabled = NSButton(checkboxWithTitle: "Enable offline Go Docs lookup (local-only; independent of inline AI completion)", target: nil, action: nil)
+    private let docsErrorHintsEnabled = NSButton(checkboxWithTitle: "Show error-driven Docs hints in Problems (never auto-opens panels or edits code)", target: nil, action: nil)
     private let docsSemanticEnabled = NSButton(checkboxWithTitle: "Enable semantic search & cross-encoder reranker (local MLX server via uvx on 127.0.0.1)", target: nil, action: nil)
     private let docsEmbedModel = NSComboBox()
     private let docsRerankEnabled = NSButton(checkboxWithTitle: "Use cross-encoder reranker (improves Japanese -> English ranking)", target: nil, action: nil)
@@ -60,6 +61,9 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
             MainActor.assumeIsolated { self?.refreshStatus() }
         }
         NotificationCenter.default.addObserver(forName: .ogDocsChanged, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshDocs() }
+        }
+        NotificationCenter.default.addObserver(forName: .ogDocsErrorHintsSettingChanged, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.refreshDocs() }
         }
         NotificationCenter.default.addObserver(forName: .ogDocsBatchProgressChanged, object: nil, queue: .main) { [weak self] _ in
@@ -136,9 +140,11 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
 
         let statusRow = NSStackView(views: [status, NSView(), actionButton])
 
-        // Offline Go Docs controls (FR-19, FR-20, FR-23, FR-24, FR-27, FR-29, L-9, Issue #21)
+        // Offline Go Docs controls (FR-19, FR-20, FR-23, FR-24, FR-27, FR-29, L-9, Issue #21, #28)
         docsEnabled.target = self
         docsEnabled.action = #selector(docsEnabledChanged)
+        docsErrorHintsEnabled.target = self
+        docsErrorHintsEnabled.action = #selector(docsErrorHintsEnabledChanged)
         docsSemanticEnabled.target = self
         docsSemanticEnabled.action = #selector(docsSemanticEnabledChanged)
         docsEmbedModel.isEditable = true
@@ -222,7 +228,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
             reopen, NSBox(),
             aiEnabled, row("Backend", backend), row("Model", model), customRow, hint, statusRow, logScroll,
             NSBox(),
-            docsEnabled, docsSemanticEnabled, docsSemanticHint, row("Embedding", docsEmbedModel), docsRerankEnabled, row("Reranker", docsRerankModel),
+            docsEnabled, docsErrorHintsEnabled, docsSemanticEnabled, docsSemanticHint, row("Embedding", docsEmbedModel), docsRerankEnabled, row("Reranker", docsRerankModel),
             docsServerRow,
             row("Synthesis", docsAnswerMode), row("LLM Back", docsAnswerBackend), row("LLM Model", docsAnswerModel), docsIncludeEditorContext, docsAnswerRow,
             row("Indexing", docsBatchPolicy), docsButtons, docsPacksLabel, docsProgressBar, docsProgressLabel
@@ -381,6 +387,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         let ds = DocsServerManager.shared
         let dsCfg = ds.config
         docsEnabled.state = d.enabled ? .on : .off
+        docsErrorHintsEnabled.state = d.errorHintsEnabled ? .on : .off
         docsSemanticEnabled.state = ds.enabled ? .on : .off
         docsSemanticEnabled.isEnabled = d.enabled
         docsEmbedModel.stringValue = DocsEmbedModelPreset.matching(id: dsCfg.embedModel)?.title ?? dsCfg.embedModel
@@ -531,6 +538,11 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
 
     @objc private func docsEnabledChanged() {
         DocsManager.shared.enabled = docsEnabled.state == .on
+        refreshDocs()
+    }
+
+    @objc private func docsErrorHintsEnabledChanged() {
+        DocsManager.shared.errorHintsEnabled = docsErrorHintsEnabled.state == .on
         refreshDocs()
     }
 

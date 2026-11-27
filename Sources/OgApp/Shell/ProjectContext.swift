@@ -17,6 +17,7 @@ final class ProjectContext {
     let index: ProjectIndex
     private(set) var documents: DocumentStore!
     private(set) var breakpoints: BreakpointStore!
+    private(set) var errorHints: ErrorHintCoordinator!
     weak var window: ProjectWindowController?
 
     /// uri -> diagnostics (latest per document).
@@ -53,6 +54,7 @@ final class ProjectContext {
         box.value = self
         self.documents = DocumentStore(context: self)
         self.breakpoints = BreakpointStore(context: self)
+        self.errorHints = ErrorHintCoordinator(context: self)
     }
 
     func start() {
@@ -69,6 +71,7 @@ final class ProjectContext {
 
     func shutdown() {
         depDocsSyncTask?.cancel()
+        errorHints.shutdown()
         documents.autosaveAll()
         window?.bottomPanel.debugPanel.stop()
         window?.bottomPanel.terminalPanel.terminateAll()
@@ -135,7 +138,13 @@ final class ProjectContext {
         let shown = unique.filter { !Self.isStaleBuildDiagnostic($0) }
         if !stale.isEmpty { recoverStaleBuild(uri: uri) }
         diagnostics[uri] = shown.isEmpty ? nil : shown
+        let docVersion = URL(string: uri).flatMap { documents.document(for: $0)?.version } ?? 1
+        errorHints.handleGoplsDiagnostics(fileURI: uri, docVersion: docVersion, items: shown)
         NotificationCenter.default.post(name: .ogDiagnosticsChanged, object: self, userInfo: ["uri": uri])
+    }
+
+    func notifyDocumentEdited(uri: String, version: Int) {
+        errorHints.handleDocumentEdited(fileURI: uri, newVersion: version)
     }
 
     nonisolated static func isStaleBuildDiagnostic(_ d: LSPDiagnostic) -> Bool {

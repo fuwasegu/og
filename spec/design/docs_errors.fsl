@@ -1,0 +1,273 @@
+// og — Error-driven Go documentation lookup design (DocsErrorQueryExtractor + DocsErrorHintStore + ProblemsPanel)
+//
+// Refines: spec/req/docs_errors.fsl (mapping: spec/design/docs_errors_refines_req.fsl)
+//
+// DES-ERR-1: Local-only endpoint invariant — every error-driven lookup reuses `ResearchService`
+//            with loopback-only endpoint validation (`endpoint == Loopback`).
+// DES-ERR-2: Dual-signal lifecycle — gopls diagnostics (`Gopls`) are bound to `(fileURI, diagKey, docVersion)`
+//            and invalidated immediately when `Document.version` advances or `publishDiagnostics` drops them;
+//            build/vet errors (`Build`) parsed from `RunPanel` output are cleared wholesale on `new_build_run()`.
+// DES-ERR-3: Cards-only grounded retrieval — derived queries run through `ResearchService.search(..., includeSynthesis: false)`
+//            enforcing the same deterministic/FTS5/optional-semantic pipeline, anti-hallucination threshold,
+//            Go `since` version gate, and exact dependency `(module, version)` match. Zero grounded candidates
+//            yield silence (`DNoHint`); unresolved imports for uncached/unindexed dependencies surface `DDepReport`.
+//            When semantic/reranker models are unavailable, retrieval degrades cleanly to deterministic + FTS5.
+// DES-ERR-4: Unobtrusive presentation — hints attach passively to diagnostic rows in `ProblemsPanel`
+//            without auto-opening any panel, stealing focus, or modifying documents. Dismissal is sticky
+//            in-session while the same diagnostic persists; snippet insertion is strictly user-initiated
+//            through `DocsCodeInserter`.
+//
+// ASSUME-1 (representation only): two files (0, 1), two diagnostic slots per file
+//   (`DiagSlot = f * NUM_DIAGS + d`), two document versions (0, 1), and MAX_CARDS = 3.
+spec DocsErrorsDesign {
+  number FileId
+  number DiagId
+  number DiagSlot
+  number DocVer
+  number CardCount
+  const NUM_DIAGS = 2
+  const MAX_CARDS = 3
+
+  enum Host { Loopback, Elsewhere }
+  enum DDiagSource { DGopls, DBuild }
+  enum DHintKind { DNoHint, DCards, DDepReport }
+  enum DHintAnswer { DNone, DShown, DDismissed }
+
+  state {
+    endpoint:          Host,
+    enabled:           Bool,
+    hints_enabled:     Bool,
+    doc_version:       Map<FileId, DocVer>,
+    diag_present:      Map<DiagSlot, Bool>,
+    diag_source:       Map<DiagSlot, DDiagSource>,
+    diag_doc_ver:      Map<DiagSlot, DocVer>,
+    hint_kind:         Map<DiagSlot, DHintKind>,
+    hint_state:        Map<DiagSlot, DHintAnswer>,
+    hint_card_count:   Map<DiagSlot, CardCount>,
+    hint_has_citation: Map<DiagSlot, Bool>,
+    hint_grounded:     Map<DiagSlot, Bool>,
+    hint_dismissed:    Map<DiagSlot, Bool>,
+    inserted:          Bool,
+    sent_remote:       Bool,
+    panel_auto_opened: Bool,
+    document_modified: Bool
+  }
+
+  init {
+    endpoint = Loopback
+    enabled = false
+    hints_enabled = false
+    inserted = false
+    sent_remote = false
+    panel_auto_opened = false
+    document_modified = false
+    forall f: FileId {
+      doc_version[f] = 0
+    }
+    forall s: DiagSlot {
+      diag_present[s] = false
+      diag_source[s] = DGopls
+      diag_doc_ver[s] = 0
+      hint_kind[s] = DNoHint
+      hint_state[s] = DNone
+      hint_card_count[s] = 0
+      hint_has_citation[s] = false
+      hint_grounded[s] = false
+      hint_dismissed[s] = false
+    }
+  }
+
+  action set_endpoint(h: Host) "DES-ERR-1: only loopback endpoints are accepted" {
+    requires h == Loopback
+    endpoint = h
+  }
+
+  action enable() "DES-ERR-1: enable offline Go docs lookup" {
+    requires not enabled
+    enabled = true
+  }
+
+  action disable() "DES-ERR-1: disable lookup and clear every error hint" {
+    requires enabled
+    enabled = false
+    forall s: DiagSlot {
+      hint_kind[s] = DNoHint
+      hint_state[s] = DNone
+      hint_card_count[s] = 0
+      hint_has_citation[s] = false
+      hint_grounded[s] = false
+    }
+  }
+
+  action set_hints_enabled(on: Bool) "DES-ERR-4: toggle error hints independently of Docs lookup; turning off clears shown hints" {
+    requires on != hints_enabled
+    hints_enabled = on
+    if not on {
+      forall s: DiagSlot {
+        hint_kind[s] = DNoHint
+        hint_state[s] = DNone
+        hint_card_count[s] = 0
+        hint_has_citation[s] = false
+        hint_grounded[s] = false
+      }
+    }
+  }
+
+  action diagnostic_appears(f: FileId, d: DiagId, src: DDiagSource) "DES-ERR-2: record a live gopls or build diagnostic bound to the file's current document version" {
+    requires not diag_present[f * NUM_DIAGS + d]
+    diag_present[f * NUM_DIAGS + d] = true
+    diag_source[f * NUM_DIAGS + d] = src
+    diag_doc_ver[f * NUM_DIAGS + d] = doc_version[f]
+    hint_dismissed[f * NUM_DIAGS + d] = false
+  }
+
+  action publish_diagnostics(f: FileId, d: DiagId) "DES-ERR-2: clear a resolved diagnostic and its hint" {
+    requires diag_present[f * NUM_DIAGS + d]
+    diag_present[f * NUM_DIAGS + d] = false
+    hint_kind[f * NUM_DIAGS + d] = DNoHint
+    hint_state[f * NUM_DIAGS + d] = DNone
+    hint_card_count[f * NUM_DIAGS + d] = 0
+    hint_has_citation[f * NUM_DIAGS + d] = false
+    hint_grounded[f * NUM_DIAGS + d] = false
+    hint_dismissed[f * NUM_DIAGS + d] = false
+  }
+
+  action edit_document(f: FileId, v: DocVer) "DES-ERR-2: advance document version and immediately clear stale gopls hints for that file" {
+    requires v != doc_version[f]
+    doc_version[f] = v
+    forall s: DiagSlot {
+      if s >= f * NUM_DIAGS and s < (f + 1) * NUM_DIAGS and diag_source[s] == DGopls and diag_doc_ver[s] != v {
+        hint_kind[s] = DNoHint
+        hint_state[s] = DNone
+        hint_card_count[s] = 0
+        hint_has_citation[s] = false
+        hint_grounded[s] = false
+      }
+    }
+  }
+
+  action new_build_run() "DES-ERR-2: supersede all build-source diagnostics and hints on a new build/vet run" {
+    forall s: DiagSlot {
+      if diag_source[s] == DBuild {
+        diag_present[s] = false
+        hint_kind[s] = DNoHint
+        hint_state[s] = DNone
+        hint_card_count[s] = 0
+        hint_has_citation[s] = false
+        hint_grounded[s] = false
+        hint_dismissed[s] = false
+      }
+    }
+  }
+
+  action present_hint(f: FileId, d: DiagId, card_count: CardCount) "DES-ERR-3: attach 1..MAX_CARDS grounded, version-gated cards from loopback ResearchService to a live diagnostic" {
+    requires enabled
+    requires hints_enabled
+    requires diag_present[f * NUM_DIAGS + d]
+    requires diag_source[f * NUM_DIAGS + d] == DBuild or diag_doc_ver[f * NUM_DIAGS + d] == doc_version[f]
+    requires not hint_dismissed[f * NUM_DIAGS + d]
+    requires card_count >= 1 and card_count <= MAX_CARDS
+    hint_kind[f * NUM_DIAGS + d] = DCards
+    hint_state[f * NUM_DIAGS + d] = DShown
+    hint_card_count[f * NUM_DIAGS + d] = card_count
+    hint_has_citation[f * NUM_DIAGS + d] = true
+    hint_grounded[f * NUM_DIAGS + d] = true
+    sent_remote = sent_remote or endpoint == Elsewhere
+    panel_auto_opened = panel_auto_opened or false
+  }
+
+  action present_dep_report_hint(f: FileId, d: DiagId) "DES-ERR-3: attach honest uncached/unindexed dependency report without fabricating cards" {
+    requires enabled
+    requires hints_enabled
+    requires diag_present[f * NUM_DIAGS + d]
+    requires diag_source[f * NUM_DIAGS + d] == DBuild or diag_doc_ver[f * NUM_DIAGS + d] == doc_version[f]
+    requires not hint_dismissed[f * NUM_DIAGS + d]
+    hint_kind[f * NUM_DIAGS + d] = DDepReport
+    hint_state[f * NUM_DIAGS + d] = DShown
+    hint_card_count[f * NUM_DIAGS + d] = 0
+    hint_has_citation[f * NUM_DIAGS + d] = false
+    hint_grounded[f * NUM_DIAGS + d] = true
+  }
+
+  action dismiss_hint(f: FileId, d: DiagId) "DES-ERR-4: dismiss hint sticky for the lifetime of this diagnostic" {
+    requires hint_state[f * NUM_DIAGS + d] == DShown
+    hint_kind[f * NUM_DIAGS + d] = DNoHint
+    hint_state[f * NUM_DIAGS + d] = DDismissed
+    hint_card_count[f * NUM_DIAGS + d] = 0
+    hint_has_citation[f * NUM_DIAGS + d] = false
+    hint_grounded[f * NUM_DIAGS + d] = false
+    hint_dismissed[f * NUM_DIAGS + d] = true
+  }
+
+  action insert_from_hint(f: FileId, d: DiagId) "DES-ERR-4: explicit user action inserts a grounded card snippet via DocsCodeInserter" {
+    requires enabled
+    requires hint_kind[f * NUM_DIAGS + d] == DCards
+    requires hint_state[f * NUM_DIAGS + d] == DShown
+    requires hint_has_citation[f * NUM_DIAGS + d] and hint_grounded[f * NUM_DIAGS + d]
+    inserted = true
+    document_modified = true
+  }
+
+  // MARK: - Invariants
+
+  invariant EndpointIsLoopback "DES-ERR-1: validated endpoint is always loopback" {
+    endpoint == Loopback
+  }
+
+  invariant NeverLeavesMachine "DES-ERR-1: diagnostics and derived queries never leave the machine" {
+    not sent_remote
+  }
+
+  invariant HintsNeverInterrupt "DES-ERR-4: hints never auto-open panels or steal focus" {
+    not panel_auto_opened
+  }
+
+  invariant HintsNeverModifyDocument "DES-ERR-4: document is modified only through explicit insert_from_hint" {
+    document_modified => inserted
+  }
+
+  invariant HintsAreGroundedAndGated "DES-ERR-3: shown Cards hints always carry 1..MAX_CARDS cited, grounded cards for a live diagnostic" {
+    forall s: DiagSlot {
+      hint_kind[s] == DCards => (
+        enabled and hints_enabled and
+        diag_present[s] and
+        hint_state[s] == DShown and
+        hint_card_count[s] >= 1 and hint_card_count[s] <= MAX_CARDS and
+        hint_has_citation[s] and hint_grounded[s]
+      )
+    }
+  }
+
+  invariant StaleHintsNeverSurvive "DES-ERR-2: a shown gopls hint always matches its file's current document version" {
+    forall f: FileId {
+      forall d: DiagId {
+        (hint_state[f * NUM_DIAGS + d] == DShown and diag_source[f * NUM_DIAGS + d] == DGopls) =>
+          diag_doc_ver[f * NUM_DIAGS + d] == doc_version[f]
+      }
+    }
+  }
+
+  invariant DismissedHintsStayDismissed "DES-ERR-4: dismissed diagnostics never get their hint re-shown while persisting" {
+    forall s: DiagSlot {
+      hint_dismissed[s] => hint_state[s] != DShown
+    }
+  }
+
+  invariant DepReportHintsCarryNoCards "DES-ERR-3: dependency report hints never fabricate cards or citations" {
+    forall s: DiagSlot {
+      hint_kind[s] == DDepReport => (hint_card_count[s] == 0 and not hint_has_citation[s])
+    }
+  }
+
+  invariant DisabledHasNoHints "DES-ERR-1: disabling lookup or hints leaves no hint shown" {
+    (not enabled or not hints_enabled) => (forall s: DiagSlot { hint_state[s] != DShown })
+  }
+}
+
+verify {
+  values FileId = 0..1
+  values DiagId = 0..1
+  values DiagSlot = 0..3
+  values DocVer = 0..1
+  values CardCount = 0..3
+}

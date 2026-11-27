@@ -14,10 +14,18 @@ run() {
 }
 depth_for() { case "$1" in *design/refactor.fsl|*design/research.fsl|*docs_deps.fsl) echo 12 ;; *) echo 8 ;; esac; }
 # fslc refine has a fixed 50,000-state correspondence budget (not configurable via CLI):
-# docs_deps explores 29,381 states at depth 8 (refines) and hits the 50,000-state unknown_budget at depth 9+
-# due to the 2-module x 2-version (ModSlot 0..3) product domain; both req and design still verify at depth 12
-# and prove all invariants by unbounded induction.
-refine_depth_for() { case "$1" in docs_deps) echo 8 ;; *) depth_for "spec/design/$1.fsl" ;; esac; }
+# - docs_deps explores 29,381 states at depth 8 (refines) and hits unknown_budget at depth 9+
+#   due to the 2-module x 2-version (ModSlot 0..3) product domain.
+# - docs_errors explores within budget through depth 7 (refines) and hits unknown_budget at depth 8
+#   due to the 2-file x 2-diag (DiagSlot 0..3) x 2-docver product domain.
+# Both req and design still verify at depth 8+ and prove all invariants by unbounded induction.
+refine_depth_for() {
+  case "$1" in
+    docs_deps) echo 8 ;;
+    docs_errors) echo 7 ;;
+    *) depth_for "spec/design/$1.fsl" ;;
+  esac
+}
 
 for f in spec/req/*.fsl spec/design/*.fsl; do
   case "$f" in *_refines_*) continue ;; esac

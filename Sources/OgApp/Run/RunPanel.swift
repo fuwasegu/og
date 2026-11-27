@@ -152,6 +152,7 @@ final class RunPanel: NSViewController, NSOutlineViewDataSource, NSOutlineViewDe
     func run(_ request: RunRequest) {
         _ = view
         killCurrent()
+        context.errorHints.beginBuildRun()
         lastRequest = request
         let gen = generation.begin()
         let cmd = RunCommand(request)
@@ -225,6 +226,7 @@ final class RunPanel: NSViewController, NSOutlineViewDataSource, NSOutlineViewDe
             }
         case .output(.stderr, let text):
             console.append(text, color: Theme.error)
+            context.errorHints.consumeBuildOutput(text, workingDirectory: command?.directory ?? context.root)
         case .exit(let code):
             finish(exitCode: code)
         }
@@ -235,6 +237,8 @@ final class RunPanel: NSViewController, NSOutlineViewDataSource, NSOutlineViewDe
         let isFailureFrame = o.text.hasPrefix("--- FAIL") || o.text.hasPrefix("FAIL")
         let isPassFrame = o.text.hasPrefix("--- PASS") || o.text.hasPrefix("ok  ") || o.text == "PASS\n"
         console.append(o.text, color: isFailureFrame ? Theme.error : isPassFrame ? Theme.gitAdded : nil)
+        let dir = directory(forPackage: o.package) ?? command?.directory ?? context.root
+        context.errorHints.consumeBuildOutput(o.text, workingDirectory: dir)
     }
 
     /// Package of the output being appended; used to resolve relative file links.
