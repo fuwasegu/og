@@ -457,11 +457,13 @@ def extract_real_goroot_chunks(goroot: Path, include_examples: bool = True) -> l
                             seen_ids.add(sid)
                             summary = (doc.split("\n\n")[0].replace("\n", " ") if doc else f"Official Go example for {target_disp}.")[:240]
                             text = f"{title}\nfunc {ex_name}()\n{summary}\n{code[:800]}"
+                            full_text = f"{title}\nfunc {ex_name}()\n{doc}\n{code}"
                             chunks.append({
                                 "stable_id": sid,
                                 "title": title,
                                 "content_hash": hashlib.sha256(text.encode("utf-8")).hexdigest()[:24],
                                 "text": text,
+                                "full_text": full_text,
                                 "rerank_text": text[:900],
                             })
                     idx += 1
@@ -608,7 +610,11 @@ def main() -> int:
 
     ex_total = sum(1 for c in chunks if "::example::" in c["stable_id"])
     net_http_ex = [c for c in chunks if "::example::" in c["stable_id"] and ("::net/http::" in c["stable_id"] or "::net/http/" in c["stable_id"])]
-    auth_ex_hits = [c["title"] for c in chunks if "::example::" in c["stable_id"] and AUTH_HEADER_RE.search(c["text"])]
+    auth_ex_hits = [
+        c["title"]
+        for c in chunks
+        if "::example::" in c["stable_id"] and AUTH_HEADER_RE.search(c.get("full_text") or c["text"])
+    ]
     print(f"Corpus summary: total={len(chunks)} (doc={len(chunks) - ex_total}, example={ex_total}, net/http* examples={len(net_http_ex)}, auth/header example matches={auth_ex_hits})")
 
     if args.fts_only:
@@ -640,7 +646,7 @@ def main() -> int:
         fts_conn.close()
         total = len(GOLDEN_QUERIES)
         print(f"\nSummary (FTS-only): {total - failures}/{total} PASS")
-        return 0
+        return 1 if failures else 0
 
     port = free_loopback_port()
     base_url = f"http://127.0.0.1:{port}"
