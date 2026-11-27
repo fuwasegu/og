@@ -460,15 +460,24 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
             docsVersionCombo.stringValue = "go\(BundledGoCorpus.defaultVersion)"
         }
 
+        let depPacks = d.installedDependencyPacks
+        let depSummaryLine: String? = depPacks.isEmpty ? nil : {
+            let totalKB = max(1, depPacks.reduce(Int64(0)) { $0 + $1.sizeBytes } / 1024)
+            let totalChunks = depPacks.reduce(0) { $0 + $1.chunkCount }
+            return "Dependency packs: \(depPacks.count) modules (\(totalChunks) chunks, \(totalKB) KB)"
+        }()
+
         if packs.isEmpty {
-            docsPacksLabel.stringValue = "Installed packs: none (enabling installs bundled go\(BundledGoCorpus.defaultVersion) core pack offline)"
+            let base = "Installed packs: none (enabling installs bundled go\(BundledGoCorpus.defaultVersion) core pack offline)"
+            docsPacksLabel.stringValue = depSummaryLine.map { "\(base)\n\($0)" } ?? base
         } else {
-            let lines = packs.map { p in
+            var lines = packs.map { p in
                 let kb = max(1, p.sizeBytes / 1024)
                 let mode = p.status == .ready ? "ready (FTS + semantic)" : "FTS-only"
                 let legacyNote = p.needsReimport ? " — legacy v1 schema: re-import recommended" : ""
                 return "• go\(p.goVersion): \(p.chunkCount) chunks, \(kb) KB [\(mode)]\(legacyNote)"
             }
+            if let depSummaryLine { lines.append(depSummaryLine) }
             docsPacksLabel.stringValue = "Installed packs:\n" + lines.joined(separator: "\n")
         }
 
@@ -477,7 +486,8 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
             let estKB = max(1, p.estimatedBytes / 1024)
             let isRunning = p.phase == .extracting || p.phase == .buildingFTS || p.phase == .embedding || p.phase == .activating
             docsCancelButton.isEnabled = isRunning
-            docsProgressLabel.stringValue = "Batch go\(p.goVersion): \(p.phase.rawValue) (\(p.processedChunks)/\(p.totalChunks) chunks, est. \(estKB) KB, reused \(p.reusedVectors))"
+            let targetLabel = (p.goVersion.contains("@") || p.goVersion.contains(" ")) ? p.goVersion : "go\(p.goVersion)"
+            docsProgressLabel.stringValue = "Batch \(targetLabel): \(p.phase.rawValue) (\(p.processedChunks)/\(p.totalChunks) chunks, est. \(estKB) KB, reused \(p.reusedVectors))"
         } else if let err = d.lastError {
             docsProgressBar.doubleValue = 0
             docsCancelButton.isEnabled = false

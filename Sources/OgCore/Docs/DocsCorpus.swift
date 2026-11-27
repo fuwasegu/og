@@ -85,6 +85,65 @@ public enum DocsCorpusExtractor {
         return chunks
     }
 
+    /// Extracts exported GoDoc + Example chunks from a local dependency module directory (e.g. inside `GOMODCACHE`)
+    /// using the same extractor as stdlib (Issue #27, DES-DEP-3).
+    /// Skips nested submodules (subdirectories containing their own `go.mod`), `internal/`, `vendor/`, `testdata/`, `cmd/`.
+    public static func extractModule(
+        fromModuleRoot moduleRoot: URL,
+        modulePath: String,
+        moduleVersion: String,
+        goVersion: String = BundledGoCorpus.defaultVersion,
+        license: String? = nil,
+        target: GoBuildTarget = .hostDefault
+    ) -> [DocsChunk] {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: moduleRoot.path) else { return [] }
+
+        let detectedLicense = license ?? GoModuleResolver.detectLicenseIdentifier(in: moduleRoot)
+        let rootStd = moduleRoot.standardizedFileURL
+        var packageDirs: [URL] = [rootStd]
+
+        if let enumerator = fm.enumerator(
+            at: rootStd,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            for case let url as URL in enumerator {
+                let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+                guard isDir else { continue }
+                let name = url.lastPathComponent
+                if name == "internal" || name == "vendor" || name == "testdata" || name == "cmd" || name.hasPrefix("_") || name.hasPrefix(".") {
+                    enumerator.skipDescendants()
+                    continue
+                }
+                // Skip nested submodules (separate go.mod) so they don't get misattributed to this module.
+                if fm.fileExists(atPath: url.appendingPathComponent("go.mod").path) {
+                    enumerator.skipDescendants()
+                    continue
+                }
+                packageDirs.append(url.standardizedFileURL)
+            }
+        }
+
+        let resolvedTarget = target.withDefaultVersion(goVersion)
+        var chunks: [DocsChunk] = []
+        for dir in packageDirs.sorted(by: { $0.path < $1.path }) {
+            let relPath = relativePackagePath(dir: dir, root: rootStd)
+            let importPath = relPath.isEmpty ? modulePath : "\(modulePath)/\(relPath)"
+            chunks.append(contentsOf: extractPackage(
+                directory: dir,
+                importPath: importPath,
+                goVersion: goVersion,
+                source: .dependency,
+                modulePath: modulePath,
+                moduleVersion: moduleVersion,
+                license: detectedLicense,
+                target: resolvedTarget
+            ))
+        }
+        return deduplicateByStableID(chunks)
+    }
+
     /// Extracts exported symbols (`func`, `method`, `type`/`interface`, `const`, `var`, including grouped declarations)
     /// and attaches `Example*` functions to their exact parent symbol (H-1, M-12..14, R-2, R-4, R-7).
     public static func extractStdlibPackage(
@@ -92,6 +151,28 @@ public enum DocsCorpusExtractor {
         importPath: String,
         goVersion: String,
         target: GoBuildTarget = .hostDefault
+    ) -> [DocsChunk] {
+        extractPackage(
+            directory: directory,
+            importPath: importPath,
+            goVersion: goVersion,
+            source: .stdlib,
+            modulePath: nil,
+            moduleVersion: nil,
+            license: nil,
+            target: target
+        )
+    }
+
+    private static func extractPackage(
+        directory: URL,
+        importPath: String,
+        goVersion: String,
+        source: DocsSourceKind,
+        modulePath: String?,
+        moduleVersion: String?,
+        license: String?,
+        target: GoBuildTarget
     ) -> [DocsChunk] {
         let target = target.withDefaultVersion(goVersion)
         let fm = FileManager.default
@@ -127,7 +208,19 @@ public enum DocsCorpusExtractor {
             guard matchesBuildFilename(file.lastPathComponent, target: target),
                   let text = try? String(contentsOf: file, encoding: .utf8),
                   matchesBuildConstraints(in: text, target: target) else { continue }
-            let parsed = parseGoDocFile(text: text, importPath: importPath, goVersion: goVersion, examples: examplesBySymbol)
+            if source == .dependency && isMainPackageFile(text) {
+                continue
+            }
+            let parsed = parseGoDocFile(
+                text: text,
+                importPath: importPath,
+                goVersion: goVersion,
+                source: source,
+                modulePath: modulePath,
+                moduleVersion: moduleVersion,
+                license: license,
+                examples: examplesBySymbol
+            )
             if packageDoc == nil, let doc = parsed.packageDoc, !doc.isEmpty {
                 packageDoc = doc
             }
@@ -139,7 +232,7 @@ public enum DocsCorpusExtractor {
             let pkgExample = examplesBySymbol[""]
             let pkgChunk = DocsChunk(
                 goVersion: goVersion,
-                source: .stdlib,
+                source: source,
                 packageName: importPath,
                 documentID: importPath,
                 symbol: "",
@@ -150,17 +243,39 @@ public enum DocsCorpusExtractor {
                 summary: summary,
                 signature: "import \"\(importPath)\"",
                 example: pkgExample,
-                body: doc
+                body: doc,
+                modulePath: modulePath,
+                moduleVersion: moduleVersion,
+                license: license
             )
             chunks.insert(pkgChunk, at: 0)
         }
 
         // Emit dedicated official example chunks after primary symbol chunks so symbol lookups stay stable.
         for ex in detailedExamples {
-            chunks.append(makeExampleChunk(example: ex, importPath: importPath, goVersion: goVersion))
+            chunks.append(makeExampleChunk(
+                example: ex,
+                importPath: importPath,
+                goVersion: goVersion,
+                source: source,
+                modulePath: modulePath,
+                moduleVersion: moduleVersion,
+                license: license
+            ))
         }
 
         return deduplicateByStableID(chunks)
+    }
+
+    private static func isMainPackageFile(_ text: String) -> Bool {
+        for raw in text.components(separatedBy: "\n") {
+            let trimmed = raw.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("package ") {
+                let name = trimmed.dropFirst("package ".count).split(whereSeparator: { $0.isWhitespace || $0 == "/" }).first
+                return name == "main"
+            }
+        }
+        return false
     }
 
     /// Extracts heading-scoped chunks from an official guide Markdown file (e.g. `golang/website/_content/doc/`),
@@ -449,6 +564,10 @@ public enum DocsCorpusExtractor {
         text: String,
         importPath: String,
         goVersion: String,
+        source: DocsSourceKind = .stdlib,
+        modulePath: String? = nil,
+        moduleVersion: String? = nil,
+        license: String? = nil,
         examples: [String: String]
     ) -> ParsedFile {
         let lines = text.components(separatedBy: "\n")
@@ -522,6 +641,10 @@ public enum DocsCorpusExtractor {
                         groupDoc: doc,
                         importPath: importPath,
                         goVersion: goVersion,
+                        source: source,
+                        modulePath: modulePath,
+                        moduleVersion: moduleVersion,
+                        license: license,
                         examples: examples
                     )
                     chunks.append(contentsOf: groupChunks)
@@ -536,14 +659,18 @@ public enum DocsCorpusExtractor {
                     let keywordLen = kind == .constant ? 6 : 4
                     let rest = String(trimmed.dropFirst(keywordLen)).trimmingCharacters(in: .whitespaces)
                     for name in leadingIdentifierList(rest) where isExported(name) {
-                        chunks.append(makeStdlibChunk(
+                        chunks.append(makePackageChunk(
                             importPath: importPath,
                             symbol: name,
                             kind: kind,
                             signature: trimmed,
                             doc: doc,
                             example: examples[name],
-                            goVersion: goVersion
+                            goVersion: goVersion,
+                            source: source,
+                            modulePath: modulePath,
+                            moduleVersion: moduleVersion,
+                            license: license
                         ))
                     }
                     pendingComments.removeAll()
@@ -556,14 +683,18 @@ public enum DocsCorpusExtractor {
                     let (fullSig, nextIdx) = collectFuncSignature(lines: lines, startIndex: i)
                     if let decl = parseExportedFuncSignature(fullSig) {
                         // M-12: attach only exact symbol example (do NOT inherit type example onto every method).
-                        chunks.append(makeStdlibChunk(
+                        chunks.append(makePackageChunk(
                             importPath: importPath,
                             symbol: decl.symbol,
                             kind: decl.kind,
                             signature: decl.signature,
                             doc: doc,
                             example: examples[decl.symbol],
-                            goVersion: goVersion
+                            goVersion: goVersion,
+                            source: source,
+                            modulePath: modulePath,
+                            moduleVersion: moduleVersion,
+                            license: license
                         ))
                     }
                     pendingComments.removeAll()
@@ -579,6 +710,10 @@ public enum DocsCorpusExtractor {
                         groupDoc: doc,
                         importPath: importPath,
                         goVersion: goVersion,
+                        source: source,
+                        modulePath: modulePath,
+                        moduleVersion: moduleVersion,
+                        license: license,
                         examples: examples
                     )
                     chunks.append(contentsOf: groupChunks)
@@ -591,14 +726,18 @@ public enum DocsCorpusExtractor {
                 if trimmed.hasPrefix("type ") {
                     let (declOpt, nextIdx) = parseExportedType(lines: lines, startIndex: i)
                     if let decl = declOpt {
-                        chunks.append(makeStdlibChunk(
+                        chunks.append(makePackageChunk(
                             importPath: importPath,
                             symbol: decl.symbol,
                             kind: .type,
                             signature: decl.signature,
                             doc: doc,
                             example: examples[decl.symbol],
-                            goVersion: goVersion
+                            goVersion: goVersion,
+                            source: source,
+                            modulePath: modulePath,
+                            moduleVersion: moduleVersion,
+                            license: license
                         ))
                     }
                     pendingComments.removeAll()
@@ -613,20 +752,24 @@ public enum DocsCorpusExtractor {
         return ParsedFile(packageDoc: packageDoc, chunks: chunks)
     }
 
-    private static func makeStdlibChunk(
+    private static func makePackageChunk(
         importPath: String,
         symbol: String,
         kind: DocsChunkKind,
         signature: String,
         doc: String,
         example: String?,
-        goVersion: String
+        goVersion: String,
+        source: DocsSourceKind,
+        modulePath: String?,
+        moduleVersion: String?,
+        license: String?
     ) -> DocsChunk {
         let summary = doc.isEmpty ? firstLine(of: signature) : firstSentence(of: doc)
         let body = doc.isEmpty ? signature : "\(signature)\n\n\(doc)"
         return DocsChunk(
             goVersion: goVersion,
-            source: .stdlib,
+            source: source,
             packageName: importPath,
             documentID: importPath,
             symbol: symbol,
@@ -637,7 +780,10 @@ public enum DocsCorpusExtractor {
             summary: summary,
             signature: signature,
             example: example,
-            body: body
+            body: body,
+            modulePath: modulePath,
+            moduleVersion: moduleVersion,
+            license: license
         )
     }
 
@@ -649,6 +795,10 @@ public enum DocsCorpusExtractor {
         groupDoc: String,
         importPath: String,
         goVersion: String,
+        source: DocsSourceKind,
+        modulePath: String?,
+        moduleVersion: String?,
+        license: String?,
         examples: [String: String]
     ) -> ([DocsChunk], Int) {
         var out: [DocsChunk] = []
@@ -690,14 +840,18 @@ public enum DocsCorpusExtractor {
                 }
                 if !inlineComment.isEmpty { docParts.append(inlineComment) }
                 let combinedDoc = docParts.joined(separator: "\n")
-                out.append(makeStdlibChunk(
+                out.append(makePackageChunk(
                     importPath: importPath,
                     symbol: name,
                     kind: kind,
                     signature: "\(kw) \(codePart)",
                     doc: combinedDoc,
                     example: examples[name],
-                    goVersion: goVersion
+                    goVersion: goVersion,
+                    source: source,
+                    modulePath: modulePath,
+                    moduleVersion: moduleVersion,
+                    license: license
                 ))
             }
             itemComments.removeAll()
@@ -713,6 +867,10 @@ public enum DocsCorpusExtractor {
         groupDoc: String,
         importPath: String,
         goVersion: String,
+        source: DocsSourceKind,
+        modulePath: String?,
+        moduleVersion: String?,
+        license: String?,
         examples: [String: String]
     ) -> ([DocsChunk], Int) {
         var out: [DocsChunk] = []
@@ -740,14 +898,18 @@ public enum DocsCorpusExtractor {
                 let (sig, nextIdx) = parseTypeSpecBody(lines: lines, startIndex: i, prefixTypeKeyword: true)
                 if isExported(name) {
                     let doc = !itemComments.isEmpty ? itemComments.joined(separator: "\n") : groupDoc
-                    out.append(makeStdlibChunk(
+                    out.append(makePackageChunk(
                         importPath: importPath,
                         symbol: name,
                         kind: .type,
                         signature: sig,
                         doc: doc,
                         example: examples[name],
-                        goVersion: goVersion
+                        goVersion: goVersion,
+                        source: source,
+                        modulePath: modulePath,
+                        moduleVersion: moduleVersion,
+                        license: license
                     ))
                 }
                 itemComments.removeAll()
@@ -1088,11 +1250,15 @@ public enum DocsCorpusExtractor {
         return result
     }
 
-    /// Builds a dedicated `.example` `DocsChunk` with `.officialExample` provenance and a FR-31 non-colliding stable ID (Issue #25).
+    /// Builds a dedicated `.example` `DocsChunk` with `.officialExample` provenance and a FR-31 non-colliding stable ID (Issue #25, #27).
     private static func makeExampleChunk(
         example ex: ParsedGoExample,
         importPath: String,
-        goVersion: String
+        goVersion: String,
+        source: DocsSourceKind = .stdlib,
+        modulePath: String? = nil,
+        moduleVersion: String? = nil,
+        license: String? = nil
     ) -> DocsChunk {
         let targetDisplay = ex.targetSymbol.isEmpty ? importPath : "\(importPath).\(ex.targetSymbol)"
         let humanizedSuffix = ex.suffix.map(humanizeExampleSuffix).flatMap { $0.isEmpty ? nil : $0 }
@@ -1105,12 +1271,13 @@ public enum DocsCorpusExtractor {
         }
 
         let summary: String
+        let prefix = source == .dependency ? "Example" : "Official Go example"
         if !ex.docComment.isEmpty {
             summary = firstSentence(of: ex.docComment)
         } else if let desc = humanizedSuffix {
-            summary = "Official Go example for \(targetDisplay) — \(desc)."
+            summary = "\(prefix) for \(targetDisplay) — \(desc)."
         } else {
-            summary = "Official Go example for \(targetDisplay)."
+            summary = "\(prefix) for \(targetDisplay)."
         }
 
         var bodyParts: [String] = []
@@ -1124,7 +1291,7 @@ public enum DocsCorpusExtractor {
 
         return DocsChunk(
             goVersion: goVersion,
-            source: .stdlib,
+            source: source,
             provenance: .officialExample,
             packageName: importPath,
             documentID: importPath,
@@ -1136,7 +1303,10 @@ public enum DocsCorpusExtractor {
             summary: summary,
             signature: "func \(ex.functionName)()",
             example: ex.code,
-            body: bodyParts.joined(separator: "\n\n")
+            body: bodyParts.joined(separator: "\n\n"),
+            modulePath: modulePath,
+            moduleVersion: moduleVersion,
+            license: license
         )
     }
 

@@ -1,12 +1,13 @@
 import CryptoKit
 import Foundation
 
-/// Authoritative source family for Go documentation chunks (FR-4, FR-8).
+/// Authoritative source family for Go documentation chunks (FR-4, FR-8, Issue #27).
 public enum DocsSourceKind: String, Sendable, Hashable, Codable, CaseIterable {
     case spec
     case guide
     case stdlib
     case release
+    case dependency
 
     public var displayName: String {
         switch self {
@@ -14,6 +15,7 @@ public enum DocsSourceKind: String, Sendable, Hashable, Codable, CaseIterable {
         case .guide: return "Effective Go / Official Guide"
         case .stdlib: return "Go Standard Library"
         case .release: return "Go Release Notes"
+        case .dependency: return "Dependency Package"
         }
     }
 }
@@ -75,6 +77,12 @@ public struct DocsChunk: Sendable, Hashable, Codable {
     public var searchAliases: [String]
     /// Deterministic SHA-256 hash of all semantic & embedding inputs (FR-25, FR-30, FR-31, M-8).
     public var contentHash: String
+    /// For `.dependency` chunks: Go module path (e.g. `"github.com/go-chi/chi/v5"`). `nil` for stdlib/spec/guide/release (Issue #27).
+    public var modulePath: String?
+    /// For `.dependency` chunks: exact module version from `go.mod` / `go.work` (e.g. `"v5.1.0"`). `nil` for stdlib (Issue #27).
+    public var moduleVersion: String?
+    /// For `.dependency` chunks: optional concise SPDX-style license identifier (e.g. `"MIT"`, `"Apache-2.0"`), detected from module root (DES-DEP-4).
+    public var license: String?
 
     public init(
         goVersion: String,
@@ -91,7 +99,10 @@ public struct DocsChunk: Sendable, Hashable, Codable {
         signature: String? = nil,
         example: String? = nil,
         body: String,
-        searchAliases: [String] = []
+        searchAliases: [String] = [],
+        modulePath: String? = nil,
+        moduleVersion: String? = nil,
+        license: String? = nil
     ) {
         let resolvedDocID = documentID ?? (packageName.isEmpty ? source.rawValue : packageName)
         self.stableID = Self.makeStableID(
@@ -117,6 +128,9 @@ public struct DocsChunk: Sendable, Hashable, Codable {
         self.example = example
         self.body = body
         self.searchAliases = searchAliases
+        self.modulePath = modulePath
+        self.moduleVersion = moduleVersion
+        self.license = license
         self.contentHash = Self.computeContentHash(
             stableID: self.stableID,
             title: title,
@@ -147,7 +161,10 @@ public struct DocsChunk: Sendable, Hashable, Codable {
         example: String?,
         body: String,
         searchAliases: [String],
-        storedContentHash: String
+        storedContentHash: String,
+        modulePath: String? = nil,
+        moduleVersion: String? = nil,
+        license: String? = nil
     ) {
         self.stableID = restoredStableID
         self.goVersion = goVersion
@@ -166,6 +183,9 @@ public struct DocsChunk: Sendable, Hashable, Codable {
         self.body = body
         self.searchAliases = searchAliases
         self.contentHash = storedContentHash
+        self.modulePath = modulePath
+        self.moduleVersion = moduleVersion
+        self.license = license
     }
 
     /// FR-31 & H-6: deterministic, version-independent ID including document identity.
@@ -237,6 +257,24 @@ public struct DocsChunk: Sendable, Hashable, Codable {
         case .spec, .guide, .release:
             let suffix = anchor.isEmpty ? title : "\(title) (\(anchor))"
             return "\(sourceLabel): \(suffix)"
+        case .dependency:
+            let modHeader: String
+            if let mp = modulePath, let mv = moduleVersion, !mp.isEmpty, !mv.isEmpty {
+                modHeader = "\(mp)@\(mv)"
+            } else {
+                modHeader = source.displayName
+            }
+            let licTag = (license.map { !$0.isEmpty } == true) ? " [\(license!)]" : ""
+            if provenance == .officialExample {
+                let target = symbol.isEmpty ? packageName : "\(packageName).\(symbol)"
+                let exampleFn = anchor.split(separator: ".").last.map(String.init) ?? ""
+                if !exampleFn.isEmpty && exampleFn != symbol {
+                    return "\(modHeader) [Example]\(licTag): \(target) (\(exampleFn))"
+                }
+                return "\(modHeader) [Example]\(licTag): \(target)"
+            }
+            let sym = symbol.isEmpty ? packageName : "\(packageName).\(symbol)"
+            return "\(modHeader)\(licTag): \(sym)"
         }
     }
 
@@ -342,6 +380,49 @@ public struct DocsPackManifest: Sendable, Hashable, Codable {
         embeddingModelVersion = try c.decodeIfPresent(String.self, forKey: .embeddingModelVersion)
         sizeBytes = try c.decodeIfPresent(Int64.self, forKey: .sizeBytes) ?? 0
         schemaVersion = try c.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
+    }
+}
+
+/// Metadata stored alongside a module-unit dependency documentation pack (Issue #27, DES-DEP-1, DES-DEP-4).
+public struct DocsDependencyPackManifest: Sendable, Hashable, Codable {
+    public var modulePath: String
+    public var moduleVersion: String
+    public var storageKey: String
+    public var createdAt: String
+    /// Concise SPDX-style license identifier (e.g. `"MIT"`, `"Apache-2.0"`), or `nil` when undetected.
+    public var license: String?
+    public var chunkCount: Int
+    public var status: DocsPackStatus
+    public var embeddingModelID: String?
+    public var embeddingModelVersion: String?
+    public var sizeBytes: Int64
+
+    public var key: GoModuleKey {
+        GoModuleKey(modulePath: modulePath, version: moduleVersion)
+    }
+
+    public init(
+        modulePath: String,
+        moduleVersion: String,
+        storageKey: String? = nil,
+        createdAt: String,
+        license: String? = nil,
+        chunkCount: Int,
+        status: DocsPackStatus,
+        embeddingModelID: String? = nil,
+        embeddingModelVersion: String? = nil,
+        sizeBytes: Int64 = 0
+    ) {
+        self.modulePath = modulePath
+        self.moduleVersion = moduleVersion
+        self.storageKey = storageKey ?? GoModuleKey(modulePath: modulePath, version: moduleVersion).storageKey
+        self.createdAt = createdAt
+        self.license = license
+        self.chunkCount = chunkCount
+        self.status = status
+        self.embeddingModelID = embeddingModelID
+        self.embeddingModelVersion = embeddingModelVersion
+        self.sizeBytes = sizeBytes
     }
 }
 

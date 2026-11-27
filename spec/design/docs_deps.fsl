@@ -1,0 +1,386 @@
+// og — Offline Go dependency library documentation lookup design (GoModuleResolver + DocsPackManager + ResearchService)
+//
+// Refines: spec/req/docs_deps.fsl (mapping: spec/design/docs_deps_refines_req.fsl)
+//
+// DES-DEP-1: Dependency packs are stored per `(modulePath, moduleVersion)` unit under
+//            `packs/deps/<hash>/` with `manifest.json` + `index.sqlite` and share vectors via
+//            `SharedVectorStore` keyed by `(content_hash, model_id, model_version)` so unchanged
+//            symbols across module versions reuse embeddings without recomputation.
+// DES-DEP-2: Active dependencies for a project are resolved from `go.mod` / `go.work` (including
+//            MVS version selection and `replace` directives) and matched strictly against local
+//            `GOMODCACHE` using Go's `!`-lowercase path escaping. Uncached dependencies are marked
+//            `.missingFromCache` and never substituted with another version or auto-downloaded.
+// DES-DEP-3: Ingestion uses the same GoDoc + Example extractor as stdlib (skipping nested
+//            submodules with `go.mod`, `internal/`, `vendor/`, `testdata/`, `cmd/`), runs in a
+//            staging directory with chunk-level checkpoints (`chunks_done`) for pause/resume/cancel
+//            on large dependencies, and activates atomically.
+// DES-DEP-4: License attribution — detect a concise SPDX-style license identifier (MIT, Apache-2.0,
+//            BSD-3-Clause, BSD-2-Clause, ISC, MPL-2.0, etc.) from the module root LICENSE/COPYING
+//            file and store it in manifest and chunk/card metadata for lightweight citation display
+//            without duplicating full license prose in SQLite.
+//
+// ASSUME-1 (representation only): two dependency versions, two embedding models, TOTAL_CHUNKS = 2.
+spec DocsDepsDesign {
+  number DepVer
+  number ModelId
+  number ChunkDone
+  const TOTAL_CHUNKS = 2
+
+  enum Host { Loopback, Elsewhere }
+  enum DDepPackState { DMissing, DFTSOnly, DReady }
+  enum DDepStagePhase { DIdle, DExtracting, DFTSBuilt, DEmbedded }
+  enum DDepAnswerKind { DNoAnswer, DDepCards, DDepNotFound, DDepUncached }
+
+  state {
+    endpoint:             Host,
+    enabled:              Bool,
+    project_dep_ver:      Option<DepVer>,
+    cache_present:        Map<DepVer, Bool>,
+    pack_state:           Map<DepVer, DDepPackState>,
+    pack_model:           Map<DepVer, ModelId>,
+    selected_model:       ModelId,
+    // DES-DEP-3: staging & chunk-level resumable batch state
+    batch_ver:            Option<DepVer>,
+    stage_phase:          DDepStagePhase,
+    batch_model:          ModelId,
+    batch_paused:         Bool,
+    chunks_done:          ChunkDone,
+    // Answer state
+    answer_kind:          DDepAnswerKind,
+    answer_ver:           Option<DepVer>,
+    answer_has_citation:  Bool,
+    answer_has_scope:     Bool,
+    answer_used_semantic: Bool,
+    inserted:             Bool,
+    sent_remote:          Bool,
+    auto_downloaded:      Bool
+  }
+
+  init {
+    endpoint = Loopback
+    enabled = false
+    project_dep_ver = none
+    selected_model = 0
+    batch_ver = none
+    stage_phase = DIdle
+    batch_model = 0
+    batch_paused = false
+    chunks_done = 0
+    answer_kind = DNoAnswer
+    answer_ver = none
+    answer_has_citation = false
+    answer_has_scope = false
+    answer_used_semantic = false
+    inserted = false
+    sent_remote = false
+    auto_downloaded = false
+    forall dv: DepVer {
+      cache_present[dv] = false
+      pack_state[dv] = DMissing
+      pack_model[dv] = 0
+    }
+  }
+
+  action set_endpoint(h: Host) "DES-DEP-1: only loopback endpoints are accepted" {
+    requires h == Loopback
+    endpoint = h
+  }
+
+  action enable() "DES-DEP-1: enable offline Go docs lookup" {
+    requires not enabled
+    enabled = true
+  }
+
+  action disable() "DES-DEP-1: disable lookup and clear answers" {
+    requires enabled
+    enabled = false
+    answer_kind = DNoAnswer
+    answer_ver = none
+    answer_has_citation = false
+    answer_has_scope = false
+    answer_used_semantic = false
+  }
+
+  action set_project_dep(dv: DepVer) "DES-DEP-2: resolve active dependency set from project go.mod/go.work" {
+    requires project_dep_ver != some(dv)
+    project_dep_ver = some(dv)
+    answer_kind = DNoAnswer
+    answer_ver = none
+    answer_has_citation = false
+    answer_has_scope = false
+    answer_used_semantic = false
+  }
+
+  action clear_project_dep() "DES-DEP-2: switch to stdlib-only project" {
+    requires project_dep_ver != none
+    project_dep_ver = none
+    answer_kind = DNoAnswer
+    answer_ver = none
+    answer_has_citation = false
+    answer_has_scope = false
+    answer_used_semantic = false
+  }
+
+  action set_cache_present(dv: DepVer, present: Bool) "DES-DEP-2: observe local GOMODCACHE presence" {
+    requires present != cache_present[dv]
+    cache_present[dv] = present
+    if answer_kind == DDepUncached and answer_ver == some(dv) {
+      answer_kind = DNoAnswer
+      answer_ver = none
+      answer_has_citation = false
+      answer_has_scope = false
+      answer_used_semantic = false
+    }
+  }
+
+  // MARK: - Staged, chunk-checkpointed dependency ingestion (DES-DEP-3)
+
+  action batch_start(dv: DepVer) "DES-DEP-3: begin staged module extraction from verified GOMODCACHE directory" {
+    requires stage_phase == DIdle
+    requires cache_present[dv]
+    batch_ver = some(dv)
+    stage_phase = DExtracting
+    batch_model = selected_model
+    batch_paused = false
+    chunks_done = 0
+    auto_downloaded = auto_downloaded or not cache_present[dv]
+  }
+
+  fair action batch_build_fts_initial(dv: DepVer) "DES-DEP-3: initial extraction publishes FTS-only dependency pack while embeddings run" {
+    requires batch_ver == some(dv)
+    requires stage_phase == DExtracting
+    requires not batch_paused
+    requires batch_model == selected_model
+    requires pack_state[dv] == DMissing
+    stage_phase = DFTSBuilt
+    pack_state[dv] = DFTSOnly
+    if answer_kind == DDepUncached and answer_ver == some(dv) {
+      answer_kind = DNoAnswer
+      answer_ver = none
+      answer_has_citation = false
+      answer_has_scope = false
+      answer_used_semantic = false
+    }
+  }
+
+  fair action batch_build_fts_update(dv: DepVer) "DES-DEP-3: staged FTS rebuild for existing dependency pack leaves active pack untouched" {
+    requires batch_ver == some(dv)
+    requires stage_phase == DExtracting
+    requires not batch_paused
+    requires batch_model == selected_model
+    requires pack_state[dv] != DMissing
+    stage_phase = DFTSBuilt
+  }
+
+  action batch_pause() "DES-DEP-3: pause dependency batch preserving chunk checkpoint" {
+    requires stage_phase != DIdle
+    requires not batch_paused
+    batch_paused = true
+  }
+
+  action batch_resume() "DES-DEP-3: resume paused dependency batch from checkpoint" {
+    requires stage_phase != DIdle
+    requires batch_paused
+    requires batch_model == selected_model
+    batch_paused = false
+  }
+
+  fair action batch_embed_chunk(dv: DepVer) "DES-DEP-3: embed or reuse one dependency chunk and checkpoint progress" {
+    requires batch_ver == some(dv)
+    requires stage_phase == DFTSBuilt
+    requires not batch_paused
+    requires batch_model == selected_model
+    requires chunks_done < TOTAL_CHUNKS
+    chunks_done = chunks_done + 1
+    if chunks_done + 1 == TOTAL_CHUNKS { stage_phase = DEmbedded }
+  }
+
+  fair action batch_commit(dv: DepVer) "DES-DEP-3: atomically swap staged dependency pack to Ready" {
+    requires batch_ver == some(dv)
+    requires stage_phase == DEmbedded
+    requires not batch_paused
+    requires batch_model == selected_model
+    pack_state[dv] = DReady
+    pack_model[dv] = selected_model
+    batch_ver = none
+    stage_phase = DIdle
+    batch_paused = false
+    chunks_done = 0
+    if answer_kind == DDepUncached and answer_ver == some(dv) {
+      answer_kind = DNoAnswer
+      answer_ver = none
+      answer_has_citation = false
+      answer_has_scope = false
+      answer_used_semantic = false
+    }
+  }
+
+  action batch_abort() "DES-DEP-3: discard staged dependency build without affecting active pack" {
+    requires stage_phase != DIdle
+    batch_ver = none
+    stage_phase = DIdle
+    batch_paused = false
+    chunks_done = 0
+  }
+
+  action delete_dep_pack(dv: DepVer) "DES-DEP-1: remove dependency pack and cancel matching staging batch" {
+    requires pack_state[dv] != DMissing
+    pack_state[dv] = DMissing
+    if batch_ver == some(dv) {
+      batch_ver = none
+      stage_phase = DIdle
+      batch_paused = false
+      chunks_done = 0
+    }
+    if answer_ver == some(dv) {
+      answer_kind = DNoAnswer
+      answer_ver = none
+      answer_has_citation = false
+      answer_has_scope = false
+      answer_used_semantic = false
+    }
+  }
+
+  action select_embed_model(m: ModelId) "DES-DEP-1: switching embedding model aborts staging and demotes Ready dependency packs" {
+    requires m != selected_model
+    selected_model = m
+    batch_ver = none
+    stage_phase = DIdle
+    batch_paused = false
+    chunks_done = 0
+    forall dv: DepVer {
+      if pack_state[dv] == DReady and pack_model[dv] != m {
+        pack_state[dv] = DFTSOnly
+      }
+    }
+    if answer_used_semantic {
+      answer_kind = DNoAnswer
+      answer_ver = none
+      answer_has_citation = false
+      answer_has_scope = false
+      answer_used_semantic = false
+    }
+  }
+
+  // MARK: - Unified version-exact lookup (DES-DEP-2, DES-DEP-4)
+
+  action query_dep_found(dv: DepVer, use_semantic: Bool) "DES-DEP-2: return grounded dependency card(s) strictly matching active go.mod/go.work version" {
+    requires enabled
+    requires project_dep_ver == some(dv)
+    requires pack_state[dv] != DMissing
+    requires (not use_semantic) or (pack_state[dv] == DReady and pack_model[dv] == selected_model)
+    answer_kind = DDepCards
+    answer_ver = some(dv)
+    answer_has_citation = true
+    answer_has_scope = true
+    answer_used_semantic = use_semantic
+    sent_remote = sent_remote or endpoint == Elsewhere
+  }
+
+  action query_dep_not_found(dv: DepVer) "DES-DEP-2: return honest Not Found when active dependency pack has no match" {
+    requires enabled
+    requires project_dep_ver == some(dv)
+    requires pack_state[dv] != DMissing
+    answer_kind = DDepNotFound
+    answer_ver = some(dv)
+    answer_has_citation = false
+    answer_has_scope = true
+    answer_used_semantic = pack_state[dv] == DReady and pack_model[dv] == selected_model
+    sent_remote = sent_remote or endpoint == Elsewhere
+  }
+
+  action query_dep_uncached(dv: DepVer) "DES-DEP-2: report uncached dependency without substituting another version" {
+    requires enabled
+    requires project_dep_ver == some(dv)
+    requires not cache_present[dv]
+    requires pack_state[dv] == DMissing
+    answer_kind = DDepUncached
+    answer_ver = some(dv)
+    answer_has_citation = false
+    answer_has_scope = true
+    answer_used_semantic = false
+  }
+
+  action insert_dep_card() "DES-DEP-2: insert grounded dependency snippet for active project version" {
+    requires enabled
+    requires answer_kind == DDepCards
+    requires answer_ver is some(dv) and project_dep_ver == some(dv)
+    requires answer_has_citation
+    inserted = true
+  }
+
+  // MARK: - Invariants & Progress
+
+  invariant EndpointIsLoopback "DES-DEP-1: validated endpoint is always loopback" {
+    endpoint == Loopback
+  }
+
+  invariant NeverLeavesMachine "DES-DEP-1: no data ever leaves the machine" {
+    not sent_remote
+  }
+
+  invariant NeverAutoDownloads "DES-DEP-2: no automatic network download ever runs" {
+    not auto_downloaded
+  }
+
+  invariant BatchStateConsistent "DES-DEP-3: staging batch state and chunk progress stay consistent" {
+    (stage_phase == DIdle => (batch_ver == none and not batch_paused and chunks_done == 0)) and
+    (stage_phase != DIdle => (batch_ver != none and batch_model == selected_model)) and
+    (stage_phase == DExtracting => chunks_done == 0) and
+    (stage_phase == DFTSBuilt => chunks_done < TOTAL_CHUNKS) and
+    (stage_phase == DEmbedded => chunks_done == TOTAL_CHUNKS)
+  }
+
+  invariant DepCardsMatchActiveProjectVersion "MODEL-1: induction aid" {
+    answer_kind == DDepCards => (
+      enabled and
+      answer_ver is some(dv) and
+      project_dep_ver == some(dv) and
+      pack_state[dv] != DMissing and
+      answer_has_citation and
+      answer_has_scope
+    )
+  }
+
+  invariant StdlibOnlyProjectNeverReturnsDepCards "MODEL-2: induction aid" {
+    project_dep_ver == none => answer_kind != DDepCards
+  }
+
+  invariant UncachedReportedWithoutSubstitution "MODEL-3: induction aid" {
+    answer_kind == DDepUncached => (
+      enabled and
+      answer_ver is some(dv) and
+      project_dep_ver == some(dv) and
+      not cache_present[dv] and
+      pack_state[dv] == DMissing and
+      not answer_has_citation and
+      answer_has_scope
+    )
+  }
+
+  invariant ReadyDepPackMatchesModel "MODEL-4: induction aid" {
+    forall dv: DepVer { pack_state[dv] == DReady => pack_model[dv] == selected_model }
+  }
+
+  invariant SemanticRequiresMatchingModel "MODEL-5: induction aid" {
+    answer_used_semantic => (
+      answer_ver is some(dv) and
+      pack_state[dv] == DReady and
+      pack_model[dv] == selected_model
+    )
+  }
+
+  invariant DisabledHasNoAnswer "MODEL-6: induction aid" {
+    not enabled => answer_kind == DNoAnswer
+  }
+
+  leadsTo DepBatchSettles "DES-DEP-3: an unpaused dependency ingestion batch eventually finishes or pauses" {
+    (stage_phase != DIdle and not batch_paused) ~> (stage_phase == DIdle or batch_paused)
+  }
+}
+
+verify {
+  values DepVer = 0..1
+  values ModelId = 0..1
+  values ChunkDone = 0..2
+}

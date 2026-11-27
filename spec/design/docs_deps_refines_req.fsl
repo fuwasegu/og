@@ -1,0 +1,38 @@
+// DocsDepsDesign ⊑ DocsDeps
+// Chunk-level staged dependency ingestion, loopback validation, and exact go.mod/go.work
+// version gating refine the requirements-level dependency docs contract.
+refinement DocsDepsRefinesReq {
+  impl DocsDepsDesign
+  abs  DocsDeps
+  maps auto
+
+  map pack_state[dv: DepVer] =
+    if pack_state[dv] == DReady then Ready
+    else if pack_state[dv] == DFTSOnly then IndexingFTSOnly
+    else Missing
+
+  map batch_state =
+    if stage_phase == DIdle then BIdle
+    else if batch_paused then BPaused
+    else BRunning
+
+  map answer_kind =
+    if answer_kind == DDepCards then DepCards
+    else if answer_kind == DDepNotFound then DepNotFound
+    else if answer_kind == DDepUncached then DepUncached
+    else NoAnswer
+
+  action set_endpoint(h)                -> stutter
+  action batch_start(dv)                -> start_dep_batch(dv)
+  action batch_build_fts_initial(dv)    -> publish_dep_fts(dv)
+  action batch_build_fts_update(dv)     -> stutter
+  action batch_pause()                  -> pause_dep_batch()
+  action batch_resume()                 -> resume_dep_batch()
+  action batch_embed_chunk(dv)          -> stutter
+  action batch_commit(dv)               -> complete_dep_batch(dv)
+  action batch_abort()                  -> abort_dep_batch()
+  action query_dep_found(dv, use_semantic)
+    -> query_dep_found(Local, dv, use_semantic)
+  action query_dep_not_found(dv)
+    -> query_dep_not_found(Local, dv)
+}

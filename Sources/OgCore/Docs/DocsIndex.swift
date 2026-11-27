@@ -28,6 +28,7 @@ public final class DocsIndex: @unchecked Sendable {
     private var db: OpaquePointer?
     private let hasDocumentIDColumn: Bool
     private let hasProvenanceColumn: Bool
+    private let hasDependencyColumns: Bool
 
     public init(databaseURL: URL, readOnly: Bool = false) throws {
         self.databaseURL = databaseURL
@@ -53,9 +54,11 @@ public final class DocsIndex: @unchecked Sendable {
             try Self.initializeSchema(db: handle)
             self.hasDocumentIDColumn = true
             self.hasProvenanceColumn = true
+            self.hasDependencyColumns = true
         } else {
             self.hasDocumentIDColumn = Self.tableHasColumn(db: handle, table: "chunks", column: "document_id")
             self.hasProvenanceColumn = Self.tableHasColumn(db: handle, table: "chunks", column: "provenance")
+            self.hasDependencyColumns = Self.tableHasColumn(db: handle, table: "chunks", column: "module_path")
         }
     }
 
@@ -111,7 +114,10 @@ public final class DocsIndex: @unchecked Sendable {
             example TEXT,
             body TEXT NOT NULL,
             search_aliases TEXT NOT NULL,
-            content_hash TEXT NOT NULL
+            content_hash TEXT NOT NULL,
+            module_path TEXT,
+            module_version TEXT,
+            license TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_chunks_pkg_sym ON chunks (package_name, symbol);
@@ -146,6 +152,15 @@ public final class DocsIndex: @unchecked Sendable {
         if !Self.tableHasColumn(db: db, table: "chunks", column: "provenance") {
             try SQLiteHelpers.exec(db: db, sql: "ALTER TABLE chunks ADD COLUMN provenance TEXT NOT NULL DEFAULT 'official_extracted';")
         }
+        if !Self.tableHasColumn(db: db, table: "chunks", column: "module_path") {
+            try SQLiteHelpers.exec(db: db, sql: "ALTER TABLE chunks ADD COLUMN module_path TEXT;")
+        }
+        if !Self.tableHasColumn(db: db, table: "chunks", column: "module_version") {
+            try SQLiteHelpers.exec(db: db, sql: "ALTER TABLE chunks ADD COLUMN module_version TEXT;")
+        }
+        if !Self.tableHasColumn(db: db, table: "chunks", column: "license") {
+            try SQLiteHelpers.exec(db: db, sql: "ALTER TABLE chunks ADD COLUMN license TEXT;")
+        }
     }
 
     private static func tableHasColumn(db: OpaquePointer, table: String, column: String) -> Bool {
@@ -172,8 +187,8 @@ public final class DocsIndex: @unchecked Sendable {
                 INSERT INTO chunks (
                     stable_id, go_version, source, provenance, package_name, document_id, symbol, kind,
                     title, anchor, since, summary, signature, example, body,
-                    search_aliases, content_hash
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17);
+                    search_aliases, content_hash, module_path, module_version, license
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20);
                 """
                 let insertFTS = """
                 INSERT INTO chunks_fts (
@@ -214,6 +229,9 @@ public final class DocsIndex: @unchecked Sendable {
                     SQLiteHelpers.bindText(chunkStmt, index: 15, value: c.body)
                     SQLiteHelpers.bindText(chunkStmt, index: 16, value: aliasesJSON)
                     SQLiteHelpers.bindText(chunkStmt, index: 17, value: c.contentHash)
+                    SQLiteHelpers.bindOptionalText(chunkStmt, index: 18, value: c.modulePath)
+                    SQLiteHelpers.bindOptionalText(chunkStmt, index: 19, value: c.moduleVersion)
+                    SQLiteHelpers.bindOptionalText(chunkStmt, index: 20, value: c.license)
                     guard sqlite3_step(chunkStmt) == SQLITE_DONE else {
                         throw DocsStorageError.sqlite(String(cString: sqlite3_errmsg(db)))
                     }
@@ -446,12 +464,18 @@ public final class DocsIndex: @unchecked Sendable {
 
         var pkgPart: String?
         var symPart: String?
-        if let dot = needle.firstIndex(of: ".") {
+        if let dot = needle.lastIndex(of: ".") {
             let p = String(needle[..<dot]).lowercased()
             let s = String(needle[needle.index(after: dot)...]).lowercased()
+            // Handle `pkg.Type.Method` as well as `github.com/go-chi/chi/v5.NewRouter`.
             if !p.isEmpty && !s.isEmpty {
-                pkgPart = p
-                symPart = s
+                if let firstDot = needle.firstIndex(of: "."), firstDot != dot, !needle[..<firstDot].contains("/") && !needle[..<firstDot].contains(".") {
+                    pkgPart = String(needle[..<firstDot]).lowercased()
+                    symPart = String(needle[needle.index(after: firstDot)...]).lowercased()
+                } else {
+                    pkgPart = p
+                    symPart = s
+                }
             }
         }
 
@@ -461,7 +485,7 @@ public final class DocsIndex: @unchecked Sendable {
             if let pkgPart, let symPart {
                 sql = selectColumns + """
                  FROM chunks
-                WHERE (lower(package_name) = ?1 OR lower(package_name) LIKE ?2)
+                WHERE (lower(package_name) = ?1 OR lower(package_name) LIKE ?2 OR lower(package_name) LIKE ?5)
                   AND (lower(symbol) = ?3 OR lower(symbol) LIKE ?4)
                 ORDER BY CASE WHEN kind = 'example' THEN 1 ELSE 0 END, stable_id ASC
                 LIMIT 64;
@@ -474,12 +498,14 @@ public final class DocsIndex: @unchecked Sendable {
                 SQLiteHelpers.bindText(stmt, index: 2, value: "%/" + pkgPart)
                 SQLiteHelpers.bindText(stmt, index: 3, value: symPart)
                 SQLiteHelpers.bindText(stmt, index: 4, value: symPart + ".%")
+                SQLiteHelpers.bindText(stmt, index: 5, value: "%/" + pkgPart + "/v%")
                 return try Self.collectChunks(stmt: stmt, db: db)
             } else {
                 sql = selectColumns + """
                  FROM chunks
                 WHERE lower(package_name) = ?1
                    OR lower(package_name) LIKE ?2
+                   OR lower(package_name) LIKE ?3
                    OR lower(symbol) = ?1
                 ORDER BY CASE WHEN kind = 'example' THEN 1 ELSE 0 END, stable_id ASC
                 LIMIT 64;
@@ -490,6 +516,7 @@ public final class DocsIndex: @unchecked Sendable {
                 defer { sqlite3_finalize(stmt) }
                 SQLiteHelpers.bindText(stmt, index: 1, value: lower)
                 SQLiteHelpers.bindText(stmt, index: 2, value: "%/" + lower)
+                SQLiteHelpers.bindText(stmt, index: 3, value: "%/" + lower + "/v%")
                 return try Self.collectChunks(stmt: stmt, db: db)
             }
         }
@@ -497,7 +524,7 @@ public final class DocsIndex: @unchecked Sendable {
         var hits: [DocsIndexHit] = []
         for chunk in candidates {
             let cPkg = chunk.packageName.lowercased()
-            let cShortPkg = cPkg.split(separator: "/").last.map(String.init) ?? cPkg
+            let cShortPkg = Self.shortPackageName(for: cPkg)
             let cSym = chunk.symbol.lowercased()
             let full = cPkg.isEmpty ? cSym : "\(cPkg).\(cSym)"
             let shortFull = cShortPkg.isEmpty ? cSym : "\(cShortPkg).\(cSym)"
@@ -540,10 +567,13 @@ public final class DocsIndex: @unchecked Sendable {
         var hits: [DocsIndexHit] = try withDB { db in
             let provCol = hasProvenanceColumn ? "c.provenance" : "'official_extracted' AS provenance"
             let docCol = hasDocumentIDColumn ? "c.document_id" : "'' AS document_id"
+            let depCols = hasDependencyColumns
+                ? "c.module_path, c.module_version, c.license"
+                : "NULL AS module_path, NULL AS module_version, NULL AS license"
             let sql = """
             SELECT c.stable_id, c.go_version, c.source, \(provCol), c.package_name, \(docCol), c.symbol, c.kind,
                    c.title, c.anchor, c.since, c.summary, c.signature, c.example, c.body,
-                   c.search_aliases, c.content_hash,
+                   c.search_aliases, c.content_hash, \(depCols),
                    bm25(chunks_fts, 0.0, 4.0, 3.0, 5.0, 2.5, 1.0, 4.5) AS rank
             FROM chunks_fts
             JOIN chunks c ON c.stable_id = chunks_fts.stable_id
@@ -564,7 +594,7 @@ public final class DocsIndex: @unchecked Sendable {
                 let rc = sqlite3_step(stmt)
                 if rc == SQLITE_ROW {
                     let chunk = Self.decodeChunk(stmt: stmt, offset: 0)
-                    let bm25 = sqlite3_column_double(stmt, 17)
+                    let bm25 = sqlite3_column_double(stmt, 20)
                     let normalized = max(0.1, -bm25)
                     out.append(DocsIndexHit(chunk: chunk, score: normalized, matchedBy: .fts5))
                 } else if rc == SQLITE_DONE {
@@ -666,13 +696,27 @@ public final class DocsIndex: @unchecked Sendable {
 
     // MARK: - Decoding (H-7: zero SHA-256 recomputation; L-1: JSON aliases; L-3: error propagation)
 
+    /// Returns the idiomatic Go short package name for an import path, stripping trailing major-version segments
+    /// like `/v2`, `/v5` (e.g. `github.com/go-chi/chi/v5` -> `chi`).
+    public static func shortPackageName(for importPath: String) -> String {
+        let parts = importPath.split(separator: "/").map(String.init)
+        guard let last = parts.last else { return importPath }
+        if parts.count >= 2, last.hasPrefix("v"), last.count >= 2, last.dropFirst().allSatisfy(\.isNumber) {
+            return parts[parts.count - 2]
+        }
+        return last
+    }
+
     private var selectColumns: String {
         let provCol = hasProvenanceColumn ? "provenance" : "'official_extracted' AS provenance"
         let docCol = hasDocumentIDColumn ? "document_id" : "'' AS document_id"
+        let depCols = hasDependencyColumns
+            ? "module_path, module_version, license"
+            : "NULL AS module_path, NULL AS module_version, NULL AS license"
         return """
         SELECT stable_id, go_version, source, \(provCol), package_name, \(docCol), symbol, kind,
                title, anchor, since, summary, signature, example, body,
-               search_aliases, content_hash
+               search_aliases, content_hash, \(depCols)
         """
     }
 
@@ -709,6 +753,9 @@ public final class DocsIndex: @unchecked Sendable {
         let body = SQLiteHelpers.columnText(stmt, index: offset + 14)
         let aliasesRaw = SQLiteHelpers.columnText(stmt, index: offset + 15)
         let storedHash = SQLiteHelpers.columnText(stmt, index: offset + 16)
+        let modulePath = SQLiteHelpers.columnOptionalText(stmt, index: offset + 17)
+        let moduleVersion = SQLiteHelpers.columnOptionalText(stmt, index: offset + 18)
+        let license = SQLiteHelpers.columnOptionalText(stmt, index: offset + 19)
 
         let aliases: [String]
         if aliasesRaw.hasPrefix("["),
@@ -738,7 +785,10 @@ public final class DocsIndex: @unchecked Sendable {
             example: example,
             body: body,
             searchAliases: aliases,
-            storedContentHash: storedHash
+            storedContentHash: storedHash,
+            modulePath: modulePath,
+            moduleVersion: moduleVersion,
+            license: license
         )
     }
 }

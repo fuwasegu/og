@@ -29,6 +29,7 @@ final class ProjectContext {
     }
     private var watcher: FileWatcher?
     private var gitRefreshTask: Task<Void, Never>?
+    private var depDocsSyncTask: Task<Void, Never>?
 
     init(root: URL) {
         self.root = root.standardizedFileURL
@@ -58,12 +59,16 @@ final class ProjectContext {
         Task { await gopls.start() }
         Task { await index.refresh() }
         refreshGit()
+        if DocsManager.shared.enabled {
+            DocsManager.shared.syncProjectDependencies(projectRoot: root)
+        }
         watcher = FileWatcher(root: root) { paths in
             Task { @MainActor [weak self] in self?.filesChanged(paths) }
         }
     }
 
     func shutdown() {
+        depDocsSyncTask?.cancel()
         documents.autosaveAll()
         window?.bottomPanel.debugPanel.stop()
         window?.bottomPanel.terminalPanel.terminateAll()
@@ -174,8 +179,21 @@ final class ProjectContext {
             let index = self.index
             Task { await index.refresh() }
             NotificationCenter.default.post(name: .ogFilesChanged, object: self, userInfo: ["paths": worktree])
+            if DocsManager.shared.enabled && worktree.contains(where: { $0.hasSuffix("/go.mod") || $0.hasSuffix("/go.work") }) {
+                scheduleDependencyDocsSync()
+            }
         }
         if gitTouched || !worktree.isEmpty { refreshGit() }
+    }
+
+    private func scheduleDependencyDocsSync() {
+        depDocsSyncTask?.cancel()
+        let projectRoot = root
+        depDocsSyncTask = Task {
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            guard !Task.isCancelled else { return }
+            DocsManager.shared.syncProjectDependencies(projectRoot: projectRoot)
+        }
     }
 
     /// Debounced git status refresh (DES-3).

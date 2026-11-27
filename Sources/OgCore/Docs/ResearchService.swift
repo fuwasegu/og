@@ -57,6 +57,12 @@ public struct DocsAnswerCard: Sendable, Hashable {
     /// True only when a code example exists AND passed the version gate (UX-2, DOC-9).
     public var canInsert: Bool
     public var matchedBy: DocsMatchOrigin
+    /// For `.dependency` cards: module path from `go.mod` / `go.work` (Issue #27).
+    public var modulePath: String?
+    /// For `.dependency` cards: exact module version from `go.mod` / `go.work` (Issue #27).
+    public var moduleVersion: String?
+    /// For `.dependency` cards: optional concise SPDX-style license identifier (DES-DEP-4).
+    public var license: String?
 
     public init(
         stableID: String,
@@ -73,7 +79,10 @@ public struct DocsAnswerCard: Sendable, Hashable {
         goVersion: String,
         since: String?,
         canInsert: Bool,
-        matchedBy: DocsMatchOrigin
+        matchedBy: DocsMatchOrigin,
+        modulePath: String? = nil,
+        moduleVersion: String? = nil,
+        license: String? = nil
     ) {
         self.stableID = stableID
         self.title = title
@@ -90,6 +99,37 @@ public struct DocsAnswerCard: Sendable, Hashable {
         self.since = since
         self.canInsert = canInsert
         self.matchedBy = matchedBy
+        self.modulePath = modulePath
+        self.moduleVersion = moduleVersion
+        self.license = license
+    }
+}
+
+/// Summary of project dependency packs active during a search (Issue #27, DOC-12).
+public struct DocsDependencySearchSummary: Sendable, Hashable {
+    /// Dependencies whose exact-version packs were searched.
+    public var indexedModules: [GoModuleKey]
+    /// Dependencies present in local GOMODCACHE but not yet extracted into a pack.
+    public var unindexedCachedModules: [GoModuleKey]
+    /// Dependencies absent from local GOMODCACHE ("未取得"; never substituted with another version).
+    public var uncachedModules: [GoModuleKey]
+
+    public init(
+        indexedModules: [GoModuleKey] = [],
+        unindexedCachedModules: [GoModuleKey] = [],
+        uncachedModules: [GoModuleKey] = []
+    ) {
+        self.indexedModules = indexedModules
+        self.unindexedCachedModules = unindexedCachedModules
+        self.uncachedModules = uncachedModules
+    }
+
+    public var totalDependencies: Int {
+        indexedModules.count + unindexedCachedModules.count + uncachedModules.count
+    }
+
+    public var hasAnyDependency: Bool {
+        totalDependencies > 0
     }
 }
 
@@ -129,6 +169,8 @@ public struct DocsAnswer: Sendable, Hashable {
     /// Explicit search scope shown on all answers and especially Not Found (FR-14).
     public var searchedScope: String
     public var licenseNotice: String
+    /// Dependency pack coverage for the active project (Issue #27, DOC-12). `nil` for stdlib-only projects.
+    public var dependencySummary: DocsDependencySearchSummary?
 
     public init(
         query: String,
@@ -145,7 +187,8 @@ public struct DocsAnswer: Sendable, Hashable {
         usedLLM: Bool = false,
         usedReranker: Bool = false,
         searchedScope: String = "",
-        licenseNotice: String = DocsLicense.goBSD3Clause
+        licenseNotice: String = DocsLicense.goBSD3Clause,
+        dependencySummary: DocsDependencySearchSummary? = nil
     ) {
         self.query = query
         self.status = status
@@ -162,6 +205,7 @@ public struct DocsAnswer: Sendable, Hashable {
         self.usedReranker = usedReranker
         self.searchedScope = searchedScope
         self.licenseNotice = licenseNotice
+        self.dependencySummary = dependencySummary
     }
 }
 
@@ -498,6 +542,7 @@ public actor ResearchService {
         explicitVersionOverride: GoVersion? = nil,
         editorContext: DocsEditorContext? = nil,
         includeSynthesis: Bool = true,
+        moduleCacheRoot: URL? = nil,
         toolchainVersionProvider: (@Sendable () -> GoVersion?)? = nil
     ) async throws -> DocsAnswer {
         try Task.checkCancellation()
@@ -584,7 +629,44 @@ public actor ResearchService {
         }
         defer { index.close() }
 
-        // Step 3: Stage 1 hybrid candidate collection: deterministic -> FTS5 -> optional semantic (FR-9, §7.3, Issue #21).
+        // Step 2b (Issue #27, DOC-12): Resolve active project dependencies from go.mod/go.work
+        // and open ONLY dependency packs strictly matching exact (modulePath, version).
+        var activeDepPacks: [(dep: GoModuleDependency, manifest: DocsDependencyPackManifest, index: DocsIndex)] = []
+        var depSummary: DocsDependencySearchSummary?
+        if let projectRoot {
+            let resolvedDeps = GoModuleResolver.resolveDependencies(
+                projectRoot: projectRoot,
+                moduleCacheRoot: moduleCacheRoot
+            )
+            if !resolvedDeps.isEmpty {
+                var indexedKeys: [GoModuleKey] = []
+                var unindexedCachedKeys: [GoModuleKey] = []
+                var uncachedKeys: [GoModuleKey] = []
+                for dep in resolvedDeps {
+                    if let depManifest = await packManager.dependencyManifest(for: dep.packKey),
+                       let depIndex = try await packManager.openDependencyIndex(for: dep.packKey) {
+                        activeDepPacks.append((dep, depManifest, depIndex))
+                        indexedKeys.append(dep.packKey)
+                    } else if dep.isCached {
+                        unindexedCachedKeys.append(dep.packKey)
+                    } else {
+                        uncachedKeys.append(dep.packKey)
+                    }
+                }
+                depSummary = DocsDependencySearchSummary(
+                    indexedModules: indexedKeys,
+                    unindexedCachedModules: unindexedCachedKeys,
+                    uncachedModules: uncachedKeys
+                )
+            }
+        }
+        defer {
+            for pack in activeDepPacks {
+                pack.index.close()
+            }
+        }
+
+        // Step 3: Stage 1 hybrid candidate collection: deterministic -> FTS5 -> optional semantic (FR-9, §7.3, Issue #21, #27).
         struct Candidate {
             var chunk: DocsChunk
             var score: Double
@@ -631,46 +713,75 @@ public actor ResearchService {
             }
         }
 
-        // 3a. Deterministic lookup (FR-1, FR-9a)
+        // 3a. Deterministic lookup (FR-1, FR-9a, Issue #27)
         if let sym = plan.exactSymbolCandidate {
             let detHits = try index.deterministicSearch(symbolOrPackage: sym, limit: 10)
             merge(detHits, weight: 2.0)
+            for depPack in activeDepPacks {
+                let depDetHits = try depPack.index.deterministicSearch(symbolOrPackage: sym, limit: 10)
+                merge(depDetHits, weight: 2.0)
+            }
         }
 
         try Task.checkCancellation()
 
-        // 3b. SQLite FTS5 full-text search (FR-9b)
+        // 3b. SQLite FTS5 full-text search (FR-9b, Issue #27)
         if !plan.searchTerms.isEmpty {
             let ftsHits = try index.ftsSearch(terms: plan.searchTerms, limit: 20)
             merge(ftsHits, weight: 1.0)
+            for depPack in activeDepPacks {
+                let depFtsHits = try depPack.index.ftsSearch(terms: plan.searchTerms, limit: 12)
+                merge(depFtsHits, weight: 1.0)
+            }
         }
 
         try Task.checkCancellation()
 
-        // 3c. Optional semantic search ONLY when pack is Ready AND model matches (FR-27, FR-28, DOC-4).
+        // 3c. Optional semantic search ONLY when pack is Ready AND model matches (FR-27, FR-28, DOC-4, DOC-12).
         // Any non-cancellation failure from the embedder or vector store degrades cleanly to Phase 1 FTS (V-4).
         var usedSemantic = false
-        if manifest.status == .ready,
-           let embedder = queryEmbedder,
-           manifest.embeddingModelID == embedder.descriptor.id,
-           manifest.embeddingModelVersion == embedder.descriptor.version {
-            do {
-                let qVec = try await embedder.embedQuery(plan.originalQuery)
-                try Task.checkCancellation()
-                let semHits = try await index.semanticSearch(
-                    queryVector: qVec,
-                    model: embedder.descriptor,
-                    sharedStore: packManager.sharedVectorStore,
-                    minimumSimilarity: Self.minimumSemanticSimilarity,
-                    limit: Self.retrievalPoolLimit
-                )
-                // Balanced weight so semantic assists recall without swamping deterministic/FTS precision (M-1).
-                merge(semHits, weight: 0.4)
-                usedSemantic = true
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                usedSemantic = false
+        if let embedder = queryEmbedder {
+            let stdSemanticReady = manifest.status == .ready
+                && manifest.embeddingModelID == embedder.descriptor.id
+                && manifest.embeddingModelVersion == embedder.descriptor.version
+            let readyDepPacks = activeDepPacks.filter {
+                $0.manifest.status == .ready
+                    && $0.manifest.embeddingModelID == embedder.descriptor.id
+                    && $0.manifest.embeddingModelVersion == embedder.descriptor.version
+            }
+            if stdSemanticReady || !readyDepPacks.isEmpty {
+                do {
+                    let qVec = try await embedder.embedQuery(plan.originalQuery)
+                    try Task.checkCancellation()
+                    if stdSemanticReady {
+                        let semHits = try await index.semanticSearch(
+                            queryVector: qVec,
+                            model: embedder.descriptor,
+                            sharedStore: packManager.sharedVectorStore,
+                            minimumSimilarity: Self.minimumSemanticSimilarity,
+                            limit: Self.retrievalPoolLimit
+                        )
+                        // Balanced weight so semantic assists recall without swamping deterministic/FTS precision (M-1).
+                        merge(semHits, weight: 0.4)
+                        usedSemantic = true
+                    }
+                    for depPack in readyDepPacks {
+                        try Task.checkCancellation()
+                        let depSemHits = try await depPack.index.semanticSearch(
+                            queryVector: qVec,
+                            model: embedder.descriptor,
+                            sharedStore: packManager.sharedVectorStore,
+                            minimumSimilarity: Self.minimumSemanticSimilarity,
+                            limit: Self.retrievalPoolLimit
+                        )
+                        merge(depSemHits, weight: 0.4)
+                        usedSemantic = true
+                    }
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    usedSemantic = false
+                }
             }
         }
 
@@ -737,7 +848,7 @@ public actor ResearchService {
                     if entry.chunk.source == .spec { intentBonus += 18.0 }
                     else if entry.chunk.source == .guide { intentBonus += 14.0 }
                 case .exactSymbol, .existenceCheck, .needsReverseLookup:
-                    if entry.chunk.source == .stdlib {
+                    if entry.chunk.source == .stdlib || entry.chunk.source == .dependency {
                         if entry.chunk.kind == .example && plan.intent != .needsReverseLookup {
                             intentBonus += 7.0
                         } else {
@@ -753,7 +864,7 @@ public actor ResearchService {
                     if entry.lexicalMatched {
                         let symLower = entry.chunk.symbol.lowercased()
                         let pkgLower = entry.chunk.packageName.lowercased()
-                        let shortPkg = pkgLower.split(separator: "/").last.map(String.init) ?? pkgLower
+                        let shortPkg = DocsIndex.shortPackageName(for: pkgLower)
                         if !symLower.isEmpty && lowerSearchTerms.contains(symLower) {
                             intentBonus += 12.0
                         }
@@ -939,13 +1050,37 @@ public actor ResearchService {
 
         newerNotes.sort { ($0.since, $0.title) < ($1.since, $1.title) }
 
-        let scopeText = "Go \(packKey) pack (\(manifest.chunkCount) chunks: Language Spec, Official Guides, Standard Library)"
+        let baseScopeText = "Go \(packKey) pack (\(manifest.chunkCount) chunks: Language Spec, Official Guides, Standard Library)"
+        let scopeText: String
+        if let depSummary, depSummary.hasAnyDependency {
+            var depParts: [String] = []
+            if !depSummary.indexedModules.isEmpty {
+                let depChunks = activeDepPacks.reduce(0) { $0 + $1.manifest.chunkCount }
+                depParts.append("\(depSummary.indexedModules.count) indexed (\(depChunks) chunks)")
+            }
+            if !depSummary.unindexedCachedModules.isEmpty {
+                depParts.append("\(depSummary.unindexedCachedModules.count) cached/unindexed")
+            }
+            if !depSummary.uncachedModules.isEmpty {
+                let names = depSummary.uncachedModules.prefix(3).map(\.displayID).joined(separator: ", ")
+                let more = depSummary.uncachedModules.count > 3 ? " +\(depSummary.uncachedModules.count - 3)" : ""
+                depParts.append("\(depSummary.uncachedModules.count) uncached: \(names)\(more)")
+            }
+            scopeText = "\(baseScopeText) + Dependencies [\(depParts.joined(separator: ", "))]"
+        } else {
+            scopeText = baseScopeText
+        }
 
         // Step 6: Honest Not Found when zero grounded, version-gated candidates match (FR-12, FR-14, UX-4).
         guard !allowedEntries.isEmpty else {
             let msg: String
             if plan.language == .japanese {
-                msg = "標準ライブラリ・公式ドキュメント（Go \(packKey)）には該当する機能が見つかりませんでした。根拠のないシンボルは提示しません。"
+                if let depSummary, !depSummary.uncachedModules.isEmpty {
+                    let names = depSummary.uncachedModules.prefix(3).map(\.displayID).joined(separator: ", ")
+                    msg = "標準ライブラリ・導入済み依存ドキュメント（Go \(packKey)）には該当する機能が見つかりませんでした（module cache 未取得の依存あり: \(names)）。根拠のないシンボルや別バージョンは提示しません。"
+                } else {
+                    msg = "標準ライブラリ・公式ドキュメント（Go \(packKey)）には該当する機能が見つかりませんでした。根拠のないシンボルは提示しません。"
+                }
             } else {
                 msg = "No matching symbol or guide was found in the Go \(packKey) offline documentation pack."
             }
@@ -962,7 +1097,8 @@ public actor ResearchService {
                 searchMode: usedSemantic ? .hybridSemantic : .ftsOnly,
                 usedLLM: false,
                 usedReranker: false,
-                searchedScope: scopeText
+                searchedScope: scopeText,
+                dependencySummary: depSummary
             )
         }
 
@@ -987,7 +1123,10 @@ public actor ResearchService {
                 goVersion: packKey,
                 since: c.since,
                 canInsert: canInsert,
-                matchedBy: entry.candidate.origin
+                matchedBy: entry.candidate.origin,
+                modulePath: c.modulePath,
+                moduleVersion: c.moduleVersion,
+                license: c.license
             )
         }
 
@@ -1021,7 +1160,8 @@ public actor ResearchService {
             searchMode: searchMode,
             usedLLM: generated != nil,
             usedReranker: usedReranker,
-            searchedScope: scopeText
+            searchedScope: scopeText,
+            dependencySummary: depSummary
         )
     }
 
@@ -1317,8 +1457,8 @@ public actor ResearchService {
         guard lexicalMatched, !lowerTerms.isEmpty else { return 0 }
         let sym = chunk.symbol.lowercased()
         let pkg = chunk.packageName.lowercased()
-        let shortPkg = pkg.split(separator: "/").last.map(String.init) ?? pkg
-        if chunk.source == .stdlib {
+        let shortPkg = DocsIndex.shortPackageName(for: pkg)
+        if chunk.source == .stdlib || chunk.source == .dependency {
             if !sym.isEmpty && lowerTerms.contains(sym) { return 2 }
             if lowerTerms.contains(where: { (!sym.isEmpty && sym.hasPrefix($0 + ".")) || pkg == $0 || shortPkg == $0 }) {
                 return 1
@@ -1339,27 +1479,45 @@ public actor ResearchService {
     ) -> String {
         guard let top = cards.first else { return "" }
         let verLabel = targetVersion.description
+        let isDep = top.sourceKind == .dependency
+        let depLabel: String? = (isDep && top.modulePath != nil && top.moduleVersion != nil)
+            ? "\(top.modulePath!)@\(top.moduleVersion!)"
+            : nil
         switch (plan.intent, plan.language) {
         case (.existenceCheck, .japanese):
             let name = top.packageName.isEmpty ? top.symbol : (top.symbol.isEmpty ? top.packageName : "\(top.packageName).\(top.symbol)")
+            if let depLabel {
+                return "あります（\(depLabel)）: `\(name)` が依存パッケージで利用できます。"
+            }
             return "あります（\(verLabel)）: `\(name)` が標準ライブラリで利用できます。"
         case (.existenceCheck, .english):
             let name = top.packageName.isEmpty ? top.symbol : (top.symbol.isEmpty ? top.packageName : "\(top.packageName).\(top.symbol)")
+            if let depLabel {
+                return "Yes (\(depLabel)): `\(name)` is available in project dependencies."
+            }
             return "Yes (\(verLabel)): `\(name)` is available in the Go standard library."
         case (.syntaxHowTo, .japanese):
             return "\(verLabel) で使える書き方と指針（\(cards.count)件）:"
         case (.syntaxHowTo, .english):
             return "Syntax and guidance for \(verLabel) (\(cards.count) match\(cards.count == 1 ? "" : "es")):"
         case (.exactSymbol, .japanese):
+            if depLabel != nil {
+                return "依存パッケージのリファレンス（\(top.citation)）:"
+            }
             return "\(verLabel) の公式リファレンス（\(top.citation)）:"
         case (.exactSymbol, .english):
+            if depLabel != nil {
+                return "Dependency reference (\(top.citation)):"
+            }
             return "Official reference for \(verLabel) (\(top.citation)):"
         case (_, .japanese):
-            let name = top.packageName.isEmpty ? top.title : "\(top.packageName).\(top.symbol)"
-            return "あります（\(verLabel)）: 第一候補は `\(name)` です（候補 \(cards.count)件）。"
+            let name = top.packageName.isEmpty ? top.title : (top.symbol.isEmpty ? top.packageName : "\(top.packageName).\(top.symbol)")
+            let scopeTag = depLabel ?? verLabel
+            return "あります（\(scopeTag)）: 第一候補は `\(name)` です（候補 \(cards.count)件）。"
         case (_, .english):
-            let name = top.packageName.isEmpty ? top.title : "\(top.packageName).\(top.symbol)"
-            return "Found for \(verLabel): top match `\(name)` (\(cards.count) result\(cards.count == 1 ? "" : "s"))."
+            let name = top.packageName.isEmpty ? top.title : (top.symbol.isEmpty ? top.packageName : "\(top.packageName).\(top.symbol)")
+            let scopeTag = depLabel ?? verLabel
+            return "Found for \(scopeTag): top match `\(name)` (\(cards.count) result\(cards.count == 1 ? "" : "s"))."
         }
     }
 }

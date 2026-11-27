@@ -2200,4 +2200,373 @@ struct DocsExampleCorpusTests {
     }
 }
 
+@Suite("Docs Dependency Module Cache (Issue #27)")
+struct DocsDependencyTests {
+    @Test("Escapes module paths, parses go.mod/go.work/replace/MVS, detects licenses, and refuses version substitution (DOC-12)")
+    func resolvesModulesAndLicensesStrictly() {
+        let dir = TempDir()
+        defer { dir.cleanup() }
+
+        #expect(GoModuleResolver.escapeModulePath("github.com/Azure/go-Autorest") == "github.com/!azure/go-!autorest")
+        #expect(GoModuleResolver.escapeModulePath("v1.2.3-RC1") == "v1.2.3-!r!c1")
+
+        let cache = dir.subdir("modcache")
+        let chiDir = dir.subdir("modcache/github.com/go-chi/chi/v5@v5.1.0")
+        _ = dir.file("modcache/github.com/go-chi/chi/v5@v5.1.0/LICENSE", "MIT License\nPermission is hereby granted, free of charge, to any person obtaining a copy without restriction.")
+        // Only v1.8.0 exists in cache; project will request v1.9.0 -> MUST NOT substitute!
+        _ = dir.subdir("modcache/github.com/example/strict@v1.8.0")
+        // Uppercase path escaped in cache
+        _ = dir.subdir("modcache/github.com/!azure/sdk@v2.0.0")
+        _ = dir.file("modcache/github.com/!azure/sdk@v2.0.0/LICENSE", "Apache License\nVersion 2.0, January 2004")
+        let localRep = dir.subdir("local-helper")
+        _ = dir.file("local-helper/helper.go", "package helper\n")
+
+        // Workspace with two modules requiring different versions of chi (MVS picks v5.1.0)
+        let ws = dir.subdir("ws")
+        _ = dir.file("ws/go.work", """
+        go 1.23
+
+        use (
+            ./svc-a
+            ./svc-b
+        )
+        """)
+        _ = dir.file("ws/svc-a/go.mod", """
+        module example.com/svc-a
+
+        go 1.23
+
+        require (
+            github.com/go-chi/chi/v5 v5.0.8
+            github.com/example/strict v1.9.0
+            github.com/Azure/sdk v2.0.0 // indirect
+            example.com/helper v0.0.0
+        )
+
+        replace example.com/helper => ../../local-helper
+        """)
+        _ = dir.file("ws/svc-b/go.mod", """
+        module example.com/svc-b
+
+        go 1.23
+
+        require github.com/go-chi/chi/v5 v5.1.0
+        """)
+
+        let deps = GoModuleResolver.resolveDependencies(projectRoot: ws, moduleCacheRoot: cache)
+        #expect(deps.count == 4)
+
+        let chi = deps.first { $0.modulePath == "github.com/go-chi/chi/v5" }
+        #expect(chi?.version == "v5.1.0")
+        #expect(chi?.isCached == true)
+        #expect(chi?.isIndirect == false)
+        #expect(chi?.cacheDirectory?.standardizedFileURL == chiDir.standardizedFileURL)
+        #expect(GoModuleResolver.detectLicenseIdentifier(in: chiDir) == "MIT")
+
+        let strict = deps.first { $0.modulePath == "github.com/example/strict" }
+        #expect(strict?.version == "v1.9.0")
+        #expect(strict?.isCached == false)
+        #expect(strict?.cacheDirectory == nil)
+
+        let azure = deps.first { $0.modulePath == "github.com/Azure/sdk" }
+        #expect(azure?.version == "v2.0.0")
+        #expect(azure?.isCached == true)
+        #expect(azure?.isIndirect == true)
+        #expect(GoModuleResolver.detectLicenseIdentifier(in: azure!.cacheDirectory!) == "Apache-2.0")
+
+        let helper = deps.first { $0.modulePath == "example.com/helper" }
+        #expect(helper?.isCached == true)
+        #expect(helper?.localReplaceDirectory?.standardizedFileURL == localRep.standardizedFileURL)
+    }
+
+    @Test("Extracts dependency module packages & examples while skipping internal, cmd, main, and nested submodules")
+    func extractsDependencyModuleChunks() {
+        let dir = TempDir()
+        defer { dir.cleanup() }
+
+        let modRoot = dir.subdir("mod/github.com/go-chi/chi/v5@v5.1.0")
+        _ = dir.file("mod/github.com/go-chi/chi/v5@v5.1.0/LICENSE", "MIT License\nPermission is hereby granted, free of charge, without restriction.")
+        _ = dir.file("mod/github.com/go-chi/chi/v5@v5.1.0/chi.go", """
+        // Package chi is a lightweight, idiomatic router for building Go HTTP services.
+        package chi
+
+        // NewRouter returns a new Mux object that implements the Router interface.
+        func NewRouter() *Mux { return &Mux{} }
+
+        // Mux is a simple HTTP route multiplexer.
+        type Mux struct{}
+        """)
+        _ = dir.file("mod/github.com/go-chi/chi/v5@v5.1.0/example_test.go", """
+        package chi_test
+
+        // Create a basic router and register a GET handler.
+        func ExampleNewRouter() {
+        \tr := chi.NewRouter()
+        \t_ = r
+        }
+        """)
+        _ = dir.file("mod/github.com/go-chi/chi/v5@v5.1.0/middleware/logger.go", """
+        // Package middleware provides standard HTTP middleware.
+        package middleware
+
+        // Logger logs the start and end of each request.
+        func Logger(next any) any { return next }
+        """)
+        _ = dir.file("mod/github.com/go-chi/chi/v5@v5.1.0/internal/secret/secret.go", """
+        package secret
+        func Hidden() {}
+        """)
+        _ = dir.file("mod/github.com/go-chi/chi/v5@v5.1.0/submod/go.mod", "module github.com/go-chi/chi/v5/submod\n\ngo 1.23\n")
+        _ = dir.file("mod/github.com/go-chi/chi/v5@v5.1.0/submod/sub.go", """
+        package submod
+        func NestedModuleFunc() {}
+        """)
+        _ = dir.file("mod/github.com/go-chi/chi/v5@v5.1.0/tools/main.go", """
+        package main
+        func MainToolHelper() {}
+        """)
+
+        let chunks = DocsCorpusExtractor.extractModule(
+            fromModuleRoot: modRoot,
+            modulePath: "github.com/go-chi/chi/v5",
+            moduleVersion: "v5.1.0",
+            goVersion: "1.23"
+        )
+
+        let newRouter = chunks.first { $0.packageName == "github.com/go-chi/chi/v5" && $0.symbol == "NewRouter" && $0.kind == .function }
+        #expect(newRouter != nil)
+        #expect(newRouter?.source == .dependency)
+        #expect(newRouter?.modulePath == "github.com/go-chi/chi/v5")
+        #expect(newRouter?.moduleVersion == "v5.1.0")
+        #expect(newRouter?.license == "MIT")
+        #expect(stringContains(newRouter?.citationLabel ?? "", "github.com/go-chi/chi/v5@v5.1.0"))
+        #expect(stringContains(newRouter?.citationLabel ?? "", "[MIT]"))
+        #expect(stringContains(newRouter?.example ?? "", "chi.NewRouter()"))
+
+        #expect(chunks.contains { $0.packageName == "github.com/go-chi/chi/v5/middleware" && $0.symbol == "Logger" })
+        #expect(chunks.contains { $0.kind == .example && $0.provenance == .officialExample && $0.moduleVersion == "v5.1.0" })
+        #expect(!chunks.contains { $0.symbol == "Hidden" })
+        #expect(!chunks.contains { $0.symbol == "NestedModuleFunc" })
+        #expect(!chunks.contains { $0.symbol == "MainToolHelper" })
+    }
+
+    @Test("Searches exact go.mod dependency version, rejects mismatched version packs, switches cleanly across projects, and preserves stdlib-only behavior (DOC-12)")
+    func unifiedSearchVersionExactnessAndProjectSwitch() async throws {
+        let dir = TempDir()
+        let packDir = TempDir()
+        defer {
+            dir.cleanup()
+            packDir.cleanup()
+        }
+
+        let cache = dir.subdir("modcache")
+
+        // Populate module cache with two distinct versions of chi: v5.0.0 and v5.1.0
+        _ = dir.file("modcache/github.com/go-chi/chi/v5@v5.0.0/chi.go", """
+        package chi
+        // LegacyRouterV500 only exists in v5.0.0.
+        func LegacyRouterV500() {}
+        // NewRouter constructs a v5.0.0 router.
+        func NewRouter() {}
+        """)
+        _ = dir.file("modcache/github.com/go-chi/chi/v5@v5.1.0/LICENSE", "MIT License\nPermission is hereby granted, free of charge, without restriction.")
+        _ = dir.file("modcache/github.com/go-chi/chi/v5@v5.1.0/chi.go", """
+        package chi
+        // NewRouter constructs a v5.1.0 router with route pattern support.
+        func NewRouter() {}
+        // RoutePatternV510 is only available in v5.1.0.
+        func RoutePatternV510() {}
+        """)
+        _ = dir.file("modcache/github.com/go-chi/chi/v5@v5.1.0/example_test.go", """
+        package chi_test
+        func ExampleNewRouter() {
+        \tr := chi.NewRouter()
+        \t_ = r
+        }
+        """)
+
+        // Project A: requires chi v5.1.0 (cached) and uncached-lib v1.2.3 (NOT in cache)
+        let projA = dir.subdir("projA")
+        _ = dir.file("projA/go.mod", """
+        module example.com/projA
+
+        go 1.23
+
+        require (
+            github.com/go-chi/chi/v5 v5.1.0
+            github.com/example/uncached v1.2.3
+        )
+        """)
+
+        // Project B: requires chi v5.0.0
+        let projB = dir.subdir("projB")
+        _ = dir.file("projB/go.mod", """
+        module example.com/projB
+
+        go 1.23
+
+        require github.com/go-chi/chi/v5 v5.0.0
+        """)
+
+        // Project C: stdlib-only project (no dependencies)
+        let projC = dir.subdir("projC")
+        _ = dir.file("projC/go.mod", """
+        module example.com/projC
+
+        go 1.23
+        """)
+
+        let mgr = try makeDocsPackManager(in: packDir)
+        _ = try await mgr.ensureBundledPackInstalled(goVersion: "1.23")
+
+        // Sync both projects so BOTH v5.0.0 and v5.1.0 packs exist on disk simultaneously.
+        let syncA = await mgr.syncProjectDependencies(projectRoot: projA, moduleCacheRoot: cache, goVersion: "1.23")
+        #expect(syncA.synced == [GoModuleKey(modulePath: "github.com/go-chi/chi/v5", version: "v5.1.0")])
+        #expect(syncA.uncached == [GoModuleKey(modulePath: "github.com/example/uncached", version: "v1.2.3")])
+
+        // Second sync on projA skips already up-to-date dependency pack.
+        let syncA2 = await mgr.syncProjectDependencies(projectRoot: projA, moduleCacheRoot: cache, goVersion: "1.23")
+        #expect(syncA2.skippedUpToDate == [GoModuleKey(modulePath: "github.com/go-chi/chi/v5", version: "v5.1.0")])
+        #expect(syncA2.synced.isEmpty)
+
+        let syncB = await mgr.syncProjectDependencies(projectRoot: projB, moduleCacheRoot: cache, goVersion: "1.23")
+        #expect(syncB.synced == [GoModuleKey(modulePath: "github.com/go-chi/chi/v5", version: "v5.0.0")])
+
+        let svc = ResearchService(packManager: mgr, enabled: true)
+
+        // 1. Project A finds chi.NewRouter from v5.1.0 with module@version + MIT citation and insertable snippet.
+        let ansA = try await svc.search(query: "chi.NewRouter", projectRoot: projA, moduleCacheRoot: cache)
+        #expect(ansA.status == .found)
+        let topA = ansA.cards.first
+        #expect(topA?.sourceKind == .dependency)
+        #expect(topA?.modulePath == "github.com/go-chi/chi/v5")
+        #expect(topA?.moduleVersion == "v5.1.0")
+        #expect(topA?.license == "MIT")
+        #expect(stringContains(topA?.citation ?? "", "github.com/go-chi/chi/v5@v5.1.0"))
+        #expect(topA?.canInsert == true)
+        #expect(ansA.dependencySummary?.uncachedModules == [GoModuleKey(modulePath: "github.com/example/uncached", version: "v1.2.3")])
+
+        // 2. Project A MUST NOT return v5.0.0-only symbol even though v5.0.0 pack is installed on disk (FB-DEP-1).
+        let mismatchA = try await svc.search(query: "LegacyRouterV500", projectRoot: projA, moduleCacheRoot: cache)
+        #expect(mismatchA.status == .notFound)
+        #expect(mismatchA.cards.isEmpty)
+        let mismatchAQual = try await svc.search(query: "chi.LegacyRouterV500", projectRoot: projA, moduleCacheRoot: cache)
+        #expect(!mismatchAQual.cards.contains { $0.moduleVersion == "v5.0.0" || $0.symbol == "LegacyRouterV500" })
+
+        // 3. Switching to Project B finds v5.0.0 symbol and MUST NOT return v5.1.0-only symbol (AC-DEP-3).
+        let ansB = try await svc.search(query: "chi.LegacyRouterV500", projectRoot: projB, moduleCacheRoot: cache)
+        #expect(ansB.status == .found)
+        #expect(ansB.cards.first?.moduleVersion == "v5.0.0")
+        let mismatchB = try await svc.search(query: "RoutePatternV510", projectRoot: projB, moduleCacheRoot: cache)
+        #expect(mismatchB.status == .notFound)
+        #expect(mismatchB.cards.isEmpty)
+
+        // 4. Stdlib-only Project C never returns dependency cards and preserves exact stdlib behavior (FB-DEP-2).
+        let ansCDep = try await svc.search(query: "chi.NewRouter", projectRoot: projC, moduleCacheRoot: cache)
+        #expect(ansCDep.status == .notFound)
+        #expect(ansCDep.dependencySummary == nil)
+        let ansCStd = try await svc.search(query: "json.Encoder", projectRoot: projC, moduleCacheRoot: cache)
+        #expect(ansCStd.status == .found)
+        #expect(ansCStd.cards.first?.sourceKind == .stdlib)
+        #expect(ansCStd.dependencySummary == nil)
+    }
+
+    @Test("Supports pause/cancel/resume, shared vector reuse across dependency versions, and model-switch demotion (DOC-12d)")
+    func dependencyBatchCancelResumeReuseAndModelSwitch() async throws {
+        let packDir = TempDir()
+        defer { packDir.cleanup() }
+
+        let mgr = try makeDocsPackManager(in: packDir)
+        let modelA = EmbeddingModelDescriptor(id: "test-embed-a", version: "1")
+        let modelB = EmbeddingModelDescriptor(id: "test-embed-b", version: "1")
+        _ = try await mgr.selectEmbeddingModel(modelA)
+
+        // Build 6 dependency chunks for v1.0.0; cancel mid-batch after 2 embeddings, then resume.
+        let chunksV1: [DocsChunk] = (0..<6).map { i in
+            DocsChunk(
+                goVersion: "1.23",
+                source: .dependency,
+                packageName: "github.com/example/biglib",
+                symbol: "Func\(i)",
+                kind: .function,
+                title: "github.com/example/biglib.Func\(i)",
+                anchor: "github.com/example/biglib.Func\(i)",
+                summary: "Helper function \(i).",
+                signature: "func Func\(i)()",
+                body: "func Func\(i)()\n\nHelper function \(i).",
+                modulePath: "github.com/example/biglib",
+                moduleVersion: "v1.0.0",
+                license: "MIT"
+            )
+        }
+
+        let keyV1 = GoModuleKey(modulePath: "github.com/example/biglib", version: "v1.0.0")
+        let cancelAfter2 = CountingFakeEmbedder(id: modelA.id, version: modelA.version)
+        cancelAfter2.configureCancelDependency(manager: mgr, key: keyV1, afterCalls: 2)
+        let firstRun = try await mgr.ingestDependency(
+            modulePath: keyV1.modulePath,
+            moduleVersion: keyV1.version,
+            chunks: chunksV1,
+            license: "MIT",
+            embedder: cancelAfter2
+        )
+        #expect(firstRun.cancelled == true)
+        #expect(firstRun.computedVectors == 2)
+        // Initial FTS-only snapshot remains queryable after mid-batch cancellation.
+        let partialManifest = await mgr.dependencyManifest(for: keyV1)
+        #expect(partialManifest?.status == .indexingFTSOnly)
+
+        // Resume: previously embedded chunks are reused from checkpoint/SharedVectorStore.
+        let resumed = try await mgr.ingestDependency(
+            modulePath: keyV1.modulePath,
+            moduleVersion: keyV1.version,
+            chunks: chunksV1,
+            license: "MIT",
+            embedder: CountingFakeEmbedder(id: modelA.id, version: modelA.version)
+        )
+        #expect(resumed.cancelled == false)
+        #expect(resumed.status == .ready)
+        #expect(resumed.reusedVectors == 2)
+        #expect(resumed.computedVectors == 4)
+
+        // Upgrade to v1.1.0 with identical chunk bodies -> all 6 vectors reused from SharedVectorStore!
+        let chunksV11 = chunksV1.map { c in
+            DocsChunk(
+                goVersion: "1.23",
+                source: .dependency,
+                packageName: c.packageName,
+                symbol: c.symbol,
+                kind: c.kind,
+                title: c.title,
+                anchor: c.anchor,
+                summary: c.summary,
+                signature: c.signature,
+                body: c.body,
+                modulePath: "github.com/example/biglib",
+                moduleVersion: "v1.1.0",
+                license: "MIT"
+            )
+        }
+        let v11Report = try await mgr.ingestDependency(
+            modulePath: "github.com/example/biglib",
+            moduleVersion: "v1.1.0",
+            chunks: chunksV11,
+            license: "MIT",
+            embedder: CountingFakeEmbedder(id: modelA.id, version: modelA.version)
+        )
+        #expect(v11Report.status == .ready)
+        #expect(v11Report.reusedVectors == 6)
+        #expect(v11Report.computedVectors == 0)
+
+        // Switching embedding model demotes Ready dependency packs to FTS-only (ReadyDepPackMatchesModel).
+        let needsRebuild = try await mgr.selectEmbeddingModel(modelB)
+        #expect(needsRebuild == true)
+        let demotedV1 = await mgr.dependencyManifest(for: keyV1)
+        let demotedV11 = await mgr.dependencyManifest(for: GoModuleKey(modulePath: "github.com/example/biglib", version: "v1.1.0"))
+        #expect(demotedV1?.status == .indexingFTSOnly)
+        #expect(demotedV11?.status == .indexingFTSOnly)
+    }
+}
+
+
 
