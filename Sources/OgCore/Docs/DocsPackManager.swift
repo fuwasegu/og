@@ -133,6 +133,33 @@ public struct DocsMigrationReport: Sendable, Hashable {
     }
 }
 
+/// Result of synchronizing a project's `go.mod`/`go.work` dependencies from local `GOMODCACHE` (Issue #27, DOC-12).
+public struct DocsDependencySyncReport: Sendable, Hashable {
+    public var synced: [GoModuleKey]
+    public var skippedUpToDate: [GoModuleKey]
+    public var uncached: [GoModuleKey]
+    /// Modules whose extraction hit safety budgets (`DocsModuleExtractionLimits`) and were partially indexed (N-1).
+    public var truncatedModules: [String: String]
+    public var failed: [String: String]
+    public var cancelled: Bool
+
+    public init(
+        synced: [GoModuleKey] = [],
+        skippedUpToDate: [GoModuleKey] = [],
+        uncached: [GoModuleKey] = [],
+        truncatedModules: [String: String] = [:],
+        failed: [String: String] = [:],
+        cancelled: Bool = false
+    ) {
+        self.synced = synced
+        self.skippedUpToDate = skippedUpToDate
+        self.uncached = uncached
+        self.truncatedModules = truncatedModules
+        self.failed = failed
+        self.cancelled = cancelled
+    }
+}
+
 /// Persisted manager-level settings (M-15: selected embedding model survives restarts).
 private struct DocsManagerSettings: Codable {
     var selectedEmbeddingModel: EmbeddingModelDescriptor?
@@ -166,7 +193,9 @@ public actor DocsPackManager {
         self.rootDirectory = rootDirectory
         let fm = FileManager.default
         try fm.createDirectory(at: rootDirectory.appendingPathComponent("packs", isDirectory: true), withIntermediateDirectories: true)
+        try fm.createDirectory(at: rootDirectory.appendingPathComponent("packs/deps", isDirectory: true), withIntermediateDirectories: true)
         try fm.createDirectory(at: rootDirectory.appendingPathComponent("staging", isDirectory: true), withIntermediateDirectories: true)
+        try fm.createDirectory(at: rootDirectory.appendingPathComponent("staging/deps", isDirectory: true), withIntermediateDirectories: true)
         let storeURL = rootDirectory.appendingPathComponent("shared_vectors.sqlite")
         self.sharedVectorStore = try SharedVectorStore(databaseURL: storeURL)
         // M-15: load persisted selected embedding model
@@ -189,6 +218,18 @@ public actor DocsPackManager {
 
     public func indexURL(for goVersion: String) -> URL {
         packDirectory(for: goVersion).appendingPathComponent("index.sqlite")
+    }
+
+    public func dependencyPackDirectory(for key: GoModuleKey) -> URL {
+        rootDirectory.appendingPathComponent("packs/deps/\(key.storageKey)", isDirectory: true)
+    }
+
+    public func dependencyStagingDirectory(for key: GoModuleKey) -> URL {
+        rootDirectory.appendingPathComponent("staging/deps/\(key.storageKey)", isDirectory: true)
+    }
+
+    public func dependencyIndexURL(for key: GoModuleKey) -> URL {
+        dependencyPackDirectory(for: key).appendingPathComponent("index.sqlite")
     }
 
     /// Global user/app-extensible concept rules JSON path (S-3).
@@ -307,6 +348,75 @@ public actor DocsPackManager {
         let url = indexURL(for: goVersion)
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         return try DocsIndex(databaseURL: url, readOnly: true)
+    }
+
+    // MARK: - Dependency Pack Inventory (Issue #27, DES-DEP-1)
+
+    public func installedDependencyPacks() -> [DocsDependencyPackManifest] {
+        let depsDir = rootDirectory.appendingPathComponent("packs/deps", isDirectory: true)
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: depsDir,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+
+        var manifests: [DocsDependencyPackManifest] = []
+        let decoder = JSONDecoder()
+        for dir in entries {
+            let mURL = manifestURL(in: dir)
+            guard let data = try? Data(contentsOf: mURL),
+                  var manifest = try? decoder.decode(DocsDependencyPackManifest.self, from: data) else { continue }
+            manifest.sizeBytes = Self.directorySizeBytes(dir)
+            manifests.append(manifest)
+        }
+        manifests.sort { $0.key < $1.key }
+        return manifests
+    }
+
+    public func dependencyManifest(for key: GoModuleKey) -> DocsDependencyPackManifest? {
+        let dir = dependencyPackDirectory(for: key)
+        guard let data = try? Data(contentsOf: manifestURL(in: dir)),
+              var m = try? JSONDecoder().decode(DocsDependencyPackManifest.self, from: data) else { return nil }
+        // Strict verification: manifest modulePath, moduleVersion, and localSourcePath must match requested key exactly.
+        guard m.modulePath == key.modulePath
+            && m.moduleVersion == key.version
+            && m.localSourcePath == key.localSourcePath else { return nil }
+        m.sizeBytes = Self.directorySizeBytes(dir)
+        return m
+    }
+
+    public func openDependencyIndex(for key: GoModuleKey) throws -> DocsIndex? {
+        guard dependencyManifest(for: key) != nil else { return nil }
+        let url = dependencyIndexURL(for: key)
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return try DocsIndex(databaseURL: url, readOnly: true)
+    }
+
+    public func requestCancelDependency(key: GoModuleKey) {
+        cancelRequested[Self.depBatchKey(for: key)] = true
+    }
+
+    @discardableResult
+    public func deleteDependencyPack(key: GoModuleKey) async throws -> Int {
+        let batchKey = Self.depBatchKey(for: key)
+        cancelRequested[batchKey] = true
+        let fm = FileManager.default
+        let packDir = dependencyPackDirectory(for: key)
+        if fm.fileExists(atPath: packDir.path) {
+            try fm.removeItem(at: packDir)
+        }
+        let stageDir = dependencyStagingDirectory(for: key)
+        if inFlightVersions.contains(batchKey) {
+            deletedWhileInFlight.insert(batchKey)
+        } else if fm.fileExists(atPath: stageDir.path) {
+            try? fm.removeItem(at: stageDir)
+        }
+        latestProgress.removeValue(forKey: batchKey)
+        return try await garbageCollectSharedVectors()
+    }
+
+    private static func depBatchKey(for key: GoModuleKey) -> String {
+        "dep:\(key.storageKey)"
     }
 
     /// Migrates existing v2 installed packs (including GOROOT-imported packs) in place to schema v3 (S-1, T-1, T-2):
@@ -438,6 +548,34 @@ public actor DocsPackManager {
             // Discard incompatible staging checkpoints so resume never mixes models.
             if !inFlightVersions.contains(pack.goVersion) {
                 let stage = stagingDirectory(for: pack.goVersion)
+                if fm.fileExists(atPath: stage.path) {
+                    try? fm.removeItem(at: stage)
+                }
+            }
+        }
+
+        // DOC-4 / ReadyDepPackMatchesModel: also demote incompatible dependency packs to FTS-only.
+        for var depPack in installedDependencyPacks() {
+            let matches = (depPack.embeddingModelID == model?.id && depPack.embeddingModelVersion == model?.version)
+            if !matches && (depPack.status == .ready || depPack.embeddingModelID != nil) {
+                needsRebuild = true
+                depPack.status = .indexingFTSOnly
+                depPack.embeddingModelID = nil
+                depPack.embeddingModelVersion = nil
+                let dir = dependencyPackDirectory(for: depPack.key)
+                let dbURL = dir.appendingPathComponent("index.sqlite")
+                if fm.fileExists(atPath: dbURL.path) {
+                    let idx = try DocsIndex(databaseURL: dbURL, readOnly: false)
+                    defer { idx.close() }
+                    try idx.clearVectorReferences()
+                    try idx.checkpointWAL()
+                }
+                let data = try encoder.encode(depPack)
+                try data.write(to: manifestURL(in: dir), options: .atomic)
+            }
+            let batchKey = Self.depBatchKey(for: depPack.key)
+            if !inFlightVersions.contains(batchKey) {
+                let stage = dependencyStagingDirectory(for: depPack.key)
                 if fm.fileExists(atPath: stage.path) {
                     try? fm.removeItem(at: stage)
                 }
@@ -760,6 +898,442 @@ public actor DocsPackManager {
         return try await ingest(goVersion: goVersion, chunks: chunks, embedder: embedder, onProgress: onProgress)
     }
 
+    // MARK: - Staged, Resumable Dependency Module Pack Ingestion (Issue #27, DES-DEP-1..4)
+
+    /// Ingests a single `(modulePath, moduleVersion)` dependency pack with staged atomic activation,
+    /// chunk-level pause/resume checkpoints, and shared vector reuse across versions.
+    public func ingestDependency(
+        modulePath: String,
+        moduleVersion: String,
+        localSourcePath: String? = nil,
+        chunks: [DocsChunk],
+        license: String? = nil,
+        truncated: Bool = false,
+        truncationReason: String? = nil,
+        embedder: (any DocsEmbedder)? = nil,
+        simulateSwapFailure: Bool = false,
+        onProgress: (@Sendable (DocsBatchProgress) -> Void)? = nil
+    ) async throws -> DocsIngestionReport {
+        let key = GoModuleKey(modulePath: modulePath, version: moduleVersion, localSourcePath: localSourcePath)
+        let batchKey = Self.depBatchKey(for: key)
+        guard !inFlightVersions.contains(batchKey) else {
+            throw DocsStorageError.batchAlreadyRunning(key.displayID)
+        }
+        inFlightVersions.insert(batchKey)
+        cancelRequested[batchKey] = false
+        deletedWhileInFlight.remove(batchKey)
+        pinnedVectorKeys[batchKey] = []
+        defer {
+            inFlightVersions.remove(batchKey)
+            pinnedVectorKeys.removeValue(forKey: batchKey)
+            deletedWhileInFlight.remove(batchKey)
+        }
+
+        let estimate = Self.estimateBatch(chunks: chunks, includesEmbeddings: embedder != nil)
+        let fm = FileManager.default
+        let activeDir = dependencyPackDirectory(for: key)
+        let stageDir = dependencyStagingDirectory(for: key)
+        let activeDBURL = dependencyIndexURL(for: key)
+        let activeExists = fm.fileExists(atPath: activeDBURL.path)
+
+        var processed = 0
+        var reusedCount = 0
+        var computedCount = 0
+
+        func emit(_ phase: DocsBatchPhase, error: String? = nil) {
+            let p = DocsBatchProgress(
+                goVersion: key.displayID,
+                phase: phase,
+                processedChunks: processed,
+                totalChunks: chunks.count,
+                reusedVectors: reusedCount,
+                computedVectors: computedCount,
+                estimatedBytes: estimate.estimatedBytes,
+                errorMessage: error
+            )
+            latestProgress[batchKey] = p
+            onProgress?(p)
+        }
+
+        var stageIndexHandle: DocsIndex?
+        var stageClosed = false
+        func closeStageIndex() {
+            if !stageClosed {
+                stageIndexHandle?.close()
+                stageClosed = true
+            }
+        }
+
+        do {
+            emit(.extracting)
+
+            var previousHashes: [String: String] = [:]
+            var previousRefs: [String: SharedVectorKey] = [:]
+            if activeExists {
+                let activeIndex = try DocsIndex(databaseURL: activeDBURL, readOnly: true)
+                defer { activeIndex.close() }
+                previousHashes = try activeIndex.contentHashesByStableID()
+                previousRefs = try activeIndex.vectorReferences()
+            }
+            let diff = DocsChunkDiff.compute(previous: previousHashes, next: chunks)
+            let unchangedIDs = Set(diff.unchanged.map(\.stableID))
+            let changedIDs = diff.changed.map(\.stableID)
+
+            try fm.createDirectory(at: stageDir, withIntermediateDirectories: true)
+            let stageDBURL = stageDir.appendingPathComponent("index.sqlite")
+            let stageIndex = try DocsIndex(databaseURL: stageDBURL, readOnly: false)
+            stageIndexHandle = stageIndex
+            defer { closeStageIndex() }
+
+            let stageRefs = try stageIndex.vectorReferences()
+
+            emit(.buildingFTS)
+            try stageIndex.replaceAllChunks(chunks)
+            try stageIndex.removeVectorReferences(forStableIDs: diff.removed + changedIDs)
+
+            if let embedder {
+                let model = embedder.descriptor
+                for (stableID, ref) in previousRefs where unchangedIDs.contains(stableID) {
+                    if ref.modelID == model.id && ref.modelVersion == model.version && stageRefs[stableID] == nil {
+                        try stageIndex.recordVectorReference(stableID: stableID, key: ref)
+                    }
+                }
+            } else {
+                try stageIndex.clearVectorReferences()
+            }
+
+            try stageIndex.checkpointWAL()
+
+            if !activeExists && embedder != nil && !(Task.isCancelled || cancelRequested[batchKey] == true) {
+                try publishInitialDependencyFTSOnlySnapshot(
+                    fromStageDB: stageDBURL,
+                    key: key,
+                    license: license,
+                    chunkCount: chunks.count
+                )
+            }
+
+            var finalStatus: DocsPackStatus = .indexingFTSOnly
+
+            if let embedder {
+                let model = embedder.descriptor
+                let completedRefs = try stageIndex.vectorReferences()
+                let batchSize = max(1, embedder.preferredBatchSize)
+                var pendingBatch: [(chunk: DocsChunk, key: SharedVectorKey)] = []
+                pendingBatch.reserveCapacity(batchSize)
+
+                for chunk in chunks {
+                    if Task.isCancelled || cancelRequested[batchKey] == true {
+                        try? stageIndex.checkpointWAL()
+                        closeStageIndex()
+                        await cleanupDeletedDependencyInFlightIfNeeded(key: key)
+                        emit(.cancelled)
+                        return DocsIngestionReport(
+                            goVersion: key.displayID,
+                            status: dependencyManifest(for: key)?.status ?? .indexingFTSOnly,
+                            totalChunks: chunks.count,
+                            addedChunks: diff.added.count,
+                            changedChunks: diff.changed.count,
+                            removedChunks: diff.removed.count,
+                            unchangedChunks: diff.unchanged.count,
+                            reusedVectors: reusedCount,
+                            computedVectors: computedCount,
+                            cancelled: true
+                        )
+                    }
+
+                    let vKey = SharedVectorKey(contentHash: chunk.contentHash, model: model)
+                    pinnedVectorKeys[batchKey, default: []].insert(vKey)
+
+                    if let existingRef = completedRefs[chunk.stableID], existingRef == vKey,
+                       (try await sharedVectorStore.contains(vKey)) {
+                        reusedCount += 1
+                        processed += 1
+                        emit(.embedding)
+                        continue
+                    }
+
+                    if try await sharedVectorStore.contains(vKey) {
+                        try stageIndex.recordVectorReference(stableID: chunk.stableID, key: vKey)
+                        reusedCount += 1
+                        processed += 1
+                        emit(.embedding)
+                    } else {
+                        pendingBatch.append((chunk, vKey))
+                        if pendingBatch.count >= batchSize {
+                            let batch = pendingBatch
+                            pendingBatch.removeAll(keepingCapacity: true)
+                            let vectors = try await computeBatchVectors(batch.map(\.chunk.embeddingText), with: embedder)
+                            for (item, vector) in zip(batch, vectors) {
+                                try await sharedVectorStore.store(key: item.key, vector: vector)
+                                try stageIndex.recordVectorReference(stableID: item.chunk.stableID, key: item.key)
+                                computedCount += 1
+                                processed += 1
+                            }
+                            emit(.embedding)
+                        }
+                    }
+                }
+                if !pendingBatch.isEmpty && !(Task.isCancelled || cancelRequested[batchKey] == true) {
+                    let batch = pendingBatch
+                    pendingBatch.removeAll(keepingCapacity: true)
+                    let vectors = try await computeBatchVectors(batch.map(\.chunk.embeddingText), with: embedder)
+                    for (item, vector) in zip(batch, vectors) {
+                        try await sharedVectorStore.store(key: item.key, vector: vector)
+                        try stageIndex.recordVectorReference(stableID: item.chunk.stableID, key: item.key)
+                        computedCount += 1
+                        processed += 1
+                    }
+                    emit(.embedding)
+                }
+                finalStatus = .ready
+            } else {
+                processed = chunks.count
+                finalStatus = .indexingFTSOnly
+            }
+
+            if Task.isCancelled || cancelRequested[batchKey] == true {
+                try? stageIndex.checkpointWAL()
+                closeStageIndex()
+                await cleanupDeletedDependencyInFlightIfNeeded(key: key)
+                emit(.cancelled)
+                return DocsIngestionReport(
+                    goVersion: key.displayID,
+                    status: dependencyManifest(for: key)?.status ?? .indexingFTSOnly,
+                    totalChunks: chunks.count,
+                    addedChunks: diff.added.count,
+                    changedChunks: diff.changed.count,
+                    removedChunks: diff.removed.count,
+                    unchangedChunks: diff.unchanged.count,
+                    reusedVectors: reusedCount,
+                    computedVectors: computedCount,
+                    cancelled: true
+                )
+            }
+
+            try stageIndex.checkpointWAL()
+            closeStageIndex()
+
+            emit(.activating)
+
+            let manifest = DocsDependencyPackManifest(
+                modulePath: modulePath,
+                moduleVersion: moduleVersion,
+                localSourcePath: localSourcePath,
+                storageKey: key.storageKey,
+                createdAt: ISO8601DateFormatter().string(from: Date()),
+                license: license,
+                chunkCount: chunks.count,
+                status: finalStatus,
+                embeddingModelID: embedder?.descriptor.id,
+                embeddingModelVersion: embedder?.descriptor.version,
+                sizeBytes: Self.directorySizeBytes(stageDir),
+                truncated: truncated,
+                truncationReason: truncationReason
+            )
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            try encoder.encode(manifest).write(to: manifestURL(in: stageDir), options: .atomic)
+
+            if simulateSwapFailure {
+                throw DocsStorageError.io("simulated atomic swap failure")
+            }
+            try Self.atomicReplaceDirectory(source: stageDir, destination: activeDir)
+
+            emit(.completed)
+            return DocsIngestionReport(
+                goVersion: key.displayID,
+                status: finalStatus,
+                totalChunks: chunks.count,
+                addedChunks: diff.added.count,
+                changedChunks: diff.changed.count,
+                removedChunks: diff.removed.count,
+                unchangedChunks: diff.unchanged.count,
+                reusedVectors: reusedCount,
+                computedVectors: computedCount,
+                cancelled: false
+            )
+        } catch {
+            closeStageIndex()
+            await cleanupDeletedDependencyInFlightIfNeeded(key: key)
+            emit(.failed, error: error.localizedDescription)
+            throw error
+        }
+    }
+
+    /// Default total disk budget for cached dependency packs (256 MB, N-2).
+    public static let defaultDependencyStorageBudgetBytes: Int64 = 256 * 1024 * 1024
+
+    /// Incrementally extracts and indexes only the dependencies of `projectRoot` that are present in local
+    /// `GOMODCACHE` and missing or outdated as dependency packs (Issue #27, DOC-12a, DOC-12b, N-1, N-2).
+    /// Uncached dependencies are reported in `report.uncached` and never auto-downloaded or substituted.
+    public func syncProjectDependencies(
+        projectRoot: URL,
+        moduleCacheRoot: URL? = nil,
+        goVersion: String = BundledGoCorpus.defaultVersion,
+        embedder: (any DocsEmbedder)? = nil,
+        forceRebuild: Bool = false,
+        extractionLimits: DocsModuleExtractionLimits = .default,
+        storageBudgetBytes: Int64 = DocsPackManager.defaultDependencyStorageBudgetBytes,
+        onProgress: (@Sendable (DocsBatchProgress) -> Void)? = nil
+    ) async -> DocsDependencySyncReport {
+        let deps = GoModuleResolver.resolveDependencies(projectRoot: projectRoot, moduleCacheRoot: moduleCacheRoot)
+        var report = DocsDependencySyncReport()
+
+        for dep in deps {
+            if Task.isCancelled {
+                report.cancelled = true
+                break
+            }
+            guard let sourceDir = dep.cacheDirectory else {
+                report.uncached.append(dep.packKey)
+                continue
+            }
+
+            // Skip already up-to-date immutable module-cache packs unless rebuild, embedding upgrade,
+            // or retry after a transient time-limit truncation is needed.
+            if !forceRebuild, dep.localReplaceDirectory == nil, let existing = dependencyManifest(for: dep.packKey) {
+                let wasTimeTruncated = existing.truncated && (existing.truncationReason?.hasPrefix("time limit") == true)
+                let embeddingSatisfied: Bool
+                if let embedder {
+                    embeddingSatisfied = existing.status == .ready
+                        && existing.embeddingModelID == embedder.descriptor.id
+                        && existing.embeddingModelVersion == embedder.descriptor.version
+                } else {
+                    embeddingSatisfied = true
+                }
+                if embeddingSatisfied && !wasTimeTruncated {
+                    report.skippedUpToDate.append(dep.packKey)
+                    continue
+                }
+            }
+
+            let license = GoModuleResolver.detectLicenseIdentifier(in: sourceDir)
+            let extracted = DocsCorpusExtractor.extractModuleDetailed(
+                fromModuleRoot: sourceDir,
+                modulePath: dep.modulePath,
+                moduleVersion: dep.version,
+                goVersion: goVersion,
+                license: license,
+                limits: extractionLimits
+            )
+            if extracted.cancelled {
+                report.cancelled = true
+                break
+            }
+            if extracted.truncated {
+                report.truncatedModules[dep.displayID] = extracted.truncationReason ?? "extraction budget reached"
+            }
+            do {
+                let res = try await ingestDependency(
+                    modulePath: dep.modulePath,
+                    moduleVersion: dep.version,
+                    localSourcePath: dep.localReplaceDirectory?.standardizedFileURL.path,
+                    chunks: extracted.chunks,
+                    license: license,
+                    truncated: extracted.truncated,
+                    truncationReason: extracted.truncationReason,
+                    embedder: embedder,
+                    onProgress: onProgress
+                )
+                if res.cancelled {
+                    report.cancelled = true
+                    break
+                }
+                report.synced.append(dep.packKey)
+            } catch is CancellationError {
+                report.cancelled = true
+                break
+            } catch {
+                report.failed[dep.displayID] = error.localizedDescription
+            }
+        }
+
+        // N-2: enforce total dependency pack storage budget, protecting the current project's dependencies.
+        let activeKeys = Set(deps.map(\.packKey))
+        _ = try? await enforceDependencyStorageBudget(maxTotalBytes: storageBudgetBytes, protecting: activeKeys)
+        return report
+    }
+
+    /// Removes all installed dependency packs not present in `activeKeys` and garbage-collects unreferenced shared vectors (N-2).
+    @discardableResult
+    public func pruneUnusedDependencyPacks(keepingActiveKeys activeKeys: Set<GoModuleKey>) async throws -> [GoModuleKey] {
+        var removed: [GoModuleKey] = []
+        let fm = FileManager.default
+        for pack in installedDependencyPacks() {
+            let key = pack.key
+            guard !activeKeys.contains(key) else { continue }
+            let batchKey = Self.depBatchKey(for: key)
+            guard !inFlightVersions.contains(batchKey) else { continue }
+            let packDir = dependencyPackDirectory(for: key)
+            if fm.fileExists(atPath: packDir.path) {
+                try fm.removeItem(at: packDir)
+            }
+            let stageDir = dependencyStagingDirectory(for: key)
+            if fm.fileExists(atPath: stageDir.path) {
+                try? fm.removeItem(at: stageDir)
+            }
+            latestProgress.removeValue(forKey: batchKey)
+            removed.append(key)
+        }
+        if !removed.isEmpty {
+            _ = try await garbageCollectSharedVectors()
+        }
+        return removed
+    }
+
+    /// Removes dependency packs not required by any of the given project roots (N-2).
+    @discardableResult
+    public func pruneUnusedDependencyPacks(
+        forProjectRoots roots: [URL],
+        moduleCacheRoot: URL? = nil
+    ) async throws -> [GoModuleKey] {
+        var active = Set<GoModuleKey>()
+        for root in roots {
+            let deps = GoModuleResolver.resolveDependencies(projectRoot: root, moduleCacheRoot: moduleCacheRoot)
+            for dep in deps {
+                active.insert(dep.packKey)
+            }
+        }
+        return try await pruneUnusedDependencyPacks(keepingActiveKeys: active)
+    }
+
+    /// Evicts oldest non-protected dependency packs when total disk usage exceeds `maxTotalBytes`, then runs shared-vector GC (N-2).
+    @discardableResult
+    public func enforceDependencyStorageBudget(
+        maxTotalBytes: Int64 = DocsPackManager.defaultDependencyStorageBudgetBytes,
+        protecting activeKeys: Set<GoModuleKey> = []
+    ) async throws -> [GoModuleKey] {
+        guard maxTotalBytes > 0 else { return [] }
+        let packs = installedDependencyPacks()
+        var totalBytes = packs.reduce(Int64(0)) { $0 + $1.sizeBytes }
+        guard totalBytes > maxTotalBytes else { return [] }
+
+        let evictable = packs
+            .filter { !activeKeys.contains($0.key) && !inFlightVersions.contains(Self.depBatchKey(for: $0.key)) }
+            .sorted { $0.createdAt < $1.createdAt }
+
+        var evicted: [GoModuleKey] = []
+        let fm = FileManager.default
+        for pack in evictable {
+            guard totalBytes > maxTotalBytes else { break }
+            let dir = dependencyPackDirectory(for: pack.key)
+            if fm.fileExists(atPath: dir.path) {
+                try? fm.removeItem(at: dir)
+            }
+            let stageDir = dependencyStagingDirectory(for: pack.key)
+            if fm.fileExists(atPath: stageDir.path) {
+                try? fm.removeItem(at: stageDir)
+            }
+            totalBytes -= pack.sizeBytes
+            evicted.append(pack.key)
+        }
+        if !evicted.isEmpty {
+            _ = try await garbageCollectSharedVectors()
+        }
+        return evicted
+    }
+
     /// JSON payload exported for reproducible offline Phase 2 evaluation (`scripts/eval-docs-phase2.py`, V-7).
     public struct ExportedEvalChunk: Codable, Sendable, Hashable {
         public var stable_id: String
@@ -868,13 +1442,30 @@ public actor DocsPackManager {
         _ = try? await garbageCollectSharedVectors()
     }
 
+    private func cleanupDeletedDependencyInFlightIfNeeded(key: GoModuleKey) async {
+        let batchKey = Self.depBatchKey(for: key)
+        guard deletedWhileInFlight.remove(batchKey) != nil else { return }
+        let fm = FileManager.default
+        let stageDir = dependencyStagingDirectory(for: key)
+        let activeDir = dependencyPackDirectory(for: key)
+        if fm.fileExists(atPath: stageDir.path) {
+            try? fm.removeItem(at: stageDir)
+        }
+        if fm.fileExists(atPath: activeDir.path) {
+            try? fm.removeItem(at: activeDir)
+        }
+        pinnedVectorKeys.removeValue(forKey: batchKey)
+        latestProgress.removeValue(forKey: batchKey)
+        _ = try? await garbageCollectSharedVectors()
+    }
+
     /// Reclaims any vector in `SharedVectorStore` not referenced by any active pack, staging checkpoint,
     /// or currently running batch (FR-30, H-9).
     @discardableResult
     public func garbageCollectSharedVectors() async throws -> Int {
         var referenced = Set<SharedVectorKey>()
 
-        // 1. Active installed packs
+        // 1. Active installed packs (stdlib + dependency packs)
         for pack in installedPacks() {
             if let index = try openIndex(for: pack.goVersion) {
                 defer { index.close() }
@@ -882,25 +1473,37 @@ public actor DocsPackManager {
                 for key in refs.values { referenced.insert(key) }
             }
         }
+        for depPack in installedDependencyPacks() {
+            if let index = try openDependencyIndex(for: depPack.key) {
+                defer { index.close() }
+                let refs = try index.vectorReferences()
+                for key in refs.values { referenced.insert(key) }
+            }
+        }
 
         // 2. Staging checkpoints for resumable / paused batches (H-9)
-        let stagingRoot = rootDirectory.appendingPathComponent("staging", isDirectory: true)
-        if let entries = try? FileManager.default.contentsOfDirectory(
-            at: stagingRoot,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) {
-            for dir in entries where dir.lastPathComponent.hasPrefix("go") {
-                let dbURL = dir.appendingPathComponent("index.sqlite")
-                guard FileManager.default.fileExists(atPath: dbURL.path) else { continue }
-                // R-10b: if an uncheckpointed WAL staging DB from a crash fails read-only open,
-                // fall back to read-write open so SQLite recovers the WAL and preserves checkpointed refs.
-                let stageIdx = (try? DocsIndex(databaseURL: dbURL, readOnly: true))
-                    ?? (try? DocsIndex(databaseURL: dbURL, readOnly: false))
-                if let stageIdx {
-                    defer { stageIdx.close() }
-                    if let refs = try? stageIdx.vectorReferences() {
-                        for key in refs.values { referenced.insert(key) }
+        let stagingRoots = [
+            rootDirectory.appendingPathComponent("staging", isDirectory: true),
+            rootDirectory.appendingPathComponent("staging/deps", isDirectory: true)
+        ]
+        for stagingRoot in stagingRoots {
+            if let entries = try? FileManager.default.contentsOfDirectory(
+                at: stagingRoot,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            ) {
+                for dir in entries where dir.lastPathComponent != "deps" {
+                    let dbURL = dir.appendingPathComponent("index.sqlite")
+                    guard FileManager.default.fileExists(atPath: dbURL.path) else { continue }
+                    // R-10b: if an uncheckpointed WAL staging DB from a crash fails read-only open,
+                    // fall back to read-write open so SQLite recovers the WAL and preserves checkpointed refs.
+                    let stageIdx = (try? DocsIndex(databaseURL: dbURL, readOnly: true))
+                        ?? (try? DocsIndex(databaseURL: dbURL, readOnly: false))
+                    if let stageIdx {
+                        defer { stageIdx.close() }
+                        if let refs = try? stageIdx.vectorReferences() {
+                            for key in refs.values { referenced.insert(key) }
+                        }
                     }
                 }
             }
@@ -915,6 +1518,34 @@ public actor DocsPackManager {
     }
 
     // MARK: - Helpers
+
+    private func publishInitialDependencyFTSOnlySnapshot(
+        fromStageDB stageDB: URL,
+        key: GoModuleKey,
+        license: String?,
+        chunkCount: Int
+    ) throws {
+        let fm = FileManager.default
+        let tempDir = rootDirectory.appendingPathComponent("staging/deps/.fts-pub-\(key.storageKey)-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempDir) }
+        try fm.copyItem(at: stageDB, to: tempDir.appendingPathComponent("index.sqlite"))
+        let manifest = DocsDependencyPackManifest(
+            modulePath: key.modulePath,
+            moduleVersion: key.version,
+            localSourcePath: key.localSourcePath,
+            storageKey: key.storageKey,
+            createdAt: ISO8601DateFormatter().string(from: Date()),
+            license: license,
+            chunkCount: chunkCount,
+            status: .indexingFTSOnly,
+            sizeBytes: Self.directorySizeBytes(tempDir)
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(manifest).write(to: manifestURL(in: tempDir), options: .atomic)
+        try Self.atomicReplaceDirectory(source: tempDir, destination: dependencyPackDirectory(for: key))
+    }
 
     private func publishInitialFTSOnlySnapshot(fromStageDB stageDB: URL, goVersion: String, chunkCount: Int) throws {
         let fm = FileManager.default

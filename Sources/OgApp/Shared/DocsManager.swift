@@ -17,9 +17,11 @@ final class DocsManager {
     let service: ResearchService?
 
     private(set) var installedPacks: [DocsPackManifest] = []
+    private(set) var installedDependencyPacks: [DocsDependencyPackManifest] = []
     private(set) var activeProgress: DocsBatchProgress?
     private(set) var lastError: String?
     private(set) var detectedToolchainVersion: GoVersion?
+    private(set) var detectedModuleCacheRoot: URL?
     private var toolchainDetectionCompleted = false
     private var batchTasks: [String: Task<Void, Never>] = [:]
     /// In-memory override for headless tests so `DebugDriver` never mutates UserDefaults opt-in (M-6).
@@ -37,9 +39,11 @@ final class DocsManager {
             self.lastError = error.localizedDescription
         }
         Task.detached(priority: .utility) {
-            let ver = await GoVersionResolver.detectInstalledToolchainVersionAsync()
+            async let ver = GoVersionResolver.detectInstalledToolchainVersionAsync()
+            async let modCache = GoModuleResolver.detectModuleCacheRootAsync()
+            let (resolvedVer, resolvedCache) = await (ver, modCache)
             await MainActor.run {
-                DocsManager.shared.setDetectedToolchainVersion(ver)
+                DocsManager.shared.setDetectedEnvironment(version: resolvedVer, moduleCacheRoot: resolvedCache)
             }
         }
         Task { [weak self] in
@@ -47,8 +51,9 @@ final class DocsManager {
         }
     }
 
-    private func setDetectedToolchainVersion(_ ver: GoVersion?) {
+    private func setDetectedEnvironment(version ver: GoVersion?, moduleCacheRoot: URL?) {
         detectedToolchainVersion = ver
+        detectedModuleCacheRoot = moduleCacheRoot
         toolchainDetectionCompleted = true
         notifyProgressChanged()
     }
@@ -150,6 +155,7 @@ final class DocsManager {
         // S-3, T-3: validate concept_rules.json (surfacing JSON errors) while keeping live disk reload enabled.
         await reloadConceptRules()
         installedPacks = await pm.installedPacks()
+        installedDependencyPacks = await pm.installedDependencyPacks()
         notifyPacksChanged()
     }
 
@@ -280,14 +286,125 @@ final class DocsManager {
         notifyProgressChanged()
     }
 
+    /// Incrementally extracts and indexes `go.mod`/`go.work` dependencies present in local `GOMODCACHE` (Issue #27, DOC-12).
+    /// Never runs `go mod download` automatically.
+    func syncProjectDependencies(projectRoot: URL, forceRebuild: Bool = false) {
+        guard enabled, let pm = packManager else { return }
+        let taskKey = "deps:\(projectRoot.standardizedFileURL.path)"
+        batchTasks[taskKey]?.cancel()
+        lastError = nil
+
+        let activeEmbedder = DocsServerManager.shared.embedderClient
+        let cachedModCache = detectedModuleCacheRoot
+        let goVer = GoVersionResolver.resolve(
+            projectRoot: projectRoot,
+            toolchainVersionProvider: { [cached = detectedToolchainVersion] in cached }
+        )?.version.minorKey ?? BundledGoCorpus.defaultVersion
+
+        batchTasks[taskKey] = Task.detached(priority: .utility) {
+            let modCache: URL?
+            if let cachedModCache {
+                modCache = cachedModCache
+            } else {
+                modCache = await GoModuleResolver.detectModuleCacheRootAsync()
+            }
+            let report = await pm.syncProjectDependencies(
+                projectRoot: projectRoot,
+                moduleCacheRoot: modCache,
+                goVersion: goVer,
+                embedder: activeEmbedder,
+                forceRebuild: forceRebuild
+            ) { progress in
+                Task { @MainActor in
+                    DocsManager.shared.handleBatchProgress(progress)
+                }
+            }
+            let errText: String? = report.failed.isEmpty ? nil : report.failed.map { "\($0.key): \($0.value)" }.joined(separator: "; ")
+            await DocsManager.shared.finishBatch(goVersion: taskKey, error: errText)
+        }
+    }
+
+    /// Explicit user-triggered `go mod download` for uncached dependencies, followed by local extraction (DOC-12a).
+    /// Never called automatically.
+    func downloadAndSyncProjectDependencies(projectRoot: URL) {
+        guard enabled else { return }
+        let taskKey = "deps-dl:\(projectRoot.standardizedFileURL.path)"
+        batchTasks[taskKey]?.cancel()
+        lastError = nil
+        activeProgress = DocsBatchProgress(goVersion: "go mod download", phase: .extracting)
+        notifyProgressChanged()
+
+        batchTasks[taskKey] = Task.detached(priority: .utility) {
+            let locator = ToolLocator.shared
+            guard let goExe = locator.find("go") else {
+                await DocsManager.shared.finishBatch(goVersion: taskKey, error: "`go` executable not found on PATH.")
+                return
+            }
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: goExe)
+            proc.arguments = ["mod", "download"]
+            proc.currentDirectoryURL = projectRoot
+            proc.environment = locator.environment
+            let errPipe = Pipe()
+            proc.standardOutput = FileHandle.nullDevice
+            proc.standardError = errPipe
+            proc.standardInput = FileHandle.nullDevice
+            do {
+                try proc.run()
+                // Drain stderr BEFORE waitUntilExit so a verbose `go mod download` never deadlocks on a full pipe buffer.
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                proc.waitUntilExit()
+                if proc.terminationStatus != 0 {
+                    let errMsg = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    await DocsManager.shared.finishBatch(
+                        goVersion: taskKey,
+                        error: "go mod download failed: \(errMsg?.isEmpty == false ? errMsg! : "exit \(proc.terminationStatus)")"
+                    )
+                    return
+                }
+            } catch {
+                await DocsManager.shared.finishBatch(goVersion: taskKey, error: "go mod download failed: \(error.localizedDescription)")
+                return
+            }
+            await MainActor.run {
+                DocsManager.shared.batchTasks.removeValue(forKey: taskKey)
+                DocsManager.shared.syncProjectDependencies(projectRoot: projectRoot)
+            }
+        }
+    }
+
+    /// Removes dependency packs not required by any of the given open project roots and runs shared-vector GC (N-2).
+    func pruneUnusedDependencyPacks(keepingProjectRoots roots: [URL]) {
+        guard let pm = packManager else { return }
+        let modCache = detectedModuleCacheRoot
+        Task { [weak self] in
+            do {
+                _ = try await pm.pruneUnusedDependencyPacks(forProjectRoots: roots, moduleCacheRoot: modCache)
+                self?.lastError = nil
+            } catch {
+                self?.lastError = error.localizedDescription
+            }
+            await self?.refreshPacks()
+        }
+    }
+
     func cancelActiveBatch() {
         guard let progress = activeProgress else { return }
         let ver = progress.goVersion
         batchTasks[ver]?.cancel()
         batchTasks.removeValue(forKey: ver)
+        for (k, task) in batchTasks where k.hasPrefix("deps:") || k.hasPrefix("deps-dl:") {
+            task.cancel()
+            batchTasks.removeValue(forKey: k)
+        }
         if let pm = packManager {
             Task { [weak self] in
                 await pm.requestCancel(goVersion: ver)
+                if let atIdx = ver.firstIndex(of: "@") {
+                    let mp = String(ver[..<atIdx])
+                    let mv = String(ver[ver.index(after: atIdx)...])
+                    await pm.requestCancelDependency(key: GoModuleKey(modulePath: mp, version: mv))
+                }
                 await self?.refreshPacks()
             }
         }
@@ -352,6 +469,7 @@ final class DocsManager {
                 explicitVersionOverride: explicitVersion,
                 editorContext: editorContext,
                 includeSynthesis: includeSynthesis,
+                moduleCacheRoot: detectedModuleCacheRoot,
                 toolchainVersionProvider: provider
             )
             // T-3: surface any concept_rules.json decode error encountered during live reload.

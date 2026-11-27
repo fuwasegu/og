@@ -1,0 +1,502 @@
+// og — Offline Go dependency library documentation lookup requirements (Issue #27)
+//
+// Source: GitHub issue #27 (module cache extraction & version-exact dependency search).
+//   DOC-12a: Dependency documentation is extracted per `(modulePath, moduleVersion)` unit from
+//            local Go module cache (`GOMODCACHE` / `$GOPATH/pkg/mod`). No automatic network
+//            download ever runs (`NeverAutoDownloads`); fetching an uncached dependency occurs
+//            only via an explicit user action (`user_fetch_dependency`).
+//   DOC-12b: Module & version exactness — only dependencies matching the active project's
+//            `go.mod`/`go.work` exact `(module, version)` pairs are searchable as usable cards,
+//            passing the same top-N / anti-hallucination threshold / `1..MAX_CARDS` gates as stdlib.
+//            Dependencies absent from module cache are explicitly reported as `DepUncached`, and
+//            cached-but-unindexed dependencies as `DepUnindexed`, never substituted with another
+//            version or module.
+//   DOC-12c: Project switching & `go.mod` updates switch the active dependency set and clear stale
+//            answers; stdlib-only projects (`project_dep_ver[m] == none`) never return dependency cards.
+//   DOC-12d: Staged ingestion publishes FTS-only before Ready on initial build, supports pause/resume/
+//            abort without corrupting active packs, respects embedding model boundaries
+//            (`ReadyDepPackMatchesModel`), and stays strictly on loopback (`NeverLeavesMachine`).
+//
+// ASSUME-1 (representation only): two modules (0, 1), two dependency versions (0 = v1.8.0,
+//   1 = v1.9.0), flattened into `ModSlot = 0..3` (`slot = m * NUM_VERS + v`), two embedding models,
+//   and `MAX_CARDS = 3` are sufficient to expose module-confusion, version-mismatch,
+//   uncached-substitution, explicit-fetch, project-switch, and model-mixing bugs.
+requirements DocsDeps {
+  number ModuleId
+  number DepVer
+  number ModSlot
+  number ModelId
+  number CardCount
+  const NUM_VERS = 2
+  const MAX_CARDS = 3
+
+  enum Endpoint { Local, Remote }
+  enum DepPackState { Missing, IndexingFTSOnly, Ready }
+  enum DepBatchState { BIdle, BRunning, BPaused }
+  enum DepAnswerKind { NoAnswer, DepCards, DepNotFound, DepUnindexed, DepUncached }
+
+  state {
+    enabled:              Bool,
+    // F-1: per-module required version in active project's go.mod/go.work (none = not required)
+    project_dep_ver:      Map<ModuleId, Option<DepVer>>,
+    // Flattened (ModuleId, DepVer) maps keyed by `m * NUM_VERS + v`
+    cache_present:        Map<ModSlot, Bool>,
+    pack_state:           Map<ModSlot, DepPackState>,
+    pack_model:           Map<ModSlot, ModelId>,
+    selected_model:       ModelId,
+    batch_state:          DepBatchState,
+    batch_slot:           Option<ModSlot>,
+    batch_model:          ModelId,
+    // F-1 / F-2 / F-6: answer state carrying explicit (module, version), card count, and grounding
+    answer_kind:          DepAnswerKind,
+    answer_mod:           Option<ModuleId>,
+    answer_ver:           Option<DepVer>,
+    answer_card_count:    CardCount,
+    answer_has_citation:  Bool,
+    answer_has_scope:     Bool,
+    answer_grounded:      Bool,
+    answer_used_semantic: Bool,
+    inserted:             Bool,
+    sent_remote:          Bool,       // MODEL-1: ghost — query/context ever sent off-machine
+    auto_downloaded:      Bool,       // MODEL-2: ghost — unrequested automatic network download
+    explicit_fetched:     Bool        // F-3: observable flag that user explicitly ran go mod download
+  }
+
+  init {
+    enabled = false
+    selected_model = 0
+    batch_state = BIdle
+    batch_slot = none
+    batch_model = 0
+    answer_kind = NoAnswer
+    answer_mod = none
+    answer_ver = none
+    answer_card_count = 0
+    answer_has_citation = false
+    answer_has_scope = false
+    answer_grounded = false
+    answer_used_semantic = false
+    inserted = false
+    sent_remote = false
+    auto_downloaded = false
+    explicit_fetched = false
+    forall m: ModuleId {
+      project_dep_ver[m] = none
+    }
+    forall s: ModSlot {
+      cache_present[s] = false
+      pack_state[s] = Missing
+      pack_model[s] = 0
+    }
+  }
+
+  action enable() "DOC-1: enable offline Go docs lookup" {
+    requires not enabled
+    enabled = true
+  }
+
+  action disable() "DOC-1: disable lookup and clear displayed dependency answers" {
+    requires enabled
+    enabled = false
+    answer_kind = NoAnswer
+    answer_mod = none
+    answer_ver = none
+    answer_card_count = 0
+    answer_has_citation = false
+    answer_has_scope = false
+    answer_grounded = false
+    answer_used_semantic = false
+  }
+
+  action set_project_dep(m: ModuleId, dv: DepVer) "DOC-12c: open project or update go.mod/go.work requiring (m, dv) and clear stale answers" {
+    requires project_dep_ver[m] != some(dv)
+    project_dep_ver[m] = some(dv)
+    answer_kind = NoAnswer
+    answer_mod = none
+    answer_ver = none
+    answer_card_count = 0
+    answer_has_citation = false
+    answer_has_scope = false
+    answer_grounded = false
+    answer_used_semantic = false
+  }
+
+  action clear_project_dep(m: ModuleId) "DOC-12c: remove module m from active project dependencies and clear stale answers" {
+    requires project_dep_ver[m] != none
+    project_dep_ver[m] = none
+    answer_kind = NoAnswer
+    answer_mod = none
+    answer_ver = none
+    answer_card_count = 0
+    answer_has_citation = false
+    answer_has_scope = false
+    answer_grounded = false
+    answer_used_semantic = false
+  }
+
+  action set_cache_present(m: ModuleId, dv: DepVer, present: Bool) "DOC-12a: external local module cache availability changes offline" {
+    requires present != cache_present[m * NUM_VERS + dv]
+    cache_present[m * NUM_VERS + dv] = present
+    if (answer_kind == DepUncached or answer_kind == DepUnindexed) and answer_mod == some(m) and answer_ver == some(dv) {
+      answer_kind = NoAnswer
+      answer_mod = none
+      answer_ver = none
+      answer_card_count = 0
+      answer_has_citation = false
+      answer_has_scope = false
+      answer_grounded = false
+      answer_used_semantic = false
+    }
+  }
+
+  action user_fetch_dependency(m: ModuleId, dv: DepVer) "DOC-12a: explicit user-triggered go mod download fetches uncached dependency (m, dv) into local cache" {
+    requires enabled
+    requires project_dep_ver[m] == some(dv)
+    requires not cache_present[m * NUM_VERS + dv]
+    cache_present[m * NUM_VERS + dv] = true
+    explicit_fetched = true
+    if answer_kind == DepUncached and answer_mod == some(m) and answer_ver == some(dv) {
+      answer_kind = NoAnswer
+      answer_mod = none
+      answer_ver = none
+      answer_card_count = 0
+      answer_has_citation = false
+      answer_has_scope = false
+      answer_grounded = false
+      answer_used_semantic = false
+    }
+  }
+
+  // MARK: - Staged, cancellable, resumable dependency pack ingestion (DOC-12a, DOC-12d, F-5)
+
+  action start_dep_batch(m: ModuleId, dv: DepVer) "DOC-12a: start staged extraction for (m, dv) only when exact version exists in local module cache" {
+    requires batch_state == BIdle
+    requires cache_present[m * NUM_VERS + dv]
+    batch_state = BRunning
+    batch_slot = some(m * NUM_VERS + dv)
+    batch_model = selected_model
+    // MODEL-2 (vacuity idiom, mirrors `sent_remote = sent_remote or to == Remote`):
+    // records an automatic download iff extraction ever bypassed the `cache_present` guard.
+    auto_downloaded = auto_downloaded or not cache_present[m * NUM_VERS + dv]
+  }
+
+  action publish_dep_fts(m: ModuleId, dv: DepVer) "DOC-12d: publish initial FTS-only dependency pack while embeddings run" {
+    requires batch_state == BRunning
+    requires batch_slot == some(m * NUM_VERS + dv)
+    requires batch_model == selected_model
+    requires pack_state[m * NUM_VERS + dv] == Missing
+    pack_state[m * NUM_VERS + dv] = IndexingFTSOnly
+    if (answer_kind == DepUncached or answer_kind == DepUnindexed) and answer_mod == some(m) and answer_ver == some(dv) {
+      answer_kind = NoAnswer
+      answer_mod = none
+      answer_ver = none
+      answer_card_count = 0
+      answer_has_citation = false
+      answer_has_scope = false
+      answer_grounded = false
+      answer_used_semantic = false
+    }
+  }
+
+  action pause_dep_batch() "DOC-12d: pause a running dependency ingestion batch keeping active packs intact" {
+    requires batch_state == BRunning
+    batch_state = BPaused
+  }
+
+  action resume_dep_batch() "DOC-12d: resume a paused dependency ingestion batch for the same model" {
+    requires batch_state == BPaused
+    requires batch_model == selected_model
+    batch_state = BRunning
+  }
+
+  action abort_dep_batch() "DOC-12d: cancel or abort a running/paused batch without corrupting active packs" {
+    requires batch_state != BIdle
+    batch_state = BIdle
+    batch_slot = none
+  }
+
+  action complete_dep_batch(m: ModuleId, dv: DepVer) "DOC-12d: atomically activate Ready dependency pack for (m, dv) after staged FTS publication" {
+    requires batch_state == BRunning
+    requires batch_slot == some(m * NUM_VERS + dv)
+    requires batch_model == selected_model
+    // F-5: initial build must publish FTS-only before Ready; updates already have pack_state != Missing.
+    requires pack_state[m * NUM_VERS + dv] != Missing
+    pack_state[m * NUM_VERS + dv] = Ready
+    pack_model[m * NUM_VERS + dv] = selected_model
+    batch_state = BIdle
+    batch_slot = none
+  }
+
+  action delete_dep_pack(m: ModuleId, dv: DepVer) "DOC-12d: remove dependency pack for (m, dv) and clear answers referencing it" {
+    requires pack_state[m * NUM_VERS + dv] != Missing
+    pack_state[m * NUM_VERS + dv] = Missing
+    if batch_slot == some(m * NUM_VERS + dv) {
+      batch_state = BIdle
+      batch_slot = none
+    }
+    if answer_mod == some(m) and answer_ver == some(dv) {
+      answer_kind = NoAnswer
+      answer_mod = none
+      answer_ver = none
+      answer_card_count = 0
+      answer_has_citation = false
+      answer_has_scope = false
+      answer_grounded = false
+      answer_used_semantic = false
+    }
+  }
+
+  action select_embed_model(m: ModelId) "DOC-4: switching embedding model aborts incompatible batches and demotes Ready dependency packs to FTS-only" {
+    requires m != selected_model
+    selected_model = m
+    batch_state = BIdle
+    batch_slot = none
+    forall s: ModSlot {
+      if pack_state[s] == Ready and pack_model[s] != m {
+        pack_state[s] = IndexingFTSOnly
+      }
+    }
+    if answer_used_semantic {
+      answer_kind = NoAnswer
+      answer_mod = none
+      answer_ver = none
+      answer_card_count = 0
+      answer_has_citation = false
+      answer_has_scope = false
+      answer_grounded = false
+      answer_used_semantic = false
+    }
+  }
+
+  // MARK: - Version-exact & module-exact dependency lookup (DOC-12b, DOC-12c, F-1, F-2, F-6)
+
+  action query_dep_found(
+    to: Endpoint,
+    m: ModuleId,
+    dv: DepVer,
+    use_semantic: Bool,
+    card_count: CardCount,
+    within_top_n: Bool,
+    passed_threshold: Bool
+  ) "DOC-12b: local query returns 1..MAX_CARDS grounded dependency cards strictly matching active project's (m, dv) with module@version citation" {
+    requires enabled
+    requires to == Local
+    requires project_dep_ver[m] == some(dv)
+    requires pack_state[m * NUM_VERS + dv] != Missing
+    requires card_count >= 1 and card_count <= MAX_CARDS
+    requires within_top_n
+    requires passed_threshold
+    requires (not use_semantic) or (pack_state[m * NUM_VERS + dv] == Ready and pack_model[m * NUM_VERS + dv] == selected_model)
+    answer_kind = DepCards
+    answer_mod = some(m)
+    answer_ver = some(dv)
+    answer_card_count = card_count
+    answer_has_citation = true
+    answer_has_scope = true
+    answer_grounded = true
+    answer_used_semantic = use_semantic
+    sent_remote = sent_remote or to == Remote
+  }
+
+  action query_dep_not_found(to: Endpoint, m: ModuleId, dv: DepVer) "DOC-12b: honest Not Found when active dependency pack (m, dv) has no matching symbol" {
+    requires enabled
+    requires to == Local
+    requires project_dep_ver[m] == some(dv)
+    requires pack_state[m * NUM_VERS + dv] != Missing
+    answer_kind = DepNotFound
+    answer_mod = some(m)
+    answer_ver = some(dv)
+    answer_card_count = 0
+    answer_has_citation = false
+    answer_has_scope = true
+    answer_grounded = true
+    answer_used_semantic = pack_state[m * NUM_VERS + dv] == Ready and pack_model[m * NUM_VERS + dv] == selected_model
+    sent_remote = sent_remote or to == Remote
+  }
+
+  action query_dep_unindexed(m: ModuleId, dv: DepVer) "DOC-12b: report cached-but-unindexed dependency explicitly without fabricating citations" {
+    requires enabled
+    requires project_dep_ver[m] == some(dv)
+    requires cache_present[m * NUM_VERS + dv]
+    requires pack_state[m * NUM_VERS + dv] == Missing
+    answer_kind = DepUnindexed
+    answer_mod = some(m)
+    answer_ver = some(dv)
+    answer_card_count = 0
+    answer_has_citation = false
+    answer_has_scope = true
+    answer_grounded = true
+    answer_used_semantic = false
+  }
+
+  action query_dep_uncached(m: ModuleId, dv: DepVer) "DOC-12b: report uncached dependency explicitly without substituting another version or auto-downloading" {
+    requires enabled
+    requires project_dep_ver[m] == some(dv)
+    requires not cache_present[m * NUM_VERS + dv]
+    requires pack_state[m * NUM_VERS + dv] == Missing
+    answer_kind = DepUncached
+    answer_mod = some(m)
+    answer_ver = some(dv)
+    answer_card_count = 0
+    answer_has_citation = false
+    answer_has_scope = true
+    answer_grounded = true
+    answer_used_semantic = false
+  }
+
+  action insert_dep_card() "DOC-9: code insertion is permitted only for grounded cards matching active project's (module, version)" {
+    requires enabled
+    requires answer_kind == DepCards
+    requires answer_mod is some(m) and answer_ver is some(dv) and project_dep_ver[m] == some(dv)
+    requires answer_has_citation and answer_grounded
+    inserted = true
+  }
+
+  // MARK: - Invariants
+
+  invariant NeverLeavesMachine "DOC-6: dependency lookup never sends queries or project context to a remote endpoint" {
+    not sent_remote
+  }
+
+  invariant NeverAutoDownloads "DOC-12a: uncached dependencies are never automatically downloaded without explicit user action" {
+    not auto_downloaded
+  }
+
+  invariant DepCardsMatchActiveModuleAndVersion "DOC-12b: usable dependency cards strictly match active project's (module, version), have an installed pack, and are grounded/cited" {
+    answer_kind == DepCards => (
+      enabled and
+      answer_mod is some(m) and
+      answer_ver is some(dv) and
+      project_dep_ver[m] == some(dv) and
+      pack_state[m * NUM_VERS + dv] != Missing and
+      answer_has_citation and
+      answer_has_scope and
+      answer_grounded
+    )
+  }
+
+  invariant CardsBoundedByMax "DOC-10: grounded dependency answers return 1..MAX_CARDS cards and non-card answers carry 0" {
+    (answer_kind == DepCards => (answer_card_count >= 1 and answer_card_count <= MAX_CARDS)) and
+    (answer_kind != DepCards => answer_card_count == 0)
+  }
+
+  invariant UnindexedReportedHonest "DOC-12b: unindexed reports occur only when exact (m, dv) is cached locally without an installed pack" {
+    answer_kind == DepUnindexed => (
+      enabled and
+      answer_mod is some(m) and
+      answer_ver is some(dv) and
+      project_dep_ver[m] == some(dv) and
+      cache_present[m * NUM_VERS + dv] and
+      pack_state[m * NUM_VERS + dv] == Missing and
+      not answer_has_citation and
+      answer_has_scope and
+      answer_grounded
+    )
+  }
+
+  invariant UncachedReportedWithoutSubstitution "DOC-12b: uncached reports never fabricate citations and only occur when exact (m, dv) is absent from cache" {
+    answer_kind == DepUncached => (
+      enabled and
+      answer_mod is some(m) and
+      answer_ver is some(dv) and
+      project_dep_ver[m] == some(dv) and
+      not cache_present[m * NUM_VERS + dv] and
+      pack_state[m * NUM_VERS + dv] == Missing and
+      not answer_has_citation and
+      answer_has_scope and
+      answer_grounded
+    )
+  }
+
+  invariant ReadyDepPackMatchesModel "DOC-4: every Ready dependency pack was embedded with selected_model" {
+    forall s: ModSlot { pack_state[s] == Ready => pack_model[s] == selected_model }
+  }
+
+  invariant SemanticRequiresMatchingModel "DOC-4: semantic search on dependency packs never mixes vectors from another embedding model" {
+    answer_used_semantic => (
+      answer_mod is some(m) and
+      answer_ver is some(dv) and
+      pack_state[m * NUM_VERS + dv] == Ready and
+      pack_model[m * NUM_VERS + dv] == selected_model
+    )
+  }
+
+  invariant BatchTracksModel "MODEL-3: induction aid; active/paused dependency batch targets a slot with selected_model" {
+    (batch_state == BIdle => batch_slot == none) and
+    (batch_state != BIdle => (batch_slot != none and batch_model == selected_model))
+  }
+
+  invariant DisabledHasNoAnswer "DOC-1: disabling lookup leaves no dependency answer displayed" {
+    not enabled => answer_kind == NoAnswer
+  }
+
+  // MARK: - Acceptance & Forbidden traces (F-4)
+
+  acceptance AC-DEP-1 "DOC-12b: cached dependency is extracted, searched with module@version citation and gates, and inserted" {
+    enable() set_project_dep(0, 0) set_cache_present(0, 0, true) start_dep_batch(0, 0) publish_dep_fts(0, 0) query_dep_found(Local, 0, 0, false, 2, true, true) insert_dep_card()
+    expect answer_kind == DepCards and answer_mod == some(0) and answer_ver == some(0) and answer_card_count == 2 and answer_has_citation and inserted
+  }
+
+  acceptance AC-DEP-2 "DOC-12d: pausing and resuming a dependency batch completes atomically to Ready" {
+    enable() set_project_dep(0, 0) set_cache_present(0, 0, true) start_dep_batch(0, 0) publish_dep_fts(0, 0) pause_dep_batch() resume_dep_batch() complete_dep_batch(0, 0)
+    expect pack_state[0] == Ready and batch_state == BIdle
+  }
+
+  acceptance AC-DEP-3 "DOC-12c: bumping dependency version clears stale answer, then extracting new version enables searching the new version" {
+    enable() set_project_dep(0, 0) set_cache_present(0, 0, true) start_dep_batch(0, 0) publish_dep_fts(0, 0) complete_dep_batch(0, 0) query_dep_found(Local, 0, 0, false, 1, true, true) set_project_dep(0, 1) set_cache_present(0, 1, true) start_dep_batch(0, 1) publish_dep_fts(0, 1) query_dep_found(Local, 0, 1, false, 1, true, true)
+    expect answer_kind == DepCards and answer_mod == some(0) and answer_ver == some(1)
+  }
+
+  acceptance AC-DEP-4 "DOC-12b: uncached dependency is explicitly reported as DepUncached even when another version is installed" {
+    enable() set_cache_present(0, 1, true) start_dep_batch(0, 1) publish_dep_fts(0, 1) set_project_dep(0, 0) query_dep_uncached(0, 0)
+    expect answer_kind == DepUncached and answer_mod == some(0) and answer_ver == some(0) and not answer_has_citation
+  }
+
+  acceptance AC-DEP-5 "DOC-12a: explicit user_fetch_dependency populates cache, allowing extraction and grounded lookup without auto-download" {
+    enable() set_project_dep(0, 0) query_dep_uncached(0, 0) user_fetch_dependency(0, 0) start_dep_batch(0, 0) publish_dep_fts(0, 0) query_dep_found(Local, 0, 0, false, 1, true, true)
+    expect explicit_fetched and not auto_downloaded and answer_kind == DepCards and answer_mod == some(0) and answer_ver == some(0)
+  }
+
+  acceptance AC-DEP-6 "DOC-12b: two distinct modules at the same version are independently addressable without confusion" {
+    enable() set_project_dep(0, 0) set_project_dep(1, 0) set_cache_present(1, 0, true) start_dep_batch(1, 0) publish_dep_fts(1, 0) query_dep_found(Local, 1, 0, false, 1, true, true)
+    expect answer_kind == DepCards and answer_mod == some(1) and answer_ver == some(0)
+  }
+
+  forbidden FB-DEP-1 "DOC-12b: dependency version not matching go.mod cannot be returned as usable even if installed" {
+    enable() set_cache_present(0, 1, true) start_dep_batch(0, 1) publish_dep_fts(0, 1) set_project_dep(0, 0) query_dep_found(Local, 0, 1, false, 1, true, true)
+    expect rejected
+  }
+
+  forbidden FB-DEP-2 "DOC-12c: stdlib-only project (module not required) cannot return dependency cards" {
+    enable() set_cache_present(0, 0, true) start_dep_batch(0, 0) publish_dep_fts(0, 0) query_dep_found(Local, 0, 0, false, 1, true, true)
+    expect rejected
+  }
+
+  forbidden FB-DEP-3 "DOC-12a: uncached dependency version cannot be extracted from module cache" {
+    enable() set_project_dep(0, 0) start_dep_batch(0, 0)
+    expect rejected
+  }
+
+  forbidden FB-DEP-4 "DOC-6: remote queries for dependency docs are refused" {
+    enable() set_project_dep(0, 0) set_cache_present(0, 0, true) start_dep_batch(0, 0) publish_dep_fts(0, 0) query_dep_found(Remote, 0, 0, false, 1, true, true)
+    expect rejected
+  }
+
+  forbidden FB-DEP-5 "DOC-12b: module not required by active project cannot be returned even if same version exists for another module" {
+    enable() set_project_dep(0, 0) set_cache_present(1, 0, true) start_dep_batch(1, 0) publish_dep_fts(1, 0) query_dep_found(Local, 1, 0, false, 1, true, true)
+    expect rejected
+  }
+
+  forbidden FB-DEP-6 "DOC-10: dependency candidate below anti-hallucination threshold cannot be returned as grounded card" {
+    enable() set_project_dep(0, 0) set_cache_present(0, 0, true) start_dep_batch(0, 0) publish_dep_fts(0, 0) query_dep_found(Local, 0, 0, false, 1, true, false)
+    expect rejected
+  }
+}
+
+verify {
+  values ModuleId = 0..1
+  values DepVer = 0..1
+  values ModSlot = 0..3
+  values ModelId = 0..1
+  values CardCount = 0..3
+}

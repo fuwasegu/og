@@ -237,11 +237,15 @@ public enum DocsQueryRouter {
     }
 
     private static func extractSymbolReference(from query: String) -> String? {
-        // Backticked symbol e.g. `json.Encoder`
-        if let tickRange = query.range(of: #"`([a-zA-Z0-9_/]+\.[A-Za-z0-9_]+)`"#, options: .regularExpression) {
+        // Backticked symbol e.g. `json.Encoder` or `github.com/go-chi/chi/v5.NewRouter`
+        if let tickRange = query.range(of: #"`([a-zA-Z0-9_./-]+\.[A-Za-z0-9_]+)`"#, options: .regularExpression) {
             return String(query[tickRange]).trimmingCharacters(in: CharacterSet(charactersIn: "`"))
         }
-        // Bare qualified symbol e.g. bufio.Scanner, encoding/json.MarshalIndent, json.Encoder
+        // Full module/package path qualified symbol e.g. github.com/go-chi/chi/v5.NewRouter
+        if let modQualRange = query.range(of: #"\b([a-z0-9][a-z0-9._-]*/[a-zA-Z0-9_./-]+\.[A-Z][A-Za-z0-9_]*)\b"#, options: .regularExpression) {
+            return String(query[modQualRange])
+        }
+        // Bare qualified symbol e.g. bufio.Scanner, encoding/json.MarshalIndent, json.Encoder, chi.NewRouter
         if let qualRange = query.range(of: #"\b([a-z][a-z0-9]*(?:/[a-z][a-z0-9]*)?\.[A-Z][A-Za-z0-9_]*)\b"#, options: .regularExpression) {
             return String(query[qualRange])
         }

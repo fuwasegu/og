@@ -35,6 +35,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     private let docsInstallButton = NSButton(title: "Add / Update Pack", target: nil, action: nil)
     private let docsImportGorootButton = NSButton(title: "Import GOROOT…", target: nil, action: nil)
     private let docsDeleteButton = NSButton(title: "Delete Pack", target: nil, action: nil)
+    private let docsPruneDepsButton = NSButton(title: "Prune Unused Deps", target: nil, action: nil)
     private let docsCancelButton = NSButton(title: "Cancel Batch", target: nil, action: nil)
     private let docsLicenseButton = NSButton(title: "BSD License…", target: nil, action: nil)
     private let docsPacksLabel = NSTextField(wrappingLabelWithString: "")
@@ -198,6 +199,8 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         docsImportGorootButton.action = #selector(docsImportGorootClicked)
         docsDeleteButton.target = self
         docsDeleteButton.action = #selector(docsDeleteClicked)
+        docsPruneDepsButton.target = self
+        docsPruneDepsButton.action = #selector(docsPruneDepsClicked)
         docsCancelButton.target = self
         docsCancelButton.action = #selector(docsCancelClicked)
         docsLicenseButton.target = self
@@ -210,7 +213,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         docsProgressBar.controlSize = .small
         docsProgressLabel.font = Theme.smallFont
         docsProgressLabel.textColor = Theme.secondaryText
-        let docsButtons = NSStackView(views: [docsVersionCombo, docsInstallButton, docsImportGorootButton, docsDeleteButton, docsCancelButton, docsLicenseButton])
+        let docsButtons = NSStackView(views: [docsVersionCombo, docsInstallButton, docsImportGorootButton, docsDeleteButton, docsPruneDepsButton, docsCancelButton, docsLicenseButton])
         docsButtons.orientation = .horizontal
         docsButtons.spacing = 6
 
@@ -460,15 +463,27 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
             docsVersionCombo.stringValue = "go\(BundledGoCorpus.defaultVersion)"
         }
 
+        let depPacks = d.installedDependencyPacks
+        docsPruneDepsButton.isEnabled = !depPacks.isEmpty
+        let depSummaryLine: String? = depPacks.isEmpty ? nil : {
+            let totalKB = max(1, depPacks.reduce(Int64(0)) { $0 + $1.sizeBytes } / 1024)
+            let totalChunks = depPacks.reduce(0) { $0 + $1.chunkCount }
+            let partialCount = depPacks.filter(\.truncated).count
+            let partialNote = partialCount > 0 ? ", \(partialCount) partial" : ""
+            return "Dependency packs: \(depPacks.count) modules (\(totalChunks) chunks, \(totalKB) KB\(partialNote))"
+        }()
+
         if packs.isEmpty {
-            docsPacksLabel.stringValue = "Installed packs: none (enabling installs bundled go\(BundledGoCorpus.defaultVersion) core pack offline)"
+            let base = "Installed packs: none (enabling installs bundled go\(BundledGoCorpus.defaultVersion) core pack offline)"
+            docsPacksLabel.stringValue = depSummaryLine.map { "\(base)\n\($0)" } ?? base
         } else {
-            let lines = packs.map { p in
+            var lines = packs.map { p in
                 let kb = max(1, p.sizeBytes / 1024)
                 let mode = p.status == .ready ? "ready (FTS + semantic)" : "FTS-only"
                 let legacyNote = p.needsReimport ? " — legacy v1 schema: re-import recommended" : ""
                 return "• go\(p.goVersion): \(p.chunkCount) chunks, \(kb) KB [\(mode)]\(legacyNote)"
             }
+            if let depSummaryLine { lines.append(depSummaryLine) }
             docsPacksLabel.stringValue = "Installed packs:\n" + lines.joined(separator: "\n")
         }
 
@@ -477,7 +492,8 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
             let estKB = max(1, p.estimatedBytes / 1024)
             let isRunning = p.phase == .extracting || p.phase == .buildingFTS || p.phase == .embedding || p.phase == .activating
             docsCancelButton.isEnabled = isRunning
-            docsProgressLabel.stringValue = "Batch go\(p.goVersion): \(p.phase.rawValue) (\(p.processedChunks)/\(p.totalChunks) chunks, est. \(estKB) KB, reused \(p.reusedVectors))"
+            let targetLabel = (p.goVersion.contains("@") || p.goVersion.contains(" ")) ? p.goVersion : "go\(p.goVersion)"
+            docsProgressLabel.stringValue = "Batch \(targetLabel): \(p.phase.rawValue) (\(p.processedChunks)/\(p.totalChunks) chunks, est. \(estKB) KB, reused \(p.reusedVectors))"
         } else if let err = d.lastError {
             docsProgressBar.doubleValue = 0
             docsCancelButton.isEnabled = false
@@ -663,6 +679,11 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     @objc private func docsDeleteClicked() {
         guard let ver = parsedSelectedDocsVersion() else { return }
         DocsManager.shared.deletePack(goVersion: ver)
+    }
+
+    @objc private func docsPruneDepsClicked() {
+        let openRoots = NSApp.windows.compactMap { ($0.windowController as? ProjectWindowController)?.context.root }
+        DocsManager.shared.pruneUnusedDependencyPacks(keepingProjectRoots: openRoots)
     }
 
     @objc private func docsCancelClicked() {

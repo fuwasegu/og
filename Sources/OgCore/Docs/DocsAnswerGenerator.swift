@@ -72,6 +72,10 @@ public struct DocsAnswerEvidence: Sendable, Hashable {
     public var example: String?
     public var body: String
     public var since: String?
+    /// True when this evidence chunk originates from a project dependency module (U-2, Issue #27).
+    public var isDependency: Bool
+    /// Module `"path@version"` label when `isDependency == true`.
+    public var moduleLabel: String?
 
     public init(
         citation: String,
@@ -82,7 +86,9 @@ public struct DocsAnswerEvidence: Sendable, Hashable {
         summary: String,
         example: String?,
         body: String,
-        since: String?
+        since: String?,
+        isDependency: Bool = false,
+        moduleLabel: String? = nil
     ) {
         self.citation = citation
         self.title = title
@@ -93,6 +99,8 @@ public struct DocsAnswerEvidence: Sendable, Hashable {
         self.example = example
         self.body = body
         self.since = since
+        self.isDependency = isDependency
+        self.moduleLabel = moduleLabel
     }
 }
 

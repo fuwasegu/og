@@ -168,6 +168,19 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
                 self?.updateModeLabelForProgress()
             }
         })
+        // Invalidate displayed dependency answers immediately when go.mod/go.work changes in this project window (DOC-12c).
+        observers.append(NotificationCenter.default.addObserver(forName: .ogFilesChanged, object: context, queue: .main) { [weak self] note in
+            let paths = note.userInfo?["paths"] as? [String] ?? []
+            guard paths.contains(where: { $0.hasSuffix("/go.mod") || $0.hasSuffix("/go.work") }) else { return }
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.searchTask?.cancel()
+                self.synthesisTask?.cancel()
+                self.lastAnswer = nil
+                self.refreshVersionPopup()
+                self.renderIdleOrStatus()
+            }
+        })
         refreshVersionPopup()
         renderIdleOrStatus()
     }
@@ -175,7 +188,8 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
     private func updateModeLabelForProgress() {
         if let prog = DocsManager.shared.activeProgress,
            prog.phase == .extracting || prog.phase == .buildingFTS || prog.phase == .embedding || prog.phase == .activating {
-            modeLabel.stringValue = "Indexing go\(prog.goVersion) (\(prog.processedChunks)/\(prog.totalChunks))"
+            let label = prog.goVersion.contains("@") || prog.goVersion.contains(" ") ? prog.goVersion : "go\(prog.goVersion)"
+            modeLabel.stringValue = "Indexing \(label) (\(prog.processedChunks)/\(prog.totalChunks))"
         } else if let a = lastAnswer {
             modeLabel.stringValue = a.searchMode.shortLabel
         } else {
@@ -230,6 +244,14 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
         explicitVersion = v
         refreshVersionPopup()
         runSearch()
+    }
+
+    @objc private func syncDependenciesClicked() {
+        DocsManager.shared.syncProjectDependencies(projectRoot: context.root)
+    }
+
+    @objc private func downloadDependenciesClicked() {
+        DocsManager.shared.downloadAndSyncProjectDependencies(projectRoot: context.root)
     }
 
     @objc private func insertCardClicked(_ sender: NSButton) {
@@ -558,6 +580,34 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
                 size: 10
             ))
         }
+
+        // Issue #27 (DOC-12): Surface unindexed cached dependencies and uncached dependencies with explicit user actions.
+        if let depSummary = answer.dependencySummary {
+            if !depSummary.unindexedCachedModules.isEmpty {
+                let names = depSummary.unindexedCachedModules.prefix(3).map(\.displayID).joined(separator: ", ")
+                let more = depSummary.unindexedCachedModules.count > 3 ? " 他\(depSummary.unindexedCachedModules.count - 3)件" : ""
+                let msg = label("ローカルキャッシュ済みの未インデックス依存（\(depSummary.unindexedCachedModules.count)件）: \(names)\(more)", color: Theme.secondaryText, size: 11)
+                let syncBtn = NSButton(title: "依存ドキュメントを抽出", target: self, action: #selector(syncDependenciesClicked))
+                syncBtn.bezelStyle = .rounded
+                syncBtn.controlSize = .small
+                let row = NSStackView(views: [msg, syncBtn])
+                row.orientation = .horizontal
+                row.spacing = 8
+                contentStack.addArrangedSubview(row)
+            }
+            if !depSummary.uncachedModules.isEmpty {
+                let names = depSummary.uncachedModules.prefix(3).map(\.displayID).joined(separator: ", ")
+                let more = depSummary.uncachedModules.count > 3 ? " 他\(depSummary.uncachedModules.count - 3)件" : ""
+                let msg = label("module cache 未取得の依存（\(depSummary.uncachedModules.count)件 — 別バージョンでは代替しません）: \(names)\(more)", color: Theme.warning, size: 11)
+                let dlBtn = NSButton(title: "go mod download を実行", target: self, action: #selector(downloadDependenciesClicked))
+                dlBtn.bezelStyle = .rounded
+                dlBtn.controlSize = .small
+                let row = NSStackView(views: [msg, dlBtn])
+                row.orientation = .horizontal
+                row.spacing = 8
+                contentStack.addArrangedSubview(row)
+            }
+        }
     }
 
     private func makeCardView(card: DocsAnswerCard, index: Int) -> NSView {
@@ -616,9 +666,15 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
             inner.addArrangedSubview(codeContainer)
         }
 
-        // Footer: citation + Go version + Insert / Copy actions (UX-1, UX-2, G-4)
-        let sincePart = card.since.map { " (since go\($0))" } ?? ""
-        let citeField = label("出典: \(card.citation) • go\(card.goVersion)\(sincePart)", color: Theme.secondaryText, size: 11)
+        // Footer: citation + Go version / module@version + Insert / Copy actions (UX-1, UX-2, G-4, Issue #27)
+        let footerCiteText: String
+        if card.sourceKind == .dependency {
+            footerCiteText = "出典: \(card.citation)"
+        } else {
+            let sincePart = card.since.map { " (since go\($0))" } ?? ""
+            footerCiteText = "出典: \(card.citation) • go\(card.goVersion)\(sincePart)"
+        }
+        let citeField = label(footerCiteText, color: Theme.secondaryText, size: 11)
         citeField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         var footerViews: [NSView] = [citeField, NSView()]

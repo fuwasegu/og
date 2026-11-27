@@ -1,0 +1,39 @@
+// DocsDepsDesign ⊑ DocsDeps
+// Chunk-level staged dependency ingestion, loopback validation, explicit user fetch,
+// and exact go.mod/go.work (module, version) gating refine the requirements contract.
+refinement DocsDepsRefinesReq {
+  impl DocsDepsDesign
+  abs  DocsDeps
+  maps auto
+
+  map pack_state[s: ModSlot] =
+    if pack_state[s] == DReady then Ready
+    else if pack_state[s] == DFTSOnly then IndexingFTSOnly
+    else Missing
+
+  map batch_state =
+    if stage_phase == DIdle then BIdle
+    else if batch_paused then BPaused
+    else BRunning
+
+  map answer_kind =
+    if answer_kind == DDepCards then DepCards
+    else if answer_kind == DDepNotFound then DepNotFound
+    else if answer_kind == DDepUnindexed then DepUnindexed
+    else if answer_kind == DDepUncached then DepUncached
+    else NoAnswer
+
+  action set_endpoint(h)                    -> stutter
+  action batch_start(m, dv)                 -> start_dep_batch(m, dv)
+  action batch_build_fts_initial(m, dv)     -> publish_dep_fts(m, dv)
+  action batch_build_fts_update(m, dv)      -> stutter
+  action batch_pause()                      -> pause_dep_batch()
+  action batch_resume()                     -> resume_dep_batch()
+  action batch_embed_chunk(m, dv)           -> stutter
+  action batch_commit(m, dv)                -> complete_dep_batch(m, dv)
+  action batch_abort()                      -> abort_dep_batch()
+  action query_dep_found(m, dv, use_semantic, card_count)
+    -> query_dep_found(Local, m, dv, use_semantic, card_count, true, true)
+  action query_dep_not_found(m, dv)
+    -> query_dep_not_found(Local, m, dv)
+}

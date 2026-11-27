@@ -217,6 +217,7 @@ final class CountingFakeEmbedder: DocsEmbedder, @unchecked Sendable {
     private var _cancelManager: DocsPackManager?
     private var _cancelAfter: Int?
     private var _cancelVersion: String?
+    private var _cancelDepKey: GoModuleKey?
     private var _deleteInsteadOfCancel = false
 
     init(id: String = "fake-embed", version: String = "v1") {
@@ -239,6 +240,17 @@ final class CountingFakeEmbedder: DocsEmbedder, @unchecked Sendable {
         lock.lock()
         _cancelManager = manager
         _cancelVersion = goVersion
+        _cancelDepKey = nil
+        _cancelAfter = afterCalls
+        _deleteInsteadOfCancel = false
+        lock.unlock()
+    }
+
+    func configureCancelDependency(manager: DocsPackManager, key: GoModuleKey, afterCalls: Int) {
+        lock.lock()
+        _cancelManager = manager
+        _cancelVersion = nil
+        _cancelDepKey = key
         _cancelAfter = afterCalls
         _deleteInsteadOfCancel = false
         lock.unlock()
@@ -248,6 +260,7 @@ final class CountingFakeEmbedder: DocsEmbedder, @unchecked Sendable {
         lock.lock()
         _cancelManager = manager
         _cancelVersion = goVersion
+        _cancelDepKey = nil
         _cancelAfter = afterCalls
         _deleteInsteadOfCancel = true
         lock.unlock()
@@ -257,29 +270,34 @@ final class CountingFakeEmbedder: DocsEmbedder, @unchecked Sendable {
         lock.lock()
         _cancelManager = nil
         _cancelVersion = nil
+        _cancelDepKey = nil
         _cancelAfter = nil
         _deleteInsteadOfCancel = false
         lock.unlock()
     }
 
-    private func recordCallAndTakeCancelTarget() -> (DocsPackManager, String, Bool)? {
+    private func recordCallAndTakeCancelTarget() -> (DocsPackManager, String?, GoModuleKey?, Bool)? {
         lock.lock()
         defer { lock.unlock() }
         _callCount += 1
         let count = _callCount
-        if let mgr = _cancelManager, let ver = _cancelVersion, let limit = _cancelAfter, count >= limit {
+        if let mgr = _cancelManager, let limit = _cancelAfter, count >= limit {
             _cancelAfter = nil
-            return (mgr, ver, _deleteInsteadOfCancel)
+            return (mgr, _cancelVersion, _cancelDepKey, _deleteInsteadOfCancel)
         }
         return nil
     }
 
     func embed(_ text: String) async throws -> [Float] {
-        if let (mgr, ver, shouldDelete) = recordCallAndTakeCancelTarget() {
-            if shouldDelete {
-                _ = try? await mgr.deletePack(goVersion: ver)
-            } else {
-                await mgr.requestCancel(goVersion: ver)
+        if let (mgr, ver, depKey, shouldDelete) = recordCallAndTakeCancelTarget() {
+            if let depKey {
+                await mgr.requestCancelDependency(key: depKey)
+            } else if let ver {
+                if shouldDelete {
+                    _ = try? await mgr.deletePack(goVersion: ver)
+                } else {
+                    await mgr.requestCancel(goVersion: ver)
+                }
             }
         }
 
@@ -861,6 +879,10 @@ final class LocalMockHTTPServer: @unchecked Sendable {
 }
 
 func makeUUID() -> UUID { UUID() }
+
+func writeTextFile(at url: URL, contents: String) throws {
+    try contents.write(to: url, atomically: true, encoding: .utf8)
+}
 
 func isGoToolchainActive() -> Bool {
     let locator = ToolLocator()
