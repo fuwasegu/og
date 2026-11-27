@@ -232,6 +232,20 @@ public actor DocsPackManager {
         dependencyPackDirectory(for: key).appendingPathComponent("index.sqlite")
     }
 
+    public func websitePackDirectory() -> URL {
+        rootDirectory.appendingPathComponent("packs/website", isDirectory: true)
+    }
+
+    public func websiteStagingDirectory() -> URL {
+        rootDirectory.appendingPathComponent("staging/website", isDirectory: true)
+    }
+
+    public func websiteIndexURL() -> URL {
+        websitePackDirectory().appendingPathComponent("index.sqlite")
+    }
+
+    private static let websiteBatchKey = "website"
+
     /// Global user/app-extensible concept rules JSON path (S-3).
     public func conceptRulesURL() -> URL {
         rootDirectory.appendingPathComponent("concept_rules.json")
@@ -419,6 +433,46 @@ public actor DocsPackManager {
         "dep:\(key.storageKey)"
     }
 
+    // MARK: - Website Snapshot Pack Inventory (Issue #26, DOC-14a, DES-WEB-1)
+
+    public func websiteManifest() -> DocsWebsitePackManifest? {
+        let dir = websitePackDirectory()
+        guard let data = try? Data(contentsOf: manifestURL(in: dir)),
+              var m = try? JSONDecoder().decode(DocsWebsitePackManifest.self, from: data) else { return nil }
+        m.sizeBytes = Self.directorySizeBytes(dir)
+        return m
+    }
+
+    public func openWebsiteIndex() throws -> DocsIndex? {
+        guard websiteManifest() != nil else { return nil }
+        let url = websiteIndexURL()
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return try DocsIndex(databaseURL: url, readOnly: true)
+    }
+
+    public func requestCancelWebsite() {
+        cancelRequested[Self.websiteBatchKey] = true
+    }
+
+    @discardableResult
+    public func deleteWebsitePack() async throws -> Int {
+        let batchKey = Self.websiteBatchKey
+        cancelRequested[batchKey] = true
+        let fm = FileManager.default
+        let packDir = websitePackDirectory()
+        if fm.fileExists(atPath: packDir.path) {
+            try fm.removeItem(at: packDir)
+        }
+        let stageDir = websiteStagingDirectory()
+        if inFlightVersions.contains(batchKey) {
+            deletedWhileInFlight.insert(batchKey)
+        } else if fm.fileExists(atPath: stageDir.path) {
+            try? fm.removeItem(at: stageDir)
+        }
+        latestProgress.removeValue(forKey: batchKey)
+        return try await garbageCollectSharedVectors()
+    }
+
     /// Migrates existing v2 installed packs (including GOROOT-imported packs) in place to schema v3 (S-1, T-1, T-2):
     /// - v2 packs (`schemaVersion == 2`): adds missing `provenance` column, accurately tags bundled complement chunks
     ///   with `.bundledCurated` while preserving `.officialExtracted` on real GOROOT chunks, checkpoints WAL, closes DB
@@ -576,6 +630,33 @@ public actor DocsPackManager {
             let batchKey = Self.depBatchKey(for: depPack.key)
             if !inFlightVersions.contains(batchKey) {
                 let stage = dependencyStagingDirectory(for: depPack.key)
+                if fm.fileExists(atPath: stage.path) {
+                    try? fm.removeItem(at: stage)
+                }
+            }
+        }
+
+        // DOC-14c / ReadyWebsitePackMatchesModel: also demote incompatible website snapshot pack to FTS-only.
+        if var webPack = websiteManifest() {
+            let matches = (webPack.embeddingModelID == model?.id && webPack.embeddingModelVersion == model?.version)
+            if !matches && (webPack.status == .ready || webPack.embeddingModelID != nil) {
+                needsRebuild = true
+                webPack.status = .indexingFTSOnly
+                webPack.embeddingModelID = nil
+                webPack.embeddingModelVersion = nil
+                let dir = websitePackDirectory()
+                let dbURL = dir.appendingPathComponent("index.sqlite")
+                if fm.fileExists(atPath: dbURL.path) {
+                    let idx = try DocsIndex(databaseURL: dbURL, readOnly: false)
+                    defer { idx.close() }
+                    try idx.clearVectorReferences()
+                    try idx.checkpointWAL()
+                }
+                let data = try encoder.encode(webPack)
+                try data.write(to: manifestURL(in: dir), options: .atomic)
+            }
+            if !inFlightVersions.contains(Self.websiteBatchKey) {
+                let stage = websiteStagingDirectory()
                 if fm.fileExists(atPath: stage.path) {
                     try? fm.removeItem(at: stage)
                 }
@@ -896,6 +977,292 @@ public actor DocsPackManager {
         }
         index.close()
         return try await ingest(goVersion: goVersion, chunks: chunks, embedder: embedder, onProgress: onProgress)
+    }
+
+    // MARK: - Staged, Resumable Website Snapshot Pack Ingestion (Issue #26, DOC-14c, DES-WEB-3)
+
+    /// Ingests a version-independent `golang/website` snapshot pack into `packs/website/` with staged
+    /// atomic activation, chunk-level pause/resume checkpoints, and shared vector store reuse.
+    public func ingestWebsite(
+        chunks: [DocsChunk],
+        snapshotDate: String,
+        snapshotCommit: String? = nil,
+        sourceRepository: String = DocsWebsitePackManifest.defaultSourceRepository,
+        includedCategories: [String] = [],
+        embedder: (any DocsEmbedder)? = nil,
+        simulateSwapFailure: Bool = false,
+        onProgress: (@Sendable (DocsBatchProgress) -> Void)? = nil
+    ) async throws -> DocsIngestionReport {
+        let batchKey = Self.websiteBatchKey
+        guard !inFlightVersions.contains(batchKey) else {
+            throw DocsStorageError.batchAlreadyRunning("golang/website")
+        }
+        inFlightVersions.insert(batchKey)
+        cancelRequested[batchKey] = false
+        deletedWhileInFlight.remove(batchKey)
+        pinnedVectorKeys[batchKey] = []
+        defer {
+            inFlightVersions.remove(batchKey)
+            pinnedVectorKeys.removeValue(forKey: batchKey)
+            deletedWhileInFlight.remove(batchKey)
+        }
+
+        let estimate = Self.estimateBatch(chunks: chunks, includesEmbeddings: embedder != nil)
+        let fm = FileManager.default
+        let activeDir = websitePackDirectory()
+        let stageDir = websiteStagingDirectory()
+        let activeDBURL = websiteIndexURL()
+        let activeExists = fm.fileExists(atPath: activeDBURL.path)
+
+        var processed = 0
+        var reusedCount = 0
+        var computedCount = 0
+
+        func emit(_ phase: DocsBatchPhase, error: String? = nil) {
+            let p = DocsBatchProgress(
+                goVersion: "golang/website (\(snapshotDate))",
+                phase: phase,
+                processedChunks: processed,
+                totalChunks: chunks.count,
+                reusedVectors: reusedCount,
+                computedVectors: computedCount,
+                estimatedBytes: estimate.estimatedBytes,
+                errorMessage: error
+            )
+            latestProgress[batchKey] = p
+            onProgress?(p)
+        }
+
+        var stageIndexHandle: DocsIndex?
+        var stageClosed = false
+        func closeStageIndex() {
+            if !stageClosed {
+                stageIndexHandle?.close()
+                stageClosed = true
+            }
+        }
+
+        do {
+            emit(.extracting)
+
+            var previousHashes: [String: String] = [:]
+            var previousRefs: [String: SharedVectorKey] = [:]
+            if activeExists {
+                let activeIndex = try DocsIndex(databaseURL: activeDBURL, readOnly: true)
+                defer { activeIndex.close() }
+                previousHashes = try activeIndex.contentHashesByStableID()
+                previousRefs = try activeIndex.vectorReferences()
+            }
+            let diff = DocsChunkDiff.compute(previous: previousHashes, next: chunks)
+            let unchangedIDs = Set(diff.unchanged.map(\.stableID))
+            let changedIDs = diff.changed.map(\.stableID)
+
+            try fm.createDirectory(at: stageDir, withIntermediateDirectories: true)
+            let stageDBURL = stageDir.appendingPathComponent("index.sqlite")
+            let stageIndex = try DocsIndex(databaseURL: stageDBURL, readOnly: false)
+            stageIndexHandle = stageIndex
+            defer { closeStageIndex() }
+
+            let stageRefs = try stageIndex.vectorReferences()
+
+            emit(.buildingFTS)
+            try stageIndex.replaceAllChunks(chunks)
+            try stageIndex.removeVectorReferences(forStableIDs: diff.removed + changedIDs)
+
+            if let embedder {
+                let model = embedder.descriptor
+                for (stableID, ref) in previousRefs where unchangedIDs.contains(stableID) {
+                    if ref.modelID == model.id && ref.modelVersion == model.version && stageRefs[stableID] == nil {
+                        try stageIndex.recordVectorReference(stableID: stableID, key: ref)
+                    }
+                }
+            } else {
+                try stageIndex.clearVectorReferences()
+            }
+
+            try stageIndex.checkpointWAL()
+
+            if !activeExists && embedder != nil && !(Task.isCancelled || cancelRequested[batchKey] == true) {
+                try publishInitialWebsiteFTSOnlySnapshot(
+                    fromStageDB: stageDBURL,
+                    snapshotDate: snapshotDate,
+                    snapshotCommit: snapshotCommit,
+                    sourceRepository: sourceRepository,
+                    includedCategories: includedCategories,
+                    chunkCount: chunks.count
+                )
+            }
+
+            var finalStatus: DocsPackStatus = .indexingFTSOnly
+
+            if let embedder {
+                let model = embedder.descriptor
+                let completedRefs = try stageIndex.vectorReferences()
+                let batchSize = max(1, embedder.preferredBatchSize)
+                var pendingBatch: [(chunk: DocsChunk, key: SharedVectorKey)] = []
+                pendingBatch.reserveCapacity(batchSize)
+
+                for chunk in chunks {
+                    if Task.isCancelled || cancelRequested[batchKey] == true {
+                        try? stageIndex.checkpointWAL()
+                        closeStageIndex()
+                        await cleanupDeletedWebsiteInFlightIfNeeded()
+                        emit(.cancelled)
+                        return DocsIngestionReport(
+                            goVersion: batchKey,
+                            status: websiteManifest()?.status ?? .indexingFTSOnly,
+                            totalChunks: chunks.count,
+                            addedChunks: diff.added.count,
+                            changedChunks: diff.changed.count,
+                            removedChunks: diff.removed.count,
+                            unchangedChunks: diff.unchanged.count,
+                            reusedVectors: reusedCount,
+                            computedVectors: computedCount,
+                            cancelled: true
+                        )
+                    }
+
+                    let vKey = SharedVectorKey(contentHash: chunk.contentHash, model: model)
+                    pinnedVectorKeys[batchKey, default: []].insert(vKey)
+
+                    if let existingRef = completedRefs[chunk.stableID], existingRef == vKey,
+                       (try await sharedVectorStore.contains(vKey)) {
+                        reusedCount += 1
+                        processed += 1
+                        emit(.embedding)
+                        continue
+                    }
+
+                    if try await sharedVectorStore.contains(vKey) {
+                        try stageIndex.recordVectorReference(stableID: chunk.stableID, key: vKey)
+                        reusedCount += 1
+                        processed += 1
+                        emit(.embedding)
+                    } else {
+                        pendingBatch.append((chunk, vKey))
+                        if pendingBatch.count >= batchSize {
+                            let batch = pendingBatch
+                            pendingBatch.removeAll(keepingCapacity: true)
+                            let vectors = try await computeBatchVectors(batch.map(\.chunk.embeddingText), with: embedder)
+                            for (item, vector) in zip(batch, vectors) {
+                                try await sharedVectorStore.store(key: item.key, vector: vector)
+                                try stageIndex.recordVectorReference(stableID: item.chunk.stableID, key: item.key)
+                                computedCount += 1
+                                processed += 1
+                            }
+                            emit(.embedding)
+                        }
+                    }
+                }
+                if !pendingBatch.isEmpty && !(Task.isCancelled || cancelRequested[batchKey] == true) {
+                    let batch = pendingBatch
+                    pendingBatch.removeAll(keepingCapacity: true)
+                    let vectors = try await computeBatchVectors(batch.map(\.chunk.embeddingText), with: embedder)
+                    for (item, vector) in zip(batch, vectors) {
+                        try await sharedVectorStore.store(key: item.key, vector: vector)
+                        try stageIndex.recordVectorReference(stableID: item.chunk.stableID, key: item.key)
+                        computedCount += 1
+                        processed += 1
+                    }
+                    emit(.embedding)
+                }
+                finalStatus = .ready
+            } else {
+                processed = chunks.count
+                finalStatus = .indexingFTSOnly
+            }
+
+            if Task.isCancelled || cancelRequested[batchKey] == true {
+                try? stageIndex.checkpointWAL()
+                closeStageIndex()
+                await cleanupDeletedWebsiteInFlightIfNeeded()
+                emit(.cancelled)
+                return DocsIngestionReport(
+                    goVersion: batchKey,
+                    status: websiteManifest()?.status ?? .indexingFTSOnly,
+                    totalChunks: chunks.count,
+                    addedChunks: diff.added.count,
+                    changedChunks: diff.changed.count,
+                    removedChunks: diff.removed.count,
+                    unchangedChunks: diff.unchanged.count,
+                    reusedVectors: reusedCount,
+                    computedVectors: computedCount,
+                    cancelled: true
+                )
+            }
+
+            try stageIndex.checkpointWAL()
+            closeStageIndex()
+
+            emit(.activating)
+
+            let manifest = DocsWebsitePackManifest(
+                sourceRepository: sourceRepository,
+                snapshotDate: snapshotDate,
+                snapshotCommit: snapshotCommit,
+                createdAt: ISO8601DateFormatter().string(from: Date()),
+                license: DocsLicense.goBSD3Clause,
+                chunkCount: chunks.count,
+                status: finalStatus,
+                embeddingModelID: embedder?.descriptor.id,
+                embeddingModelVersion: embedder?.descriptor.version,
+                sizeBytes: Self.directorySizeBytes(stageDir),
+                includedCategories: includedCategories
+            )
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            try encoder.encode(manifest).write(to: manifestURL(in: stageDir), options: .atomic)
+
+            if simulateSwapFailure {
+                throw DocsStorageError.io("simulated atomic swap failure")
+            }
+            try Self.atomicReplaceDirectory(source: stageDir, destination: activeDir)
+
+            emit(.completed)
+            return DocsIngestionReport(
+                goVersion: batchKey,
+                status: finalStatus,
+                totalChunks: chunks.count,
+                addedChunks: diff.added.count,
+                changedChunks: diff.changed.count,
+                removedChunks: diff.removed.count,
+                unchangedChunks: diff.unchanged.count,
+                reusedVectors: reusedCount,
+                computedVectors: computedCount,
+                cancelled: false
+            )
+        } catch {
+            closeStageIndex()
+            await cleanupDeletedWebsiteInFlightIfNeeded()
+            emit(.failed, error: error.localizedDescription)
+            throw error
+        }
+    }
+
+    /// Re-embeds an already-installed website snapshot pack in place using `embedder` (DOC-14c).
+    public func reembedWebsitePack(
+        embedder: any DocsEmbedder,
+        onProgress: (@Sendable (DocsBatchProgress) -> Void)? = nil
+    ) async throws -> DocsIngestionReport? {
+        guard let existing = websiteManifest(),
+              let index = try openWebsiteIndex() else { return nil }
+        let chunks: [DocsChunk]
+        do {
+            chunks = try index.allChunks()
+        } catch {
+            index.close()
+            throw error
+        }
+        index.close()
+        return try await ingestWebsite(
+            chunks: chunks,
+            snapshotDate: existing.snapshotDate,
+            snapshotCommit: existing.snapshotCommit,
+            sourceRepository: existing.sourceRepository,
+            includedCategories: existing.includedCategories,
+            embedder: embedder,
+            onProgress: onProgress
+        )
     }
 
     // MARK: - Staged, Resumable Dependency Module Pack Ingestion (Issue #27, DES-DEP-1..4)
@@ -1459,6 +1826,23 @@ public actor DocsPackManager {
         _ = try? await garbageCollectSharedVectors()
     }
 
+    private func cleanupDeletedWebsiteInFlightIfNeeded() async {
+        let batchKey = Self.websiteBatchKey
+        guard deletedWhileInFlight.remove(batchKey) != nil else { return }
+        let fm = FileManager.default
+        let stageDir = websiteStagingDirectory()
+        let activeDir = websitePackDirectory()
+        if fm.fileExists(atPath: stageDir.path) {
+            try? fm.removeItem(at: stageDir)
+        }
+        if fm.fileExists(atPath: activeDir.path) {
+            try? fm.removeItem(at: activeDir)
+        }
+        pinnedVectorKeys.removeValue(forKey: batchKey)
+        latestProgress.removeValue(forKey: batchKey)
+        _ = try? await garbageCollectSharedVectors()
+    }
+
     /// Reclaims any vector in `SharedVectorStore` not referenced by any active pack, staging checkpoint,
     /// or currently running batch (FR-30, H-9).
     @discardableResult
@@ -1479,6 +1863,11 @@ public actor DocsPackManager {
                 let refs = try index.vectorReferences()
                 for key in refs.values { referenced.insert(key) }
             }
+        }
+        if let webIndex = try openWebsiteIndex() {
+            defer { webIndex.close() }
+            let refs = try webIndex.vectorReferences()
+            for key in refs.values { referenced.insert(key) }
         }
 
         // 2. Staging checkpoints for resumable / paused batches (H-9)
@@ -1545,6 +1934,36 @@ public actor DocsPackManager {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(manifest).write(to: manifestURL(in: tempDir), options: .atomic)
         try Self.atomicReplaceDirectory(source: tempDir, destination: dependencyPackDirectory(for: key))
+    }
+
+    private func publishInitialWebsiteFTSOnlySnapshot(
+        fromStageDB stageDB: URL,
+        snapshotDate: String,
+        snapshotCommit: String?,
+        sourceRepository: String,
+        includedCategories: [String],
+        chunkCount: Int
+    ) throws {
+        let fm = FileManager.default
+        let tempDir = rootDirectory.appendingPathComponent("staging/.fts-pub-website-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempDir) }
+        try fm.copyItem(at: stageDB, to: tempDir.appendingPathComponent("index.sqlite"))
+        let manifest = DocsWebsitePackManifest(
+            sourceRepository: sourceRepository,
+            snapshotDate: snapshotDate,
+            snapshotCommit: snapshotCommit,
+            createdAt: ISO8601DateFormatter().string(from: Date()),
+            license: DocsLicense.goBSD3Clause,
+            chunkCount: chunkCount,
+            status: .indexingFTSOnly,
+            sizeBytes: Self.directorySizeBytes(tempDir),
+            includedCategories: includedCategories
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(manifest).write(to: manifestURL(in: tempDir), options: .atomic)
+        try Self.atomicReplaceDirectory(source: tempDir, destination: websitePackDirectory())
     }
 
     private func publishInitialFTSOnlySnapshot(fromStageDB stageDB: URL, goVersion: String, chunkCount: Int) throws {

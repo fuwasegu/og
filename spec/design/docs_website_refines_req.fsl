@@ -1,0 +1,40 @@
+// DocsWebsiteDesign ⊑ DocsWebsite
+// Staged extraction of golang/website into packs/website, chunk-level resumable
+// embedding, shared vector reuse, loopback enforcement, and snapshot provenance
+// refine the DOC-14 requirements contract.
+refinement DocsWebsiteRefinesReq {
+  impl DocsWebsiteDesign
+  abs  DocsWebsite
+  maps auto
+
+  map website_pack_state =
+    if website_pack_state == DReady then Ready
+    else if website_pack_state == DFTSOnly then IndexingFTSOnly
+    else Missing
+
+  map batch_state =
+    if stage_phase == DIdle then BIdle
+    else if batch_paused then BPaused
+    else BRunning
+
+  map answer_kind =
+    if answer_kind == DWebsiteCards then WebsiteCards
+    else if answer_kind == DWebsiteNotFound then WebsiteNotFound
+    else NoAnswer
+
+  action set_endpoint(h)                    -> stutter
+  action batch_start()                      -> start_website_batch()
+  action batch_build_fts_initial()          -> publish_website_fts()
+  action batch_build_fts_update()           -> stutter
+  action batch_pause()                      -> pause_website_batch()
+  action batch_resume()                     -> resume_website_batch()
+  action batch_embed_chunk_reuse()          -> stutter
+  action batch_embed_chunk_compute()        -> stutter
+  action batch_commit_compute()             -> complete_website_batch_compute()
+  action batch_commit_reuse()               -> complete_website_batch_reuse()
+  action batch_abort()                      -> abort_website_batch()
+  action query_website_found(use_semantic, card_count)
+    -> query_website_found(Local, use_semantic, card_count, true, true)
+  action query_website_not_found()
+    -> query_website_not_found(Local)
+}

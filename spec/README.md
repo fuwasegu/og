@@ -37,6 +37,7 @@ FSL で表せるのは、操作の順序や組み合わせで壊れうる部分�
 | Docs 回答生成・検証 | DOC-11 | `req/docs_answer.fsl` |
 | Docs 依存ライブラリ | DOC-12 | `req/docs_deps.fsl` |
 | Docs エラー駆動調べ物 | DOC-13 | `req/docs_errors.fsl` |
+| Docs 公式ウェブサイト | DOC-14 | `req/docs_website.fsl` |
 | テストで確認 | WS-2, WS-3, FT-1, FT-3, ED-4, ED-5 | UI テスト |
 | テストで確認 | NAV-1〜NAV-6, LSP-3 | gopls 結合テスト（読み取りのみ） |
 | テストで確認 | TERM-1, GO-1〜GO-4 の変換内容 | ユニットテスト |
@@ -55,7 +56,7 @@ FSL で表せるのは、操作の順序や組み合わせで壊れうる部分�
 - VCS-1 ツリー上の状態表示、VCS-2 差分ガター、VCS-3 commit・ブランチ・stash
 - GO-1 Postfix 補完、GO-2 Struct タグ生成、GO-3 Table Test 生成、GO-4 implements 表示、GO-5 ローカル AI 補完
 - AI-1 有効化で起動、AI-2 無効化・終了で停止、AI-3 準備完了の判定、AI-4 異常終了の自動再起動と上限、AI-5 手動の再試行、AI-6 モデルの切り替え
-- DOC-1 オプトイン（補完と独立）、DOC-2 対象 Go バージョンの自動決定とパック/since 二段バージョンゲート、DOC-3 パックの初回構築・Ready 更新の原子的切替と中断/失敗時の旧パック保全、DOC-4 バッチの中断・再開とモデル変更時の FTS-only 降格・再構築、DOC-5 共有ベクトルストアによるバージョン間再利用、DOC-6 loopback 完結（NeverLeavesMachine）、DOC-7 根拠チャンク限定・出典/検索範囲の分離・ハルシネーション禁止、DOC-8 LLM なし（FTS 抜粋）での成立、DOC-9 現行バージョンのゲート通過済みカードのみの挿入、DOC-10 二段検索パイプライン（回収＋任意ローカルリランク）と未導入時の Phase 1 フォールバック、DOC-12 依存ライブラリの module cache 抽出・厳格バージョン一致・プロジェクト切替時の有効集合切替、DOC-13 エラー駆動調べ物（診断・ビルドエラーからの出典付きカード提示・版束縛による古い提示の消去・割り込み禁止・却下の粘着・明示操作のみの挿入）
+- DOC-1 オプトイン（補完と独立）、DOC-2 対象 Go バージョンの自動決定とパック/since 二段バージョンゲート、DOC-3 パックの初回構築・Ready 更新の原子的切替と中断/失敗時の旧パック保全、DOC-4 バッチの中断・再開とモデル変更時の FTS-only 降格・再構築、DOC-5 共有ベクトルストアによるバージョン間再利用、DOC-6 loopback 完結（NeverLeavesMachine）、DOC-7 根拠チャンク限定・出典/検索範囲の分離・ハルシネーション禁止、DOC-8 LLM なし（FTS 抜粋）での成立、DOC-9 現行バージョンのゲート通過済みカードのみの挿入、DOC-10 二段検索パイプライン（回収＋任意ローカルリランク）と未導入時の Phase 1 フォールバック、DOC-12 依存ライブラリの module cache 抽出・厳格バージョン一致・プロジェクト切替時の有効集合切替、DOC-13 エラー駆動調べ物（診断・ビルドエラーからの出典付きカード提示・版束縛による古い提示の消去・割り込み禁止・却下の粘着・明示操作のみの挿入）、DOC-14 公式ウェブサイト（`golang/website` の版独立スナップショットパック・記事名/URL/スナップショット日の出典明示・`since` ゲート非適用・Go 版パック必須・共有ベクトル再利用・loopback 完結）
 - NFR-1 WebView なし、NFR-2 120 fps と表示行だけの描画、NFR-3 Swift 6 の厳格な並行性チェック
 
 ## 設計層
@@ -76,6 +77,7 @@ FSL で表せるのは、操作の順序や組み合わせで壊れうる部分�
 | Docs 回答生成・検証 | `design/docs_answer.fsl` | `design/docs_answer_refines_req.fsl` | refines |
 | Docs 依存ライブラリ | `design/docs_deps.fsl` | `design/docs_deps_refines_req.fsl` | refines |
 | Docs エラー駆動調べ物 | `design/docs_errors.fsl` | `design/docs_errors_refines_req.fsl` | refines |
+| Docs 公式ウェブサイト | `design/docs_website.fsl` | `design/docs_website_refines_req.fsl` | refines |
 
 ```sh
 fslc refine spec/design/workspace.fsl spec/req/workspace.fsl spec/design/workspace_refines_req.fsl
