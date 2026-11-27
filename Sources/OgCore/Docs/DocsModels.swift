@@ -36,10 +36,11 @@ public enum DocsChunkKind: String, Sendable, Hashable, Codable, CaseIterable {
 }
 
 /// Provenance distinguishing official extracted GoDoc, official GOROOT Example tests,
-/// and og's bundled curated summaries (R-9, Issue #25).
+/// official `golang/website` snapshots, and og's bundled curated summaries (R-9, Issue #25, #26).
 public enum DocsProvenance: String, Sendable, Hashable, Codable {
     case officialExtracted = "official_extracted"
     case officialExample = "official_example"
+    case officialWebsiteSnapshot = "official_website_snapshot"
     case bundledCurated = "bundled_curated"
 }
 
@@ -83,6 +84,10 @@ public struct DocsChunk: Sendable, Hashable, Codable {
     public var moduleVersion: String?
     /// For `.dependency` chunks: optional concise SPDX-style license identifier (e.g. `"MIT"`, `"Apache-2.0"`), detected from module root (DES-DEP-4).
     public var license: String?
+    /// For `.officialWebsiteSnapshot` chunks: canonical official URL (e.g. `"https://go.dev/doc/effective_go#defer"`) (Issue #26, DOC-14a).
+    public var sourceURL: String?
+    /// For `.officialWebsiteSnapshot` chunks: ISO-8601 snapshot date (`YYYY-MM-DD`) of the ingested `golang/website` checkout (Issue #26, DOC-14a).
+    public var snapshotDate: String?
 
     public init(
         goVersion: String,
@@ -102,7 +107,9 @@ public struct DocsChunk: Sendable, Hashable, Codable {
         searchAliases: [String] = [],
         modulePath: String? = nil,
         moduleVersion: String? = nil,
-        license: String? = nil
+        license: String? = nil,
+        sourceURL: String? = nil,
+        snapshotDate: String? = nil
     ) {
         let resolvedDocID = documentID ?? (packageName.isEmpty ? source.rawValue : packageName)
         self.stableID = Self.makeStableID(
@@ -131,6 +138,8 @@ public struct DocsChunk: Sendable, Hashable, Codable {
         self.modulePath = modulePath
         self.moduleVersion = moduleVersion
         self.license = license
+        self.sourceURL = sourceURL
+        self.snapshotDate = snapshotDate
         self.contentHash = Self.computeContentHash(
             stableID: self.stableID,
             title: title,
@@ -164,7 +173,9 @@ public struct DocsChunk: Sendable, Hashable, Codable {
         storedContentHash: String,
         modulePath: String? = nil,
         moduleVersion: String? = nil,
-        license: String? = nil
+        license: String? = nil,
+        sourceURL: String? = nil,
+        snapshotDate: String? = nil
     ) {
         self.stableID = restoredStableID
         self.goVersion = goVersion
@@ -186,6 +197,8 @@ public struct DocsChunk: Sendable, Hashable, Codable {
         self.modulePath = modulePath
         self.moduleVersion = moduleVersion
         self.license = license
+        self.sourceURL = sourceURL
+        self.snapshotDate = snapshotDate
     }
 
     /// FR-31 & H-6: deterministic, version-independent ID including document identity.
@@ -231,15 +244,23 @@ public struct DocsChunk: Sendable, Hashable, Codable {
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Human-readable citation label (FR-13 / G-4, R-9, Issue #25: clearly marks official examples and bundled curated summaries).
+    /// Human-readable citation label (FR-13 / G-4, R-9, Issue #25, #26: clearly marks official examples,
+    /// `golang/website` snapshot provenance with URL & snapshot date, and bundled curated summaries).
     public var citationLabel: String {
+        if provenance == .officialWebsiteSnapshot {
+            let urlPart = (sourceURL.map { !$0.isEmpty } == true) ? " (\((sourceURL ?? "")))" : ""
+            let snapPart = (snapshotDate.map { !$0.isEmpty } == true)
+                ? " [golang/website snapshot \(snapshotDate!)]"
+                : " [golang/website snapshot]"
+            return "\(title)\(urlPart)\(snapPart)"
+        }
         let sourceLabel: String
         switch provenance {
         case .bundledCurated:
             sourceLabel = "\(source.displayName) [og bundled summary]"
         case .officialExample:
             sourceLabel = "\(source.displayName) [公式サンプル]"
-        case .officialExtracted:
+        case .officialExtracted, .officialWebsiteSnapshot:
             sourceLabel = source.displayName
         }
         switch source {
@@ -460,6 +481,66 @@ public struct DocsDependencyPackManifest: Sendable, Hashable, Codable {
     }
 }
 
+/// Metadata stored alongside the version-independent `golang/website` snapshot pack (Issue #26, DOC-14a, DES-WEB-1).
+public struct DocsWebsitePackManifest: Sendable, Hashable, Codable {
+    public static let defaultSourceRepository = "https://github.com/golang/website"
+
+    public var sourceRepository: String
+    /// ISO-8601 snapshot date (`YYYY-MM-DD`) derived from git commit metadata or explicit option; `nil` when unknown (never fabricated from import date, Issue #26 C-1).
+    public var snapshotDate: String?
+    /// Optional git commit SHA / tag of the ingested `golang/website` checkout.
+    public var snapshotCommit: String?
+    public var createdAt: String
+    public var license: String
+    public var chunkCount: Int
+    public var status: DocsPackStatus
+    public var embeddingModelID: String?
+    public var embeddingModelVersion: String?
+    public var sizeBytes: Int64
+    public var includedCategories: [String]
+
+    public init(
+        sourceRepository: String = DocsWebsitePackManifest.defaultSourceRepository,
+        snapshotDate: String? = nil,
+        snapshotCommit: String? = nil,
+        createdAt: String,
+        license: String = DocsLicense.goBSD3Clause,
+        chunkCount: Int,
+        status: DocsPackStatus,
+        embeddingModelID: String? = nil,
+        embeddingModelVersion: String? = nil,
+        sizeBytes: Int64 = 0,
+        includedCategories: [String] = []
+    ) {
+        self.sourceRepository = sourceRepository
+        self.snapshotDate = snapshotDate
+        self.snapshotCommit = snapshotCommit
+        self.createdAt = createdAt
+        self.license = license
+        self.chunkCount = chunkCount
+        self.status = status
+        self.embeddingModelID = embeddingModelID
+        self.embeddingModelVersion = embeddingModelVersion
+        self.sizeBytes = sizeBytes
+        self.includedCategories = includedCategories
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        sourceRepository = try c.decodeIfPresent(String.self, forKey: .sourceRepository) ?? Self.defaultSourceRepository
+        snapshotDate = try c.decodeIfPresent(String.self, forKey: .snapshotDate)
+        snapshotCommit = try c.decodeIfPresent(String.self, forKey: .snapshotCommit)
+        createdAt = try c.decode(String.self, forKey: .createdAt)
+        license = try c.decodeIfPresent(String.self, forKey: .license) ?? DocsLicense.goBSD3Clause
+        chunkCount = try c.decode(Int.self, forKey: .chunkCount)
+        status = try c.decode(DocsPackStatus.self, forKey: .status)
+        embeddingModelID = try c.decodeIfPresent(String.self, forKey: .embeddingModelID)
+        embeddingModelVersion = try c.decodeIfPresent(String.self, forKey: .embeddingModelVersion)
+        sizeBytes = try c.decodeIfPresent(Int64.self, forKey: .sizeBytes) ?? 0
+        includedCategories = try c.decodeIfPresent([String].self, forKey: .includedCategories) ?? []
+    }
+}
+
 /// Diff between two chunk sets computed by stable ID and content hash (FR-26, FR-31).
 public struct DocsChunkDiff: Sendable, Equatable {
     public var added: [DocsChunk]
@@ -498,10 +579,10 @@ public struct DocsChunkDiff: Sendable, Equatable {
     }
 }
 
-/// BSD-3-Clause license text for redistributed Go documentation excerpts (Q-4).
+/// BSD-3-Clause license text for redistributed Go documentation excerpts (GOROOT & golang/website, Q-4, Issue #26).
 public enum DocsLicense {
     public static let goBSD3Clause = """
-    Go Documentation Excerpts — BSD-3-Clause License
+    Go Documentation & Website Excerpts (golang/go, golang/website) — BSD-3-Clause License
     Copyright (c) 2009 The Go Authors. All rights reserved.
 
     Redistribution and use in source and binary forms, with or without

@@ -20,6 +20,7 @@ final class DocsManager {
 
     private(set) var installedPacks: [DocsPackManifest] = []
     private(set) var installedDependencyPacks: [DocsDependencyPackManifest] = []
+    private(set) var installedWebsitePack: DocsWebsitePackManifest?
     private(set) var activeProgress: DocsBatchProgress?
     private(set) var lastError: String?
     private(set) var detectedToolchainVersion: GoVersion?
@@ -167,6 +168,7 @@ final class DocsManager {
         await reloadConceptRules()
         installedPacks = await pm.installedPacks()
         installedDependencyPacks = await pm.installedDependencyPacks()
+        installedWebsitePack = await pm.websiteManifest()
         notifyPacksChanged()
     }
 
@@ -283,12 +285,75 @@ final class DocsManager {
                 }
                 if report == nil {
                     await DocsManager.shared.finishBatch(goVersion: goVersion, error: "No installed pack for go\(goVersion).")
-                } else {
-                    await DocsManager.shared.finishBatch(goVersion: goVersion, error: nil)
+                    return
                 }
+                // Also re-embed installed golang/website snapshot pack if present and not yet Ready with the active model.
+                if let webManifest = await pm.websiteManifest(),
+                   webManifest.status != .ready || webManifest.embeddingModelID != activeEmbedder.descriptor.id {
+                    _ = try await pm.reembedWebsitePack(embedder: activeEmbedder) { progress in
+                        Task { @MainActor in
+                            DocsManager.shared.handleBatchProgress(progress)
+                        }
+                    }
+                }
+                await DocsManager.shared.finishBatch(goVersion: goVersion, error: nil)
             } catch {
                 await DocsManager.shared.finishBatch(goVersion: goVersion, error: error.localizedDescription)
             }
+        }
+    }
+
+    /// Extracts curated guides, Tour of Go, Effective Go, FAQ, and technical Go Blog posts from a local
+    /// `golang/website` checkout into the version-independent website snapshot pack (Issue #26, DOC-14).
+    func startWebsiteIngestion(websiteRoot: URL) {
+        guard let pm = packManager else { return }
+        let taskKey = "website"
+        batchTasks[taskKey]?.cancel()
+        lastError = nil
+        activeProgress = DocsBatchProgress(goVersion: "golang/website", phase: .extracting)
+        notifyProgressChanged()
+
+        let activeEmbedder = DocsServerManager.shared.embedderClient
+        batchTasks[taskKey] = Task.detached(priority: .utility) {
+            let extracted = DocsWebsiteCorpusExtractor.extractWebsite(fromWebsiteRoot: websiteRoot)
+            guard !extracted.chunks.isEmpty else {
+                await DocsManager.shared.finishBatch(
+                    goVersion: taskKey,
+                    error: "No supported golang/website content found under \(websiteRoot.lastPathComponent) (expected _content/doc, _content/tour, _content/blog)."
+                )
+                return
+            }
+            do {
+                _ = try await pm.ingestWebsite(
+                    chunks: extracted.chunks,
+                    snapshotDate: extracted.snapshotDate,
+                    snapshotCommit: extracted.snapshotCommit,
+                    includedCategories: Array(extracted.categoryCounts.keys).sorted(),
+                    embedder: activeEmbedder
+                ) { progress in
+                    Task { @MainActor in
+                        DocsManager.shared.handleBatchProgress(progress)
+                    }
+                }
+                await DocsManager.shared.finishBatch(goVersion: taskKey, error: nil)
+            } catch {
+                await DocsManager.shared.finishBatch(goVersion: taskKey, error: error.localizedDescription)
+            }
+        }
+    }
+
+    func deleteWebsitePack() {
+        guard let pm = packManager else { return }
+        batchTasks["website"]?.cancel()
+        batchTasks.removeValue(forKey: "website")
+        Task { [weak self] in
+            do {
+                _ = try await pm.deleteWebsitePack()
+                self?.lastError = nil
+            } catch {
+                self?.lastError = error.localizedDescription
+            }
+            await self?.refreshPacks()
         }
     }
 
@@ -404,13 +469,14 @@ final class DocsManager {
         let ver = progress.goVersion
         batchTasks[ver]?.cancel()
         batchTasks.removeValue(forKey: ver)
-        for (k, task) in batchTasks where k.hasPrefix("deps:") || k.hasPrefix("deps-dl:") {
+        for (k, task) in batchTasks where k.hasPrefix("deps:") || k.hasPrefix("deps-dl:") || k == "website" {
             task.cancel()
             batchTasks.removeValue(forKey: k)
         }
         if let pm = packManager {
             Task { [weak self] in
                 await pm.requestCancel(goVersion: ver)
+                await pm.requestCancelWebsite()
                 if let atIdx = ver.firstIndex(of: "@") {
                     let mp = String(ver[..<atIdx])
                     let mv = String(ver[ver.index(after: atIdx)...])

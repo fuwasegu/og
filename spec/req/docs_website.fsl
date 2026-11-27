@@ -1,0 +1,428 @@
+// og — Offline Go website snapshot corpus requirements (Issue #26)
+//
+// Source: GitHub issue #26 (golang/website corpus expansion: Tour, Effective Go, Blog, FAQ, Guides).
+//   DOC-14a: Website documentation is ingested as a version-independent snapshot pack separate from
+//            GOROOT `go<X.Y>` packs. Website chunks carry explicit snapshot provenance (article title,
+//            canonical go.dev URL, snapshot date, BSD-3-Clause license) and are NOT subject to chunk
+//            `since` gating (`since == none`), because `golang/website` is a rolling repository without
+//            per-Go-version branches or machine-readable symbol `since` metadata.
+//   DOC-14b: Grounded website cards require Docs to be enabled, an installed Go pack for `project_ver`
+//            (never answering from website alone when the project's Go pack is missing), and an
+//            installed website snapshot pack. Cards pass the same top-N, anti-hallucination threshold,
+//            and `1..MAX_CARDS` gates as stdlib, always carry snapshot provenance (article title,
+//            URL, optional git-derived snapshot date — never fabricated), and never displace an exact
+//            definition match (`NarrativeNeverDisplacesExactDefinition`: when `definition_exact_match`
+//            holds, the definition must rank first). Narrative sections are eligible evidence for
+//            DOC-11 grounded synthesis under its unchanged grounding/citation/verification rules.
+//            Not Found answers report searched scope without fabricating citations.
+//   DOC-14c: Website pack ingestion publishes FTS-only before Ready on initial build, supports
+//            pause/resume/abort without corrupting an active website pack, reuses vectors from the
+//            shared store when model matches, demotes Ready website pack to FTS-only on embedding
+//            model change (`ReadyWebsitePackMatchesModel`), and stays strictly on loopback
+//            (`NeverLeavesMachine`).
+//   DOC-14d: Disabling Docs lookup, deleting the website pack, or deleting the active Go version pack
+//            clears displayed website answers (`DisabledHasNoAnswer`).
+//
+// ASSUME-1 (representation only): two Go versions (0 = older e.g. 1.21, 1 = newer e.g. 1.23),
+//   two embedding models, and `MAX_CARDS = 3` are sufficient to expose pack-presence, snapshot
+//   provenance, version-independence, model-mixing, and loopback bugs.
+requirements DocsWebsite {
+  number GoVer
+  number ModelId
+  number CardCount
+  const MAX_CARDS = 3
+
+  enum Endpoint { Local, Remote }
+  enum PackState { Missing, IndexingFTSOnly, Ready }
+  enum BatchState { BIdle, BRunning, BPaused }
+  enum WebAnswerKind { NoAnswer, WebsiteCards, WebsiteNotFound }
+
+  state {
+    enabled:                       Bool,
+    project_ver:                   GoVer,
+    go_pack_installed:             Map<GoVer, Bool>,
+    // DOC-14a: single version-independent golang/website snapshot pack
+    website_pack_state:            PackState,
+    website_pack_model:            ModelId,
+    website_has_snapshot_meta:     Bool,
+    selected_model:                ModelId,
+    batch_state:                   BatchState,
+    batch_model:                   ModelId,
+    shared_cached:                 Bool,
+    shared_model:                  ModelId,
+    last_batch_reused:             Bool,
+    // DOC-14b: website answer state
+    answer_kind:                   WebAnswerKind,
+    answer_ver:                    Option<GoVer>,
+    answer_card_count:             CardCount,
+    answer_has_snapshot_provenance: Bool,
+    answer_has_scope:              Bool,
+    answer_grounded:               Bool,
+    answer_used_semantic:          Bool,
+    answer_definition_exact:       Bool,
+    answer_definition_first:       Bool,
+    inserted:                      Bool,
+    sent_remote:                   Bool       // MODEL-1: ghost — off-machine transmission
+  }
+
+  init {
+    enabled = false
+    project_ver = 0
+    website_pack_state = Missing
+    website_pack_model = 0
+    website_has_snapshot_meta = false
+    selected_model = 0
+    batch_state = BIdle
+    batch_model = 0
+    shared_cached = false
+    shared_model = 0
+    last_batch_reused = false
+    answer_kind = NoAnswer
+    answer_ver = none
+    answer_card_count = 0
+    answer_has_snapshot_provenance = false
+    answer_has_scope = false
+    answer_grounded = false
+    answer_used_semantic = false
+    answer_definition_exact = false
+    answer_definition_first = false
+    inserted = false
+    sent_remote = false
+    forall v: GoVer {
+      go_pack_installed[v] = false
+    }
+  }
+
+  action enable() "DOC-1: enable offline Go docs lookup" {
+    requires not enabled
+    enabled = true
+  }
+
+  action disable() "DOC-14d: disabling docs lookup clears displayed website answers" {
+    requires enabled
+    enabled = false
+    answer_kind = NoAnswer
+    answer_ver = none
+    answer_card_count = 0
+    answer_has_snapshot_provenance = false
+    answer_has_scope = false
+    answer_grounded = false
+    answer_used_semantic = false
+    answer_definition_exact = false
+    answer_definition_first = false
+  }
+
+  action set_go_pack_installed(v: GoVer, present: Bool) "DOC-14b: Go version pack installation state changes; removing project_ver pack clears answers" {
+    requires present != go_pack_installed[v]
+    go_pack_installed[v] = present
+    if v == project_ver and not present {
+      answer_kind = NoAnswer
+      answer_ver = none
+      answer_card_count = 0
+      answer_has_snapshot_provenance = false
+      answer_has_scope = false
+      answer_grounded = false
+      answer_used_semantic = false
+      answer_definition_exact = false
+      answer_definition_first = false
+    }
+  }
+
+  action set_project_version(v: GoVer) "DOC-14a: switching project Go version clears stale answers while keeping the version-independent website pack usable" {
+    requires v != project_ver
+    project_ver = v
+    answer_kind = NoAnswer
+    answer_ver = none
+    answer_card_count = 0
+    answer_has_snapshot_provenance = false
+    answer_has_scope = false
+    answer_grounded = false
+    answer_used_semantic = false
+    answer_definition_exact = false
+    answer_definition_first = false
+  }
+
+  // MARK: - Staged website snapshot pack ingestion (DOC-14a, DOC-14c)
+
+  action start_website_batch() "DOC-14c: start initial ingestion or snapshot update of golang/website without disturbing active pack" {
+    requires batch_state == BIdle
+    batch_state = BRunning
+    batch_model = selected_model
+  }
+
+  action publish_website_fts() "DOC-14c: publish initial FTS-only website snapshot pack with snapshot metadata while embeddings run" {
+    requires batch_state == BRunning
+    requires batch_model == selected_model
+    requires website_pack_state == Missing
+    website_pack_state = IndexingFTSOnly
+    website_has_snapshot_meta = true
+  }
+
+  action pause_website_batch() "DOC-14c: pause an active website ingestion batch keeping any active pack intact" {
+    requires batch_state == BRunning
+    batch_state = BPaused
+  }
+
+  action resume_website_batch() "DOC-14c: resume a paused website ingestion batch for the same model" {
+    requires batch_state == BPaused
+    requires batch_model == selected_model
+    batch_state = BRunning
+  }
+
+  action abort_website_batch() "DOC-14c: abort a running/paused website batch without corrupting an active website pack" {
+    requires batch_state != BIdle
+    batch_state = BIdle
+  }
+
+  action complete_website_batch_compute() "DOC-14c: atomically activate Ready website snapshot pack after computing embeddings" {
+    requires batch_state == BRunning
+    requires batch_model == selected_model
+    requires website_pack_state != Missing
+    website_pack_state = Ready
+    website_pack_model = selected_model
+    website_has_snapshot_meta = true
+    shared_cached = true
+    shared_model = selected_model
+    last_batch_reused = false
+    batch_state = BIdle
+  }
+
+  action complete_website_batch_reuse() "DOC-14c: atomically activate Ready website snapshot pack reusing matching vectors from shared store" {
+    requires batch_state == BRunning
+    requires batch_model == selected_model
+    requires website_pack_state != Missing
+    requires shared_cached and shared_model == selected_model
+    website_pack_state = Ready
+    website_pack_model = selected_model
+    website_has_snapshot_meta = true
+    last_batch_reused = true
+    batch_state = BIdle
+  }
+
+  action delete_website_pack() "DOC-14d: deleting the website snapshot pack cancels active website batch and clears displayed website answers" {
+    requires website_pack_state != Missing
+    website_pack_state = Missing
+    website_has_snapshot_meta = false
+    batch_state = BIdle
+    answer_kind = NoAnswer
+    answer_ver = none
+    answer_card_count = 0
+    answer_has_snapshot_provenance = false
+    answer_has_scope = false
+    answer_grounded = false
+    answer_used_semantic = false
+    answer_definition_exact = false
+    answer_definition_first = false
+  }
+
+  action select_embed_model(m: ModelId) "DOC-14c: switching embedding model aborts incompatible website batch and demotes Ready website pack to FTS-only" {
+    requires m != selected_model
+    selected_model = m
+    batch_state = BIdle
+    last_batch_reused = false
+    if website_pack_state == Ready and website_pack_model != m {
+      website_pack_state = IndexingFTSOnly
+    }
+    if answer_used_semantic {
+      answer_kind = NoAnswer
+      answer_ver = none
+      answer_card_count = 0
+      answer_has_snapshot_provenance = false
+      answer_has_scope = false
+      answer_grounded = false
+      answer_used_semantic = false
+      answer_definition_exact = false
+      answer_definition_first = false
+    }
+  }
+
+  // MARK: - Grounded website lookup (DOC-14a, DOC-14b)
+
+  action query_website_found(
+    to: Endpoint,
+    use_semantic: Bool,
+    card_count: CardCount,
+    within_top_n: Bool,
+    passed_threshold: Bool,
+    definition_exact_match: Bool,
+    definition_shown_first: Bool
+  ) "DOC-14b: local query returns 1..MAX_CARDS grounded website cards with snapshot provenance across any project_ver with an installed Go pack without displacing exact definitions" {
+    requires enabled
+    requires to == Local
+    requires go_pack_installed[project_ver]
+    requires website_pack_state != Missing
+    requires website_has_snapshot_meta
+    requires card_count >= 1 and card_count <= MAX_CARDS
+    requires within_top_n
+    requires passed_threshold
+    requires (not definition_exact_match) or definition_shown_first
+    requires (not use_semantic) or (website_pack_state == Ready and website_pack_model == selected_model)
+    answer_kind = WebsiteCards
+    answer_ver = some(project_ver)
+    answer_card_count = card_count
+    answer_has_snapshot_provenance = true
+    answer_has_scope = true
+    answer_grounded = true
+    answer_used_semantic = use_semantic
+    answer_definition_exact = definition_exact_match
+    answer_definition_first = definition_shown_first
+    sent_remote = sent_remote or to == Remote
+  }
+
+  action query_website_not_found(to: Endpoint) "DOC-14b: honest Not Found reports searched scope without fabricating website citations" {
+    requires enabled
+    requires to == Local
+    requires go_pack_installed[project_ver]
+    requires website_pack_state != Missing
+    answer_kind = WebsiteNotFound
+    answer_ver = some(project_ver)
+    answer_card_count = 0
+    answer_has_snapshot_provenance = false
+    answer_has_scope = true
+    answer_grounded = true
+    answer_used_semantic = website_pack_state == Ready and website_pack_model == selected_model
+    answer_definition_exact = false
+    answer_definition_first = false
+    sent_remote = sent_remote or to == Remote
+  }
+
+  action insert_website_snippet() "DOC-9 / DOC-14b: snippet insertion is permitted only for grounded website cards matching the current project_ver" {
+    requires enabled
+    requires answer_kind == WebsiteCards
+    requires answer_ver == some(project_ver)
+    requires answer_has_snapshot_provenance and answer_grounded
+    inserted = true
+  }
+
+  // MARK: - Invariants
+
+  invariant NeverLeavesMachine "DOC-14c: website lookup never sends queries or project context to a remote endpoint" {
+    not sent_remote
+  }
+
+  invariant WebsiteCardsAlwaysHaveSnapshotProvenance "DOC-14b: every website card carries snapshot provenance (title, URL, snapshot date), scope, and requires both Go pack and website pack" {
+    answer_kind == WebsiteCards => (
+      enabled and
+      go_pack_installed[project_ver] and
+      website_pack_state != Missing and
+      website_has_snapshot_meta and
+      answer_ver == some(project_ver) and
+      answer_has_snapshot_provenance and
+      answer_has_scope and
+      answer_grounded
+    )
+  }
+
+  invariant NarrativeNeverDisplacesExactDefinition "DOC-14b: when an exact definition match exists, website cards never appear without the definition ranked first" {
+    (answer_kind == WebsiteCards and answer_definition_exact) => answer_definition_first
+  }
+
+  invariant NotFoundHasScopeWithoutFabricatedCitation "DOC-14b: Not Found answers report searched scope without claiming a website citation" {
+    answer_kind == WebsiteNotFound => (
+      enabled and
+      go_pack_installed[project_ver] and
+      website_pack_state != Missing and
+      answer_ver == some(project_ver) and
+      answer_grounded and
+      answer_has_scope and
+      not answer_has_snapshot_provenance
+    )
+  }
+
+  invariant CardsBoundedByMax "DOC-14b: grounded website answers return 1..MAX_CARDS cards and non-card answers carry 0" {
+    (answer_kind == WebsiteCards => (answer_card_count >= 1 and answer_card_count <= MAX_CARDS)) and
+    (answer_kind != WebsiteCards => answer_card_count == 0)
+  }
+
+  invariant WebsitePackAlwaysHasSnapshotMeta "DOC-14a: any installed website pack carries explicit snapshot metadata" {
+    website_pack_state != Missing => website_has_snapshot_meta
+  }
+
+  invariant ReadyWebsitePackMatchesModel "DOC-14c: Ready website pack was embedded with selected_model" {
+    website_pack_state == Ready => website_pack_model == selected_model
+  }
+
+  invariant SemanticRequiresMatchingModel "DOC-14c: semantic search on website pack never mixes vectors from a different model" {
+    answer_used_semantic => (website_pack_state == Ready and website_pack_model == selected_model)
+  }
+
+  invariant ReuseRequiresMatchingCache "DOC-14c: vector reuse only occurs when shared store holds vectors for selected_model" {
+    last_batch_reused => (shared_cached and shared_model == selected_model)
+  }
+
+  invariant BatchTracksModel "MODEL-2: induction aid; active/paused website batch targets selected_model" {
+    batch_state != BIdle => batch_model == selected_model
+  }
+
+  invariant DisabledHasNoAnswer "DOC-14d: disabling lookup leaves no website answer displayed" {
+    not enabled => answer_kind == NoAnswer
+  }
+
+  // MARK: - Acceptance & Forbidden traces
+
+  acceptance AC-WEB-1 "DOC-14a/b: website snapshot pack serves grounded cards with snapshot provenance across multiple Go project versions without re-importing" {
+    enable() set_go_pack_installed(0, true) set_go_pack_installed(1, true) start_website_batch() publish_website_fts() query_website_found(Local, false, 2, true, true, false, false) set_project_version(1) query_website_found(Local, false, 1, true, true, false, false) insert_website_snippet()
+    expect answer_kind == WebsiteCards and answer_ver == some(1) and answer_has_snapshot_provenance and inserted
+  }
+
+  acceptance AC-WEB-2 "DOC-14c: pausing, resuming, and updating a Ready website pack reuses shared vectors atomically" {
+    enable() set_go_pack_installed(0, true) start_website_batch() publish_website_fts() pause_website_batch() resume_website_batch() complete_website_batch_compute() start_website_batch() complete_website_batch_reuse() query_website_found(Local, true, 3, true, true, false, false)
+    expect website_pack_state == Ready and last_batch_reused and answer_used_semantic and answer_card_count == 3
+  }
+
+  acceptance AC-WEB-3 "DOC-14c: switching embedding model demotes Ready website pack to FTS-only until rebuilt" {
+    enable() set_go_pack_installed(0, true) start_website_batch() publish_website_fts() complete_website_batch_compute() select_embed_model(1) query_website_found(Local, false, 1, true, true, false, false)
+    expect website_pack_state == IndexingFTSOnly and not answer_used_semantic
+  }
+
+  acceptance AC-WEB-4 "DOC-14b: honest Not Found reports searched scope without website citation" {
+    enable() set_go_pack_installed(0, true) start_website_batch() publish_website_fts() query_website_not_found(Local)
+    expect answer_kind == WebsiteNotFound and answer_has_scope and not answer_has_snapshot_provenance
+  }
+
+  acceptance AC-WEB-5 "DOC-14c: aborting a re-ingestion batch leaves the previously active Ready website pack intact and queryable" {
+    enable() set_go_pack_installed(0, true) start_website_batch() publish_website_fts() complete_website_batch_compute() start_website_batch() abort_website_batch() query_website_found(Local, true, 1, true, true, false, false)
+    expect website_pack_state == Ready and answer_kind == WebsiteCards and answer_used_semantic
+  }
+
+  acceptance AC-WEB-6 "DOC-14b: an exact-definition query may include a website card only when the definition ranks first" {
+    enable() set_go_pack_installed(0, true) start_website_batch() publish_website_fts() query_website_found(Local, false, 2, true, true, true, true)
+    expect answer_kind == WebsiteCards and answer_definition_exact and answer_definition_first
+  }
+
+  forbidden FB-WEB-1 "DOC-14b: cannot answer from website pack when project_ver Go pack is missing" {
+    enable() start_website_batch() publish_website_fts() query_website_found(Local, false, 1, true, true, false, false)
+    expect rejected
+  }
+
+  forbidden FB-WEB-2 "DOC-14c: remote queries for website docs are refused" {
+    enable() set_go_pack_installed(0, true) start_website_batch() publish_website_fts() query_website_found(Remote, false, 1, true, true, false, false)
+    expect rejected
+  }
+
+  forbidden FB-WEB-3 "DOC-14b: website candidates below anti-hallucination threshold cannot be returned" {
+    enable() set_go_pack_installed(0, true) start_website_batch() publish_website_fts() query_website_found(Local, false, 1, true, false, false, false)
+    expect rejected
+  }
+
+  forbidden FB-WEB-4 "DOC-14c: cannot run semantic search on an FTS-only website pack" {
+    enable() set_go_pack_installed(0, true) start_website_batch() publish_website_fts() query_website_found(Local, true, 1, true, true, false, false)
+    expect rejected
+  }
+
+  forbidden FB-WEB-5 "DOC-14d: cannot insert snippet after deleting website pack" {
+    enable() set_go_pack_installed(0, true) start_website_batch() publish_website_fts() query_website_found(Local, false, 1, true, true, false, false) delete_website_pack() insert_website_snippet()
+    expect rejected
+  }
+
+  forbidden FB-WEB-6 "DOC-14b: when an exact definition match exists, cannot return website cards without the definition ranked first" {
+    enable() set_go_pack_installed(0, true) start_website_batch() publish_website_fts() query_website_found(Local, false, 1, true, true, true, false)
+    expect rejected
+  }
+}
+
+verify {
+  values GoVer = 0..1
+  values ModelId = 0..1
+  values CardCount = 0..3
+}

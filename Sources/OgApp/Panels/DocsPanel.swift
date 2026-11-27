@@ -666,9 +666,9 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
             inner.addArrangedSubview(codeContainer)
         }
 
-        // Footer: citation + Go version / module@version + Insert / Copy actions (UX-1, UX-2, G-4, Issue #27)
+        // Footer: citation + Go version / module@version / website snapshot + Insert / Copy actions (UX-1, UX-2, G-4, Issue #26, #27)
         let footerCiteText: String
-        if card.sourceKind == .dependency {
+        if card.sourceKind == .dependency || card.provenance == .officialWebsiteSnapshot {
             footerCiteText = "出典: \(card.citation)"
         } else {
             let sincePart = card.since.map { " (since go\($0))" } ?? ""

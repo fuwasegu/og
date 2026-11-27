@@ -35,6 +35,8 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     private let docsVersionCombo = NSComboBox()
     private let docsInstallButton = NSButton(title: "Add / Update Pack", target: nil, action: nil)
     private let docsImportGorootButton = NSButton(title: "Import GOROOT…", target: nil, action: nil)
+    private let docsImportWebsiteButton = NSButton(title: "Import Website…", target: nil, action: nil)
+    private let docsDeleteWebsiteButton = NSButton(title: "Delete Website", target: nil, action: nil)
     private let docsDeleteButton = NSButton(title: "Delete Pack", target: nil, action: nil)
     private let docsPruneDepsButton = NSButton(title: "Prune Unused Deps", target: nil, action: nil)
     private let docsCancelButton = NSButton(title: "Cancel Batch", target: nil, action: nil)
@@ -203,6 +205,10 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         docsInstallButton.action = #selector(docsInstallClicked)
         docsImportGorootButton.target = self
         docsImportGorootButton.action = #selector(docsImportGorootClicked)
+        docsImportWebsiteButton.target = self
+        docsImportWebsiteButton.action = #selector(docsImportWebsiteClicked)
+        docsDeleteWebsiteButton.target = self
+        docsDeleteWebsiteButton.action = #selector(docsDeleteWebsiteClicked)
         docsDeleteButton.target = self
         docsDeleteButton.action = #selector(docsDeleteClicked)
         docsPruneDepsButton.target = self
@@ -219,9 +225,12 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         docsProgressBar.controlSize = .small
         docsProgressLabel.font = Theme.smallFont
         docsProgressLabel.textColor = Theme.secondaryText
-        let docsButtons = NSStackView(views: [docsVersionCombo, docsInstallButton, docsImportGorootButton, docsDeleteButton, docsPruneDepsButton, docsCancelButton, docsLicenseButton])
+        let docsButtons = NSStackView(views: [docsVersionCombo, docsInstallButton, docsImportGorootButton, docsDeleteButton, docsCancelButton, docsLicenseButton])
         docsButtons.orientation = .horizontal
         docsButtons.spacing = 6
+        let docsCorpusButtons = NSStackView(views: [docsImportWebsiteButton, docsDeleteWebsiteButton, docsPruneDepsButton])
+        docsCorpusButtons.orientation = .horizontal
+        docsCorpusButtons.spacing = 6
 
         let stack = NSStackView(views: [
             row("Theme", themePopup), row("Font", fontFamily), NSStackView(views: [fontLabel, fontSize]), fontPreview,
@@ -231,7 +240,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
             docsEnabled, docsErrorHintsEnabled, docsSemanticEnabled, docsSemanticHint, row("Embedding", docsEmbedModel), docsRerankEnabled, row("Reranker", docsRerankModel),
             docsServerRow,
             row("Synthesis", docsAnswerMode), row("LLM Back", docsAnswerBackend), row("LLM Model", docsAnswerModel), docsIncludeEditorContext, docsAnswerRow,
-            row("Indexing", docsBatchPolicy), docsButtons, docsPacksLabel, docsProgressBar, docsProgressLabel
+            row("Indexing", docsBatchPolicy), docsButtons, docsCorpusButtons, docsPacksLabel, docsProgressBar, docsProgressLabel
         ])
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -473,6 +482,15 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
 
         let depPacks = d.installedDependencyPacks
         docsPruneDepsButton.isEnabled = !depPacks.isEmpty
+        let webPack = d.installedWebsitePack
+        docsDeleteWebsiteButton.isEnabled = webPack != nil
+        let webSummaryLine: String? = webPack.map { w in
+            let kb = max(1, w.sizeBytes / 1024)
+            let mode = w.status == .ready ? "ready (FTS + semantic)" : "FTS-only"
+            let snapLabel = w.snapshotDate.map { "snapshot \($0)" } ?? "snapshot date unknown"
+            let commitPart = w.snapshotCommit.map { " @\($0)" } ?? ""
+            return "• golang/website (\(snapLabel)\(commitPart)): \(w.chunkCount) chunks, \(kb) KB [\(mode)]"
+        }
         let depSummaryLine: String? = depPacks.isEmpty ? nil : {
             let totalKB = max(1, depPacks.reduce(Int64(0)) { $0 + $1.sizeBytes } / 1024)
             let totalChunks = depPacks.reduce(0) { $0 + $1.chunkCount }
@@ -482,8 +500,10 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         }()
 
         if packs.isEmpty {
-            let base = "Installed packs: none (enabling installs bundled go\(BundledGoCorpus.defaultVersion) core pack offline)"
-            docsPacksLabel.stringValue = depSummaryLine.map { "\(base)\n\($0)" } ?? base
+            var lines = ["Installed packs: none (enabling installs bundled go\(BundledGoCorpus.defaultVersion) core pack offline)"]
+            if let webSummaryLine { lines.append(webSummaryLine) }
+            if let depSummaryLine { lines.append(depSummaryLine) }
+            docsPacksLabel.stringValue = lines.joined(separator: "\n")
         } else {
             var lines = packs.map { p in
                 let kb = max(1, p.sizeBytes / 1024)
@@ -491,6 +511,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
                 let legacyNote = p.needsReimport ? " — legacy v1 schema: re-import recommended" : ""
                 return "• go\(p.goVersion): \(p.chunkCount) chunks, \(kb) KB [\(mode)]\(legacyNote)"
             }
+            if let webSummaryLine { lines.append(webSummaryLine) }
             if let depSummaryLine { lines.append(depSummaryLine) }
             docsPacksLabel.stringValue = "Installed packs:\n" + lines.joined(separator: "\n")
         }
@@ -687,6 +708,20 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
                 DocsManager.shared.startGorootIngestion(goroot: url, goVersion: ver)
             }
         }
+    }
+
+    @objc private func docsImportWebsiteClicked() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.message = "Choose a local golang/website checkout directory (containing _content/)"
+        if panel.runModal() == .OK, let url = panel.url {
+            DocsManager.shared.startWebsiteIngestion(websiteRoot: url)
+        }
+    }
+
+    @objc private func docsDeleteWebsiteClicked() {
+        DocsManager.shared.deleteWebsitePack()
     }
 
     @objc private func docsDeleteClicked() {

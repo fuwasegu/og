@@ -29,6 +29,7 @@ public final class DocsIndex: @unchecked Sendable {
     private let hasDocumentIDColumn: Bool
     private let hasProvenanceColumn: Bool
     private let hasDependencyColumns: Bool
+    private let hasWebsiteColumns: Bool
 
     public init(databaseURL: URL, readOnly: Bool = false) throws {
         self.databaseURL = databaseURL
@@ -55,10 +56,12 @@ public final class DocsIndex: @unchecked Sendable {
             self.hasDocumentIDColumn = true
             self.hasProvenanceColumn = true
             self.hasDependencyColumns = true
+            self.hasWebsiteColumns = true
         } else {
             self.hasDocumentIDColumn = Self.tableHasColumn(db: handle, table: "chunks", column: "document_id")
             self.hasProvenanceColumn = Self.tableHasColumn(db: handle, table: "chunks", column: "provenance")
             self.hasDependencyColumns = Self.tableHasColumn(db: handle, table: "chunks", column: "module_path")
+            self.hasWebsiteColumns = Self.tableHasColumn(db: handle, table: "chunks", column: "source_url")
         }
     }
 
@@ -117,7 +120,9 @@ public final class DocsIndex: @unchecked Sendable {
             content_hash TEXT NOT NULL,
             module_path TEXT,
             module_version TEXT,
-            license TEXT
+            license TEXT,
+            source_url TEXT,
+            snapshot_date TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_chunks_pkg_sym ON chunks (package_name, symbol);
@@ -161,6 +166,12 @@ public final class DocsIndex: @unchecked Sendable {
         if !Self.tableHasColumn(db: db, table: "chunks", column: "license") {
             try SQLiteHelpers.exec(db: db, sql: "ALTER TABLE chunks ADD COLUMN license TEXT;")
         }
+        if !Self.tableHasColumn(db: db, table: "chunks", column: "source_url") {
+            try SQLiteHelpers.exec(db: db, sql: "ALTER TABLE chunks ADD COLUMN source_url TEXT;")
+        }
+        if !Self.tableHasColumn(db: db, table: "chunks", column: "snapshot_date") {
+            try SQLiteHelpers.exec(db: db, sql: "ALTER TABLE chunks ADD COLUMN snapshot_date TEXT;")
+        }
     }
 
     private static func tableHasColumn(db: OpaquePointer, table: String, column: String) -> Bool {
@@ -187,8 +198,9 @@ public final class DocsIndex: @unchecked Sendable {
                 INSERT INTO chunks (
                     stable_id, go_version, source, provenance, package_name, document_id, symbol, kind,
                     title, anchor, since, summary, signature, example, body,
-                    search_aliases, content_hash, module_path, module_version, license
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20);
+                    search_aliases, content_hash, module_path, module_version, license,
+                    source_url, snapshot_date
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22);
                 """
                 let insertFTS = """
                 INSERT INTO chunks_fts (
@@ -232,6 +244,8 @@ public final class DocsIndex: @unchecked Sendable {
                     SQLiteHelpers.bindOptionalText(chunkStmt, index: 18, value: c.modulePath)
                     SQLiteHelpers.bindOptionalText(chunkStmt, index: 19, value: c.moduleVersion)
                     SQLiteHelpers.bindOptionalText(chunkStmt, index: 20, value: c.license)
+                    SQLiteHelpers.bindOptionalText(chunkStmt, index: 21, value: c.sourceURL)
+                    SQLiteHelpers.bindOptionalText(chunkStmt, index: 22, value: c.snapshotDate)
                     guard sqlite3_step(chunkStmt) == SQLITE_DONE else {
                         throw DocsStorageError.sqlite(String(cString: sqlite3_errmsg(db)))
                     }
@@ -578,10 +592,13 @@ public final class DocsIndex: @unchecked Sendable {
             let depCols = hasDependencyColumns
                 ? "c.module_path, c.module_version, c.license"
                 : "NULL AS module_path, NULL AS module_version, NULL AS license"
+            let webCols = hasWebsiteColumns
+                ? "c.source_url, c.snapshot_date"
+                : "NULL AS source_url, NULL AS snapshot_date"
             let sql = """
             SELECT c.stable_id, c.go_version, c.source, \(provCol), c.package_name, \(docCol), c.symbol, c.kind,
                    c.title, c.anchor, c.since, c.summary, c.signature, c.example, c.body,
-                   c.search_aliases, c.content_hash, \(depCols),
+                   c.search_aliases, c.content_hash, \(depCols), \(webCols),
                    bm25(chunks_fts, 0.0, 4.0, 3.0, 5.0, 2.5, 1.0, 4.5) AS rank
             FROM chunks_fts
             JOIN chunks c ON c.stable_id = chunks_fts.stable_id
@@ -602,7 +619,7 @@ public final class DocsIndex: @unchecked Sendable {
                 let rc = sqlite3_step(stmt)
                 if rc == SQLITE_ROW {
                     let chunk = Self.decodeChunk(stmt: stmt, offset: 0)
-                    let bm25 = sqlite3_column_double(stmt, 20)
+                    let bm25 = sqlite3_column_double(stmt, 22)
                     let normalized = max(0.1, -bm25)
                     out.append(DocsIndexHit(chunk: chunk, score: normalized, matchedBy: .fts5))
                 } else if rc == SQLITE_DONE {
@@ -721,10 +738,13 @@ public final class DocsIndex: @unchecked Sendable {
         let depCols = hasDependencyColumns
             ? "module_path, module_version, license"
             : "NULL AS module_path, NULL AS module_version, NULL AS license"
+        let webCols = hasWebsiteColumns
+            ? "source_url, snapshot_date"
+            : "NULL AS source_url, NULL AS snapshot_date"
         return """
         SELECT stable_id, go_version, source, \(provCol), package_name, \(docCol), symbol, kind,
                title, anchor, since, summary, signature, example, body,
-               search_aliases, content_hash, \(depCols)
+               search_aliases, content_hash, \(depCols), \(webCols)
         """
     }
 
@@ -764,6 +784,8 @@ public final class DocsIndex: @unchecked Sendable {
         let modulePath = SQLiteHelpers.columnOptionalText(stmt, index: offset + 17)
         let moduleVersion = SQLiteHelpers.columnOptionalText(stmt, index: offset + 18)
         let license = SQLiteHelpers.columnOptionalText(stmt, index: offset + 19)
+        let sourceURL = SQLiteHelpers.columnOptionalText(stmt, index: offset + 20)
+        let snapshotDate = SQLiteHelpers.columnOptionalText(stmt, index: offset + 21)
 
         let aliases: [String]
         if aliasesRaw.hasPrefix("["),
@@ -796,7 +818,9 @@ public final class DocsIndex: @unchecked Sendable {
             storedContentHash: storedHash,
             modulePath: modulePath,
             moduleVersion: moduleVersion,
-            license: license
+            license: license,
+            sourceURL: sourceURL,
+            snapshotDate: snapshotDate
         )
     }
 }

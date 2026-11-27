@@ -63,6 +63,10 @@ public struct DocsAnswerCard: Sendable, Hashable {
     public var moduleVersion: String?
     /// For `.dependency` cards: optional concise SPDX-style license identifier (DES-DEP-4).
     public var license: String?
+    /// For `.officialWebsiteSnapshot` cards: canonical official URL on `go.dev` (Issue #26, DOC-14b).
+    public var sourceURL: String?
+    /// For `.officialWebsiteSnapshot` cards: ISO-8601 snapshot date (`YYYY-MM-DD`) (Issue #26, DOC-14b).
+    public var snapshotDate: String?
 
     public init(
         stableID: String,
@@ -82,7 +86,9 @@ public struct DocsAnswerCard: Sendable, Hashable {
         matchedBy: DocsMatchOrigin,
         modulePath: String? = nil,
         moduleVersion: String? = nil,
-        license: String? = nil
+        license: String? = nil,
+        sourceURL: String? = nil,
+        snapshotDate: String? = nil
     ) {
         self.stableID = stableID
         self.title = title
@@ -102,6 +108,8 @@ public struct DocsAnswerCard: Sendable, Hashable {
         self.modulePath = modulePath
         self.moduleVersion = moduleVersion
         self.license = license
+        self.sourceURL = sourceURL
+        self.snapshotDate = snapshotDate
     }
 }
 
@@ -675,6 +683,17 @@ public actor ResearchService {
             }
         }
 
+        // Step 2c (Issue #26, DOC-14a/b): Open optional version-independent golang/website snapshot pack.
+        // Only searched after `packs/go<packKey>` is confirmed present (`NeverAnswersWithoutMatchingPack`).
+        var activeWebsitePack: (manifest: DocsWebsitePackManifest, index: DocsIndex)?
+        if let webManifest = await packManager.websiteManifest(),
+           let webIndex = try? await packManager.openWebsiteIndex() {
+            activeWebsitePack = (webManifest, webIndex)
+        }
+        defer {
+            activeWebsitePack?.index.close()
+        }
+
         // Step 3: Stage 1 hybrid candidate collection: deterministic -> FTS5 -> optional semantic (FR-9, §7.3, Issue #21, #27).
         struct Candidate {
             var chunk: DocsChunk
@@ -736,7 +755,7 @@ public actor ResearchService {
 
         try Task.checkCancellation()
 
-        // 3b. SQLite FTS5 full-text search (FR-9b, Issue #27)
+        // 3b. SQLite FTS5 full-text search (FR-9b, Issue #26, #27)
         if !plan.searchTerms.isEmpty {
             let ftsHits = try index.ftsSearch(terms: plan.searchTerms, limit: 20)
             merge(ftsHits, weight: 1.0)
@@ -745,11 +764,16 @@ public actor ResearchService {
                     merge(depFtsHits, weight: 1.0)
                 }
             }
+            if let webPack = activeWebsitePack,
+               let webFtsHits = try? webPack.index.ftsSearch(terms: plan.searchTerms, limit: 12) {
+                // Slightly below stdlib weight (0.9 vs 1.0) so exact stdlib matches retain priority.
+                merge(webFtsHits, weight: 0.9)
+            }
         }
 
         try Task.checkCancellation()
 
-        // 3c. Optional semantic search ONLY when pack is Ready AND model matches (FR-27, FR-28, DOC-4, DOC-12).
+        // 3c. Optional semantic search ONLY when pack is Ready AND model matches (FR-27, FR-28, DOC-4, DOC-12, DOC-14c).
         // Any non-cancellation failure from the embedder or vector store degrades cleanly to Phase 1 FTS (V-4).
         var usedSemantic = false
         if let embedder = queryEmbedder {
@@ -761,7 +785,13 @@ public actor ResearchService {
                     && $0.manifest.embeddingModelID == embedder.descriptor.id
                     && $0.manifest.embeddingModelVersion == embedder.descriptor.version
             }
-            if stdSemanticReady || !readyDepPacks.isEmpty {
+            let webSemanticReady: Bool = {
+                guard let webPack = activeWebsitePack else { return false }
+                return webPack.manifest.status == .ready
+                    && webPack.manifest.embeddingModelID == embedder.descriptor.id
+                    && webPack.manifest.embeddingModelVersion == embedder.descriptor.version
+            }()
+            if stdSemanticReady || !readyDepPacks.isEmpty || webSemanticReady {
                 do {
                     let qVec = try await embedder.embedQuery(plan.originalQuery)
                     try Task.checkCancellation()
@@ -787,6 +817,18 @@ public actor ResearchService {
                             limit: Self.retrievalPoolLimit
                         )
                         merge(depSemHits, weight: 0.4)
+                        usedSemantic = true
+                    }
+                    if webSemanticReady, let webPack = activeWebsitePack {
+                        try Task.checkCancellation()
+                        let webSemHits = try await webPack.index.semanticSearch(
+                            queryVector: qVec,
+                            model: embedder.descriptor,
+                            sharedStore: packManager.sharedVectorStore,
+                            minimumSimilarity: Self.minimumSemanticSimilarity,
+                            limit: Self.retrievalPoolLimit
+                        )
+                        merge(webSemHits, weight: 0.4)
                         usedSemantic = true
                     }
                 } catch is CancellationError {
@@ -1008,7 +1050,8 @@ public actor ResearchService {
                     let lexicalStrength = Self.lexicalMatchStrength(
                         chunk: cand.chunk,
                         lexicalMatched: cand.lexicalMatched,
-                        lowerTerms: lowerSearchTerms
+                        lowerTerms: lowerSearchTerms,
+                        intent: plan.intent
                     )
 
                     // Drop noisy body-only FTS hits (e.g. a single incidental word match) when cross-encoder rejects them.
@@ -1076,8 +1119,11 @@ public actor ResearchService {
 
         newerNotes.sort { ($0.since, $0.title) < ($1.since, $1.title) }
 
-        let baseScopeText = "Go \(packKey) pack (\(manifest.chunkCount) chunks: Language Spec, Official Guides, Standard Library)"
-        let scopeText: String
+        var scopeParts = ["Go \(packKey) pack (\(manifest.chunkCount) chunks: Language Spec, Official Guides, Standard Library)"]
+        if let webPack = activeWebsitePack {
+            let snapPart = webPack.manifest.snapshotDate.map { ", snapshot \($0)" } ?? ", snapshot date unknown"
+            scopeParts.append("Go Website (\(webPack.manifest.chunkCount) chunks\(snapPart))")
+        }
         if let depSummary, depSummary.hasAnyDependency {
             var depParts: [String] = []
             if !depSummary.indexedModules.isEmpty {
@@ -1092,10 +1138,9 @@ public actor ResearchService {
                 let more = depSummary.uncachedModules.count > 3 ? " +\(depSummary.uncachedModules.count - 3)" : ""
                 depParts.append("\(depSummary.uncachedModules.count) uncached: \(names)\(more)")
             }
-            scopeText = "\(baseScopeText) + Dependencies [\(depParts.joined(separator: ", "))]"
-        } else {
-            scopeText = baseScopeText
+            scopeParts.append("Dependencies [\(depParts.joined(separator: ", "))]")
         }
+        let scopeText = scopeParts.joined(separator: " + ")
 
         // Step 6: Honest Not Found when zero grounded, version-gated candidates match (FR-12, FR-14, UX-4).
         guard !allowedEntries.isEmpty else {
@@ -1157,7 +1202,9 @@ public actor ResearchService {
                 matchedBy: entry.candidate.origin,
                 modulePath: c.modulePath,
                 moduleVersion: c.moduleVersion,
-                license: c.license
+                license: c.license,
+                sourceURL: c.sourceURL,
+                snapshotDate: c.snapshotDate
             )
         }
 
@@ -1514,7 +1561,8 @@ public actor ResearchService {
     private static func lexicalMatchStrength(
         chunk: DocsChunk,
         lexicalMatched: Bool,
-        lowerTerms: [String]
+        lowerTerms: [String],
+        intent: DocsQueryIntent = .needsReverseLookup
     ) -> Int {
         guard lexicalMatched, !lowerTerms.isEmpty else { return 0 }
         let sym = chunk.symbol.lowercased()
@@ -1529,6 +1577,10 @@ public actor ResearchService {
         }
         let title = chunk.title.lowercased()
         if lowerTerms.contains(where: { (!sym.isEmpty && sym.contains($0)) || title.contains($0) }) {
+            // Website snapshot prose complements stdlib without displacing exact stdlib symbols on symbol/existence/reverse lookups.
+            if chunk.provenance == .officialWebsiteSnapshot && intent != .syntaxHowTo && intent != .idiomOrWhy {
+                return 1
+            }
             return 2
         }
         return 0

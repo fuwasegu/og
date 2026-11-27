@@ -128,6 +128,14 @@ AUTH_HEADER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Issue #26 (E-1) positive surfacing queries: verify golang/website narrative content actually surfaces in top-k.
+WEBSITE_POSITIVE_QUERIES = [
+    ("defer cleanup LIFO", ["Effective Go", "A Tour of Go", "Defer"], 3),
+    ("Why is there no type inheritance", ["Frequently Asked Questions"], 3),
+    ("canceling database operations timeout", ["Cancel Operations"], 3),
+    ("goroutine leak profile", ["Goroutine Leak"], 3),
+]
+
 
 def parse_bundled_concept_rules(repo_root: Path) -> list[tuple[list[str], list[str], list[str]]]:
     """Reads `BundledGoCorpus.defaultConceptRules` directly from Swift source (no duplicated rules)."""
@@ -474,6 +482,127 @@ def extract_real_goroot_chunks(goroot: Path, include_examples: bool = True) -> l
     return chunks
 
 
+def extract_website_chunks(website_root: Path) -> list[dict]:
+    """Extracts curated golang/website chunks (Effective Go, Tour, FAQ, Guides, technical Blog) for eval regression checks (Issue #26)."""
+    content_root = website_root / "_content" if (website_root / "_content").is_dir() else website_root
+    chunks: list[dict] = []
+    seen_ids: set[str] = set()
+
+    def add_chunk(doc_id: str, heading: str, title: str, body: str, url: str) -> None:
+        body = body.strip()
+        if not body:
+            return
+        sid = f"guide::{doc_id}::::{heading}::section::#{re.sub(r'[^A-Za-z0-9]+', '_', heading).strip('_') or 'section'}"
+        if sid in seen_ids:
+            return
+        seen_ids.add(sid)
+        summary = re.sub(r"\s+", " ", body)[:240]
+        text = f"{title}\n{summary}\n{body[:800]}"
+        chunks.append({
+            "stable_id": sid,
+            "title": title,
+            "content_hash": hashlib.sha256(text.encode("utf-8")).hexdigest()[:24],
+            "text": text,
+            "full_text": f"{title}\n{url}\n{body}",
+            "rerank_text": text[:900],
+            "source_url": url,
+        })
+
+    # 1. Effective Go HTML
+    eff = content_root / "doc/effective_go.html"
+    if eff.is_file():
+        raw = eff.read_text(encoding="utf-8", errors="ignore")
+        parts = re.split(r'(<h[23][^>]*>.*?</h[23]>)', raw, flags=re.IGNORECASE | re.DOTALL)
+        for i in range(1, len(parts) - 1, 2):
+            m = re.match(r'<h[23](?:\s+[^>]*?id="([^"]+)")?[^>]*>(.*?)</h[23]>', parts[i], flags=re.IGNORECASE | re.DOTALL)
+            if not m:
+                continue
+            anchor = m.group(1) or "section"
+            heading = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+            body = re.sub(r"<[^>]+>", " ", parts[i + 1])
+            body = re.sub(r"\s+", " ", body).strip()
+            add_chunk("website/doc/effective_go", heading, f"Effective Go: {heading}", body, f"https://go.dev/doc/effective_go#{anchor}")
+
+    # 2. Tour of Go .article
+    tour_dir = content_root / "tour"
+    for chap in ("welcome", "basics", "flowcontrol", "moretypes", "methods", "generics", "concurrency"):
+        art = tour_dir / f"{chap}.article"
+        if not art.is_file():
+            continue
+        lines = art.read_text(encoding="utf-8", errors="ignore").splitlines()
+        chap_title = lines[0].strip() if lines else chap
+        slide_idx = 0
+        cur_heading = None
+        cur_lines: list[str] = []
+        for ln in lines[1:]:
+            if ln.startswith("* "):
+                if cur_heading:
+                    slide_idx += 1
+                    add_chunk(f"website/tour/{chap}", cur_heading, f"A Tour of Go: {chap_title} — {cur_heading}", "\n".join(cur_lines), f"https://go.dev/tour/{chap}/{slide_idx}")
+                cur_heading = ln[2:].strip()
+                cur_lines = []
+            elif cur_heading is not None:
+                if ln.startswith(".play ") or ln.startswith(".code "):
+                    rel = ln.split()[1]
+                    go_f = tour_dir / rel
+                    if go_f.is_file():
+                        cur_lines.append(go_f.read_text(encoding="utf-8", errors="ignore")[:800])
+                elif not ln.startswith("."):
+                    cur_lines.append(ln)
+        if cur_heading:
+            slide_idx += 1
+            add_chunk(f"website/tour/{chap}", cur_heading, f"A Tour of Go: {chap_title} — {cur_heading}", "\n".join(cur_lines), f"https://go.dev/tour/{chap}/{slide_idx}")
+
+    # 3. Markdown docs (FAQ, guides, technical blog)
+    excluded_blog_prefixes = ("survey", "gophercon", "gopherchina", "gothamgo", "gouk", "contributor", "oscon", "io20", "gophergala", "brand", "go-brand", "store", "turkey-doodle")
+    md_targets: list[tuple[Path, str, str]] = []
+    if (content_root / "doc/faq.md").is_file():
+        md_targets.append((content_root / "doc/faq.md", "website/doc/faq", "https://go.dev/doc/faq"))
+    for sub in ("doc/tutorial", "doc/database", "doc/modules", "wiki"):
+        d = content_root / sub
+        if d.is_dir():
+            for f in sorted(d.glob("*.md")):
+                if f.name != "index.md":
+                    md_targets.append((f, f"website/{sub}/{f.stem}", f"https://go.dev/{sub}/{f.stem}"))
+    blog_dir = content_root / "blog"
+    if blog_dir.is_dir():
+        for f in sorted(blog_dir.glob("*.md")):
+            slug = f.stem.lower()
+            if re.match(r"^go1(\.\d+)", slug) or slug.endswith("years") or any(slug.startswith(p) for p in excluded_blog_prefixes):
+                continue
+            md_targets.append((f, f"website/blog/{f.stem}", f"https://go.dev/blog/{f.stem}"))
+
+    for md_path, doc_id, base_url in md_targets:
+        raw = md_path.read_text(encoding="utf-8", errors="ignore")
+        title = md_path.stem.replace("-", " ").title()
+        if raw.startswith("---\n"):
+            end = raw.find("\n---", 4)
+            if end != -1:
+                fm = raw[4:end]
+                tm = re.search(r'^title:\s*["\']?(.+?)["\']?\s*$', fm, re.MULTILINE)
+                if tm:
+                    title = tm.group(1).strip()
+                raw = raw[end + 4:]
+        cur_heading = title
+        cur_lines = []
+        in_fence = False
+        for ln in raw.splitlines():
+            st = ln.strip()
+            if st.startswith("```"):
+                in_fence = not in_fence
+                cur_lines.append(ln)
+                continue
+            if not in_fence and re.match(r"^#{2,4}\s+", st):
+                add_chunk(doc_id, cur_heading, f"{title}: {cur_heading}" if cur_heading != title else title, "\n".join(cur_lines), base_url)
+                cur_heading = re.sub(r"\s*\{#[^}]+\}\s*$", "", re.sub(r"^#{2,4}\s+", "", st)).strip()
+                cur_lines = []
+            else:
+                cur_lines.append(ln)
+        add_chunk(doc_id, cur_heading, f"{title}: {cur_heading}" if cur_heading != title else title, "\n".join(cur_lines), base_url)
+
+    return chunks
+
+
 def load_chunks_from_pack_db(db_path: Path) -> list[dict]:
     """Reads chunks directly from an installed og `index.sqlite` pack."""
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -559,6 +688,7 @@ def main() -> int:
     parser.add_argument("--pack-db", type=Path, default=None, help="Path to an installed og pack index.sqlite")
     parser.add_argument("--chunks", type=Path, default=None, help="Path to JSON exported by DocsPackManager.exportChunksJSON / docsexport")
     parser.add_argument("--goroot", type=Path, default=None, help="Path to local GOROOT (defaults to `go env GOROOT`)")
+    parser.add_argument("--website", type=Path, default=None, help="Path to local golang/website checkout (appends curated website snapshot chunks)")
     parser.add_argument("--sample", action="store_true", help="Explicitly use tiny 8-chunk smoke sample instead of real GOROOT")
     parser.add_argument("--offline", action="store_true", help="Run uvx & HF Hub strictly offline")
     parser.add_argument("--semantic-only", action="store_true", help="Disable Stage 1 FTS5 union (ablation mode)")
@@ -604,6 +734,13 @@ def main() -> int:
     if args.no_examples:
         chunks = [c for c in chunks if "::example::" not in c["stable_id"]]
 
+    if args.website is not None:
+        t_web = time.perf_counter()
+        web_chunks = extract_website_chunks(args.website)
+        print(f"Extracted {len(web_chunks)} golang/website snapshot chunks from {args.website} in {time.perf_counter() - t_web:.2f}s")
+        chunks.extend(web_chunks)
+        corpus_desc += f" + golang/website ({len(web_chunks)} chunks)"
+
     if not chunks:
         print("ERROR: Corpus has 0 chunks.", file=sys.stderr)
         return 2
@@ -643,10 +780,25 @@ def main() -> int:
         auth_idxs = fts_search_indices(fts_conn, auth_terms, limit=10)
         auth_top3 = [chunks[i]["title"] for i in auth_idxs[:3]]
         print(f"[DIAG] {AUTHORIZATION_DIAGNOSTIC_QUERY} -> {auth_top3 if auth_top3 else ['Not Found (0 cards)']}")
+
+        # Issue #26 (E-1): Positive surfacing check when --website is supplied
+        web_failures = 0
+        if args.website is not None:
+            print("\nWebsite positive surfacing checks (Issue #26 E-1):")
+            for wq, w_expected, w_k in WEBSITE_POSITIVE_QUERIES:
+                wt = query_search_terms(wq, concept_rules)
+                w_idxs = fts_search_indices(fts_conn, wt, limit=10)
+                w_top = [chunks[i]["title"] for i in w_idxs[:3]]
+                w_ok = bool(w_top[:w_k]) and any(any(exp.lower() in title.lower() for exp in w_expected) for title in w_top[:w_k])
+                if not w_ok:
+                    web_failures += 1
+                print(f"[{'PASS' if w_ok else 'FAIL'}] {wq} -> {w_top if w_top else ['Not Found (0 cards)']}")
+            print(f"Website positive summary: {len(WEBSITE_POSITIVE_QUERIES) - web_failures}/{len(WEBSITE_POSITIVE_QUERIES)} PASS")
+
         fts_conn.close()
         total = len(GOLDEN_QUERIES)
         print(f"\nSummary (FTS-only): {total - failures}/{total} PASS")
-        return 1 if failures else 0
+        return 1 if (failures or web_failures) else 0
 
     port = free_loopback_port()
     base_url = f"http://127.0.0.1:{port}"
