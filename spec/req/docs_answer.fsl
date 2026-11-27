@@ -1,0 +1,230 @@
+// og — Docs Phase 3: Grounded answer generation & local snippet verification (Issue #24)
+//
+// Source: GitHub issue #24 (extension of spec/req/research.fsl, DOC-1..DOC-10).
+//   DOC-11: Phase 3 grounded answer generation and local snippet type verification.
+//           - Synthesis runs strictly on loopback via local LLM (DOC-6: NeverLeavesMachine).
+//           - Generation is permitted ONLY from grounded, since-gated retrieval cards
+//             (never when NotFound or MissingPack — no fabrication).
+//           - Every generated answer carries explicit citations and target Go version.
+//           - Generated snippets are verified locally against the project's Go version.
+//           - Failed, unverified, or newer-API snippets are never marked usable or insertable.
+//
+// ASSUME-1 (representation only): two Go versions (0 = older e.g. 1.21, 1 = newer e.g. 1.23).
+requirements DocsAnswer {
+  number GoVer
+
+  enum Endpoint { Local, Remote }
+  enum RetrievalStatus { RNone, RGroundedCards, RNotFound, RMissingPack }
+  enum SnippetVerification { VNone, VVerified, VUnverified, VFailed }
+
+  state {
+    enabled:            Bool,
+    llm_available:      Bool,
+    project_ver:        GoVer,
+    retrieval_status:   RetrievalStatus,
+    retrieval_ver:      Option<GoVer>,
+    retrieval_since:    Option<GoVer>,
+    gen_has_answer:     Bool,
+    gen_ver:            Option<GoVer>,
+    gen_has_citation:   Bool,
+    gen_uses_newer_api: Bool,
+    gen_verification:   SnippetVerification,
+    gen_snippet_usable: Bool,
+    gen_inserted:       Bool,
+    sent_remote:        Bool
+  }
+
+  init {
+    enabled = false
+    llm_available = false
+    project_ver = 0
+    retrieval_status = RNone
+    retrieval_ver = none
+    retrieval_since = none
+    gen_has_answer = false
+    gen_ver = none
+    gen_has_citation = false
+    gen_uses_newer_api = false
+    gen_verification = VNone
+    gen_snippet_usable = false
+    gen_inserted = false
+    sent_remote = false
+  }
+
+  action enable() "DOC-1: enable Go docs lookup" {
+    requires not enabled
+    enabled = true
+  }
+
+  action disable() "DOC-1: disabling docs lookup clears retrieval and generated answers" {
+    requires enabled
+    enabled = false
+    retrieval_status = RNone
+    retrieval_ver = none
+    retrieval_since = none
+    gen_has_answer = false
+    gen_ver = none
+    gen_has_citation = false
+    gen_uses_newer_api = false
+    gen_verification = VNone
+    gen_snippet_usable = false
+  }
+
+  action set_project_version(v: GoVer) "DOC-2: changing project Go version clears stale answers" {
+    requires v != project_ver
+    project_ver = v
+    retrieval_status = RNone
+    retrieval_ver = none
+    retrieval_since = none
+    gen_has_answer = false
+    gen_ver = none
+    gen_has_citation = false
+    gen_uses_newer_api = false
+    gen_verification = VNone
+    gen_snippet_usable = false
+  }
+
+  action toggle_llm(avail: Bool) "DOC-8: local answer-generation LLM availability changes" {
+    requires avail != llm_available
+    llm_available = avail
+  }
+
+  action retrieve_cards(card_since: GoVer) "DOC-2 / DOC-7: Phase 2 retrieval returns grounded, since-gated cards" {
+    requires enabled
+    requires card_since <= project_ver
+    retrieval_status = RGroundedCards
+    retrieval_ver = some(project_ver)
+    retrieval_since = some(card_since)
+    gen_has_answer = false
+    gen_ver = none
+    gen_has_citation = false
+    gen_uses_newer_api = false
+    gen_verification = VNone
+    gen_snippet_usable = false
+  }
+
+  action retrieve_not_found() "DOC-7: Phase 2 retrieval finds no grounded cards" {
+    requires enabled
+    retrieval_status = RNotFound
+    retrieval_ver = some(project_ver)
+    retrieval_since = none
+    gen_has_answer = false
+    gen_ver = none
+    gen_has_citation = false
+    gen_uses_newer_api = false
+    gen_verification = VNone
+    gen_snippet_usable = false
+  }
+
+  action retrieve_missing_pack() "DOC-2: Phase 2 retrieval reports missing pack" {
+    requires enabled
+    retrieval_status = RMissingPack
+    retrieval_ver = some(project_ver)
+    retrieval_since = none
+    gen_has_answer = false
+    gen_ver = none
+    gen_has_citation = false
+    gen_uses_newer_api = false
+    gen_verification = VNone
+    gen_snippet_usable = false
+  }
+
+  action generate_answer(
+    to: Endpoint,
+    has_citation: Bool,
+    uses_newer_api: Bool,
+    verif: SnippetVerification
+  ) "DOC-11: synthesize a cited answer + snippet strictly from grounded cards on loopback, then verify locally" {
+    requires enabled
+    requires llm_available
+    requires to == Local
+    requires retrieval_status == RGroundedCards
+    requires retrieval_ver == some(project_ver)
+    requires retrieval_since is some(s) and s <= project_ver
+    requires has_citation
+    requires verif != VNone
+    gen_has_answer = true
+    gen_ver = some(project_ver)
+    gen_has_citation = true
+    gen_uses_newer_api = uses_newer_api
+    gen_verification = verif
+    gen_snippet_usable = (verif == VVerified and not uses_newer_api)
+    sent_remote = sent_remote or to == Remote
+  }
+
+  action insert_generated() "DOC-11 / DOC-9: insert generated snippet only when locally verified and compatible with project_ver" {
+    requires enabled
+    requires gen_has_answer
+    requires gen_ver == some(project_ver)
+    requires gen_has_citation
+    requires gen_snippet_usable
+    gen_inserted = true
+  }
+
+  invariant NeverLeavesMachine "DOC-6: answer generation never sends data to a remote endpoint" {
+    not sent_remote
+  }
+
+  invariant DisabledHasNoAnswer "DOC-1: disabling lookup leaves no retrieval or generated answer" {
+    not enabled => (retrieval_status == RNone and not gen_has_answer)
+  }
+
+  invariant GeneratedRequiresGroundedCards "DOC-11: generated answers require grounded, cited cards for project_ver" {
+    gen_has_answer => (
+      enabled and retrieval_status == RGroundedCards and
+      retrieval_ver == some(project_ver) and
+      gen_ver == some(project_ver) and gen_has_citation and
+      gen_verification != VNone
+    )
+  }
+
+  invariant FailedOrNewerSnippetNeverUsable "DOC-11: failed, unverified, or newer-API generated snippets are never marked usable" {
+    gen_snippet_usable => (
+      gen_has_answer and gen_verification == VVerified and not gen_uses_newer_api
+    )
+  }
+
+  invariant RetrievalMatchesProjectVersion "DOC-2: any displayed retrieval or generated answer matches project_ver" {
+    (retrieval_status != RNone => retrieval_ver == some(project_ver)) and
+    (gen_has_answer => gen_ver == some(project_ver))
+  }
+
+  acceptance AC-DOC-12 "DOC-11: local LLM generates a cited answer whose locally verified snippet is usable and insertable" {
+    enable() toggle_llm(true) retrieve_cards(0) generate_answer(Local, true, false, VVerified) insert_generated()
+    expect gen_has_answer and gen_has_citation and gen_verification == VVerified and gen_snippet_usable and gen_inserted
+  }
+
+  acceptance AC-DOC-13 "DOC-11: verification failure keeps generated answer visible as non-usable without permitting insertion" {
+    enable() toggle_llm(true) retrieve_cards(0) generate_answer(Local, true, false, VFailed)
+    expect gen_has_answer and gen_verification == VFailed and not gen_snippet_usable
+  }
+
+  acceptance AC-DOC-14 "DOC-11: unverified snippet (e.g. go toolchain missing) is marked unverified and non-usable" {
+    enable() toggle_llm(true) retrieve_cards(0) generate_answer(Local, true, false, VUnverified)
+    expect gen_has_answer and gen_verification == VUnverified and not gen_snippet_usable
+  }
+
+  forbidden FB-DOC-11 "DOC-11: cannot generate an answer when retrieval returned Not Found" {
+    enable() toggle_llm(true) retrieve_not_found() generate_answer(Local, true, false, VVerified)
+    expect rejected
+  }
+
+  forbidden FB-DOC-12 "DOC-11: cannot insert a generated snippet that failed local verification" {
+    enable() toggle_llm(true) retrieve_cards(0) generate_answer(Local, true, false, VFailed) insert_generated()
+    expect rejected
+  }
+
+  forbidden FB-DOC-13 "DOC-11 / DOC-6: cannot send answer generation to a remote endpoint" {
+    enable() toggle_llm(true) retrieve_cards(0) generate_answer(Remote, true, false, VVerified)
+    expect rejected
+  }
+
+  forbidden FB-DOC-14 "DOC-11: cannot mark a generated snippet using a newer Go version API as usable or insert it" {
+    enable() toggle_llm(true) retrieve_cards(0) generate_answer(Local, true, true, VVerified) insert_generated()
+    expect rejected
+  }
+}
+
+verify {
+  values GoVer = 0..1
+}

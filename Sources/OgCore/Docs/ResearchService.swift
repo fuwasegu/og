@@ -107,7 +107,7 @@ public struct DocsNewerVersionNote: Sendable, Hashable {
     }
 }
 
-/// Complete response from `ResearchService.search(...)` (UX-1..7, FR-12..15).
+/// Complete response from `ResearchService.search(...)` (UX-1..7, FR-12..15, DOC-11).
 public struct DocsAnswer: Sendable, Hashable {
     public var query: String
     public var status: DocsAnswerStatus
@@ -118,6 +118,8 @@ public struct DocsAnswer: Sendable, Hashable {
     public var cards: [DocsAnswerCard]
     /// Features filtered out by the version gate, separated with explicit "Go X.Y+" notes (UC-1, FR-10).
     public var newerVersionNotes: [DocsNewerVersionNote]
+    /// Optional Phase 3 synthesized answer with citations and local snippet verification (DOC-11, Issue #24).
+    public var generatedAnswer: DocsGeneratedAnswer?
     public var targetVersion: GoVersion?
     public var versionSource: GoVersionSource?
     public var searchMode: DocsSearchMode
@@ -136,6 +138,7 @@ public struct DocsAnswer: Sendable, Hashable {
         conclusion: String,
         cards: [DocsAnswerCard] = [],
         newerVersionNotes: [DocsNewerVersionNote] = [],
+        generatedAnswer: DocsGeneratedAnswer? = nil,
         targetVersion: GoVersion? = nil,
         versionSource: GoVersionSource? = nil,
         searchMode: DocsSearchMode = .ftsOnly,
@@ -151,6 +154,7 @@ public struct DocsAnswer: Sendable, Hashable {
         self.conclusion = conclusion
         self.cards = cards
         self.newerVersionNotes = newerVersionNotes
+        self.generatedAnswer = generatedAnswer
         self.targetVersion = targetVersion
         self.versionSource = versionSource
         self.searchMode = searchMode
@@ -185,6 +189,24 @@ public enum DocsCodeInserter {
             return nil
         }
         guard GoVersionGate.evaluate(since: card.since, target: targetVersion) == .allowed else {
+            return nil
+        }
+        let prepared = await formatGoSnippetDetailedAsync(raw, locator: locator)
+        guard !Task.isCancelled else { return nil }
+        return prepared
+    }
+
+    /// Async preparation for a verified Phase 3 generated snippet (DOC-11, DOC-9).
+    public static func prepareSnippetAsync(
+        from generated: DocsGeneratedAnswer,
+        targetVersion: GoVersion,
+        locator: ToolLocator = .shared
+    ) async -> DocsPreparedSnippet? {
+        guard !Task.isCancelled else { return nil }
+        guard generated.canInsert,
+              generated.targetVersion.minorKey == targetVersion.minorKey,
+              let raw = generated.snippet,
+              !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return nil
         }
         let prepared = await formatGoSnippetDetailedAsync(raw, locator: locator)
@@ -399,6 +421,9 @@ public actor ResearchService {
     private var validatedEndpoint: URL?
     private var queryEmbedder: (any DocsEmbedder)?
     private var reranker: (any DocsReranker)?
+    private var answerGenerator: (any DocsAnswerGenerator)?
+    private var snippetVerifier: any DocsSnippetVerifying = DocsSnippetVerifier()
+    private var includeEditorContextInGeneration = true
     private var conceptRulesOverride: [DocsConceptRule]?
 
     public init(packManager: DocsPackManager, enabled: Bool = false) {
@@ -444,6 +469,21 @@ public actor ResearchService {
 
     public func hasReranker() -> Bool {
         reranker != nil
+    }
+
+    /// Configures an optional local LLM answer generator for Phase 3 synthesis (DOC-11, Issue #24).
+    public func setAnswerGenerator(_ generator: (any DocsAnswerGenerator)?) {
+        answerGenerator = generator
+    }
+
+    /// Configures the local Go snippet verifier (defaults to `DocsSnippetVerifier`).
+    public func setSnippetVerifier(_ verifier: any DocsSnippetVerifying) {
+        snippetVerifier = verifier
+    }
+
+    /// Controls whether editor file imports/context are included in Phase 3 answer generation (Issue #24).
+    public func setIncludeEditorContextInGeneration(_ include: Bool) {
+        includeEditorContextInGeneration = include
     }
 
     /// Executes the fixed offline retrieval pipeline (§7.3) with cancellation checkpoints (M-4).
@@ -940,6 +980,15 @@ public actor ResearchService {
         }
 
         let conclusion = buildConclusion(plan: plan, cards: cards, targetVersion: targetVer)
+        let topEntries = Array(top)
+        let generated = await synthesizeAnswerIfNeeded(
+            plan: plan,
+            topEntries: topEntries.map(\.candidate.chunk),
+            cards: cards,
+            newerNotes: newerNotes,
+            targetVersion: targetVer,
+            editorContext: includeEditorContextInGeneration ? editorContext : nil
+        )
 
         return DocsAnswer(
             query: plan.originalQuery,
@@ -949,13 +998,116 @@ public actor ResearchService {
             conclusion: conclusion,
             cards: cards,
             newerVersionNotes: Array(newerNotes.prefix(3)),
+            generatedAnswer: generated,
             targetVersion: targetVer,
             versionSource: resolved.source,
             searchMode: searchMode,
-            usedLLM: false,
+            usedLLM: generated != nil,
             usedReranker: usedReranker,
             searchedScope: scopeText
         )
+    }
+
+    private func synthesizeAnswerIfNeeded(
+        plan: DocsRoutingPlan,
+        topEntries: [DocsChunk],
+        cards: [DocsAnswerCard],
+        newerNotes: [DocsNewerVersionNote],
+        targetVersion: GoVersion,
+        editorContext: DocsEditorContext?
+    ) async -> DocsGeneratedAnswer? {
+        guard let generator = answerGenerator, !cards.isEmpty else { return nil }
+        // Only synthesize for procedural/pattern/reverse-lookup needs; symbol/existence lookups are already answered cleanly by Phase 2 cards.
+        switch plan.intent {
+        case .exactSymbol, .existenceCheck:
+            return nil
+        case .needsReverseLookup, .syntaxHowTo, .idiomOrWhy, .releaseSince:
+            break
+        }
+
+        let evidence = topEntries.map { chunk in
+            DocsAnswerEvidence(
+                citation: chunk.citationLabel,
+                title: chunk.title,
+                packageName: chunk.packageName,
+                symbol: chunk.symbol,
+                signature: chunk.signature,
+                summary: chunk.summary,
+                example: chunk.example,
+                body: chunk.body,
+                since: chunk.since
+            )
+        }
+        let req = DocsAnswerGenerationRequest(
+            query: plan.originalQuery,
+            language: plan.language,
+            targetVersion: targetVersion,
+            evidence: evidence,
+            editorContext: editorContext
+        )
+
+        let rawOutput: DocsAnswerGenerationOutput?
+        do {
+            rawOutput = try await generator.generate(request: req)
+        } catch {
+            return nil
+        }
+        guard let output = rawOutput, !output.insufficientEvidence else { return nil }
+
+        // Grounding check (DOC-11): only accept citations that match retrieved evidence cards.
+        let validCitations = evidence.map(\.citation)
+        let matchedCitations = Self.matchGroundedCitations(output.citedLabels, against: validCitations)
+        guard !matchedCitations.isEmpty else {
+            return nil
+        }
+
+        // Version gate on generated output & snippet (DOC-2, DOC-11).
+        let verification: DocsSnippetVerificationStatus
+        if let reqVer = output.requiredNewerGoVersion, reqVer > targetVersion {
+            verification = .newerVersionRequired(since: reqVer)
+        } else if let snippet = output.snippet, !snippet.isEmpty {
+            if let newerHit = Self.detectNewerAPIMention(in: snippet, newerNotes: newerNotes) {
+                verification = .newerVersionRequired(since: newerHit)
+            } else {
+                verification = await snippetVerifier.verify(snippet: snippet, targetVersion: targetVersion)
+            }
+        } else {
+            verification = .unverified(reason: "スニペットなし")
+        }
+
+        return DocsGeneratedAnswer(
+            explanation: output.explanation,
+            snippet: output.snippet,
+            citations: matchedCitations,
+            targetVersion: targetVersion,
+            verification: verification,
+            modelID: generator.modelID
+        )
+    }
+
+    static func matchGroundedCitations(_ cited: [String], against valid: [String]) -> [String] {
+        var matched: [String] = []
+        var seen = Set<String>()
+        for label in cited {
+            let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            if let exact = valid.first(where: { $0 == trimmed || $0.localizedCaseInsensitiveContains(trimmed) || trimmed.localizedCaseInsensitiveContains($0) }) {
+                if seen.insert(exact).inserted {
+                    matched.append(exact)
+                }
+            }
+        }
+        return matched
+    }
+
+    static func detectNewerAPIMention(in snippet: String, newerNotes: [DocsNewerVersionNote]) -> GoVersion? {
+        for note in newerNotes {
+            let symbolTail = note.title.split(separator: ".").last.map(String.init) ?? note.title
+            if symbolTail.count >= 4 && snippet.contains(symbolTail) {
+                return note.since
+            }
+        }
+        return nil
     }
 
     /// Returns 2 for an exact symbol or spec/guide title match, 1 for a package or method-prefix match, 0 otherwise.

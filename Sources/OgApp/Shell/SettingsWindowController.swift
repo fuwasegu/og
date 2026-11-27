@@ -40,6 +40,13 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     private let docsPacksLabel = NSTextField(wrappingLabelWithString: "")
     private let docsProgressBar = NSProgressIndicator()
     private let docsProgressLabel = NSTextField(labelWithString: "")
+    // Docs Phase 3 answer synthesis (Issue #24, D-9, D-10)
+    private let docsAnswerMode = NSPopUpButton()
+    private let docsAnswerBackend = NSPopUpButton()
+    private let docsAnswerModel = NSComboBox()
+    private let docsIncludeEditorContext = NSButton(checkboxWithTitle: "Include active Go file imports/context in Docs synthesis", target: nil, action: nil)
+    private let docsAnswerStatus = NSTextField(labelWithString: "")
+    private let docsAnswerActionButton = NSButton(title: "Restart", target: nil, action: nil)
 
     private init() {
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 780), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
@@ -58,6 +65,9 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
             MainActor.assumeIsolated { self?.refreshDocs() }
         }
         NotificationCenter.default.addObserver(forName: .ogDocsServerChanged, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshDocs() }
+        }
+        NotificationCenter.default.addObserver(forName: .ogDocsAnswerServerChanged, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.refreshDocs() }
         }
     }
@@ -156,6 +166,25 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         docsSemanticHint.font = Theme.smallFont
         docsSemanticHint.textColor = .secondaryLabelColor
 
+        for m in DocsAnswerLLMMode.allCases { docsAnswerMode.addItem(withTitle: m.title) }
+        docsAnswerMode.target = self
+        docsAnswerMode.action = #selector(docsAnswerModeChanged)
+        for b in ModelBackend.allCases { docsAnswerBackend.addItem(withTitle: b.title) }
+        docsAnswerBackend.target = self
+        docsAnswerBackend.action = #selector(docsAnswerBackendChanged)
+        docsAnswerModel.isEditable = true
+        docsAnswerModel.completes = false
+        docsAnswerModel.delegate = self
+        docsAnswerModel.target = self
+        docsAnswerModel.action = #selector(docsAnswerModelChanged)
+        docsAnswerModel.widthAnchor.constraint(equalToConstant: 420).isActive = true
+        docsIncludeEditorContext.target = self
+        docsIncludeEditorContext.action = #selector(docsIncludeEditorContextChanged)
+        docsAnswerStatus.font = Theme.smallFont
+        docsAnswerActionButton.target = self
+        docsAnswerActionButton.action = #selector(docsAnswerActionClicked)
+        let docsAnswerRow = NSStackView(views: [docsAnswerStatus, NSView(), docsAnswerActionButton])
+
         for p in DocsBatchRunPolicy.allCases { docsBatchPolicy.addItem(withTitle: p.title) }
         docsBatchPolicy.target = self
         docsBatchPolicy.action = #selector(docsPolicyChanged)
@@ -191,7 +220,9 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
             aiEnabled, row("Backend", backend), row("Model", model), customRow, hint, statusRow, logScroll,
             NSBox(),
             docsEnabled, docsSemanticEnabled, docsSemanticHint, row("Embedding", docsEmbedModel), docsRerankEnabled, row("Reranker", docsRerankModel),
-            docsServerRow, row("Indexing", docsBatchPolicy), docsButtons, docsPacksLabel, docsProgressBar, docsProgressLabel
+            docsServerRow,
+            row("Synthesis", docsAnswerMode), row("LLM Back", docsAnswerBackend), row("LLM Model", docsAnswerModel), docsIncludeEditorContext, docsAnswerRow,
+            row("Indexing", docsBatchPolicy), docsButtons, docsPacksLabel, docsProgressBar, docsProgressLabel
         ])
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -201,6 +232,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         logScroll.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
         docsSemanticHint.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
         docsServerRow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
+        docsAnswerRow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
         docsProgressBar.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
         docsPacksLabel.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
         let scroll = NSScrollView()
@@ -295,6 +327,8 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
                     self.docsEmbedModelChanged()
                 } else if sender === self.docsRerankModel {
                     self.docsRerankModelChanged()
+                } else if sender === self.docsAnswerModel {
+                    self.docsAnswerModelChanged()
                 } else if sender === self.model {
                     self.modelChanged()
                 }
@@ -374,6 +408,27 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         }
         docsServerActionButton.isEnabled = d.enabled && ds.enabled
         docsReembedButton.isEnabled = d.enabled && ds.phase == .ready && !d.installedPacks.isEmpty
+
+        let ansMgr = DocsAnswerServerManager.shared
+        let ansCfg = ansMgr.config
+        docsAnswerMode.selectItem(at: DocsAnswerLLMMode.allCases.firstIndex(of: ansCfg.mode) ?? 0)
+        docsAnswerMode.isEnabled = d.enabled
+        docsAnswerBackend.selectItem(at: ModelBackend.allCases.firstIndex(of: ansCfg.backend) ?? 0)
+        docsAnswerBackend.isEnabled = d.enabled && ansCfg.mode == .dedicated
+        docsAnswerModel.removeAllItems()
+        docsAnswerModel.addItems(withObjectValues: DocsAnswerModelPreset.presets(for: ansCfg.backend).map(\.title))
+        docsAnswerModel.stringValue = DocsAnswerModelPreset.all.first { $0.id == ansCfg.model }?.title ?? ansCfg.model
+        docsAnswerModel.isEnabled = d.enabled && ansCfg.mode == .dedicated
+        docsIncludeEditorContext.state = ansCfg.includeEditorContext ? .on : .off
+        docsIncludeEditorContext.isEnabled = d.enabled && ansCfg.mode != .off
+        docsAnswerStatus.stringValue = ansMgr.statusText
+        switch ansMgr.phase {
+        case .failed: docsAnswerStatus.textColor = .systemRed; docsAnswerActionButton.title = "Retry"
+        case .ready: docsAnswerStatus.textColor = .systemGreen; docsAnswerActionButton.title = "Restart"
+        case .starting: docsAnswerStatus.textColor = .systemOrange; docsAnswerActionButton.title = "Restart"
+        case .off: docsAnswerStatus.textColor = .secondaryLabelColor; docsAnswerActionButton.title = "Start"
+        }
+        docsAnswerActionButton.isEnabled = d.enabled && ansCfg.mode == .dedicated
 
         docsBatchPolicy.selectItem(at: DocsBatchRunPolicy.allCases.firstIndex(of: d.batchPolicy) ?? 0)
 
@@ -609,5 +664,49 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         alert.informativeText = DocsLicense.goBSD3Clause
         alert.addButton(withTitle: "OK")
         if let w = window { alert.beginSheetModal(for: w, completionHandler: nil) } else { alert.runModal() }
+    }
+
+    @objc private func docsAnswerModeChanged() {
+        var cfg = DocsAnswerServerManager.shared.config
+        cfg.mode = DocsAnswerLLMMode.allCases[max(0, docsAnswerMode.indexOfSelectedItem)]
+        DocsAnswerServerManager.shared.config = cfg
+        refreshDocs()
+    }
+
+    @objc private func docsAnswerBackendChanged() {
+        var cfg = DocsAnswerServerManager.shared.config
+        let b = ModelBackend.allCases[max(0, docsAnswerBackend.indexOfSelectedItem)]
+        cfg.backend = b
+        if let firstPreset = DocsAnswerModelPreset.presets(for: b).first {
+            cfg.model = firstPreset.id
+        }
+        DocsAnswerServerManager.shared.config = cfg
+        refreshDocs()
+    }
+
+    @objc private func docsAnswerModelChanged() {
+        let text = docsAnswerModel.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        let preset = DocsAnswerModelPreset.all.first { $0.title == text || $0.id == text }
+        var cfg = DocsAnswerServerManager.shared.config
+        cfg.model = preset?.id ?? text
+        DocsAnswerServerManager.shared.config = cfg
+        refreshDocs()
+    }
+
+    @objc private func docsIncludeEditorContextChanged() {
+        var cfg = DocsAnswerServerManager.shared.config
+        cfg.includeEditorContext = docsIncludeEditorContext.state == .on
+        DocsAnswerServerManager.shared.config = cfg
+        DocsManager.shared.syncInferenceClients()
+    }
+
+    @objc private func docsAnswerActionClicked() {
+        let mgr = DocsAnswerServerManager.shared
+        switch mgr.phase {
+        case .failed: mgr.retry()
+        case .off: mgr.restart()
+        default: mgr.restart()
+        }
     }
 }

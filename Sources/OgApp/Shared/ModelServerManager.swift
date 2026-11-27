@@ -66,6 +66,16 @@ final class ModelServerManager {
         return LocalCompletionClient(endpoint: url, api: cfg.api)
     }
 
+    var endpointURL: URL? {
+        guard phase == .ready, let port else { return nil }
+        return URL(string: "http://127.0.0.1:\(port)")
+    }
+
+    var loadedModelName: String? {
+        guard phase == .ready else { return nil }
+        return loadedConfig?.model
+    }
+
     var statusText: String {
         switch phase {
         case .off: return "AI: off"

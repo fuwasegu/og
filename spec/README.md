@@ -34,6 +34,7 @@ FSL で表せるのは、操作の順序や組み合わせで壊れうる部分�
 | AI サーバー（補完） | AI-1〜AI-6 | `req/model_server.fsl` |
 | Docs 推論サーバー | D-9, D-10, AI-1〜AI-6 | `req/docs_server.fsl` |
 | Go 調べ物（Docs） | DOC-1〜DOC-10 | `req/research.fsl` |
+| Docs 回答生成・検証 | DOC-11 | `req/docs_answer.fsl` |
 | テストで確認 | WS-2, WS-3, FT-1, FT-3, ED-4, ED-5 | UI テスト |
 | テストで確認 | NAV-1〜NAV-6, LSP-3 | gopls 結合テスト（読み取りのみ） |
 | テストで確認 | TERM-1, GO-1〜GO-4 の変換内容 | ユニットテスト |
@@ -70,6 +71,7 @@ FSL で表せるのは、操作の順序や組み合わせで壊れうる部分�
 | AI サーバー（補完） | `design/model_server.fsl` | `design/model_server_refines_req.fsl` | refines |
 | Docs 推論サーバー | `design/docs_server.fsl` | `design/docs_server_refines_req.fsl` | refines |
 | Go 調べ物（Docs） | `design/research.fsl` | `design/research_refines_req.fsl` | refines |
+| Docs 回答生成・検証 | `design/docs_answer.fsl` | `design/docs_answer_refines_req.fsl` | refines |
 
 ```sh
 fslc refine spec/design/workspace.fsl spec/req/workspace.fsl spec/design/workspace_refines_req.fsl

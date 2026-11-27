@@ -65,6 +65,7 @@ final class DocsManager {
             debugEnabledOverride = nil
             UserDefaults.standard.set(newValue, forKey: "og.docs.enabled")
             DocsServerManager.shared.syncWithDocsOptIn(docsEnabled: newValue)
+            DocsAnswerServerManager.shared.syncWithDocsOptIn(docsEnabled: newValue)
             let svc = service
             Task { [weak self] in
                 await svc?.setEnabled(newValue)
@@ -91,6 +92,7 @@ final class DocsManager {
     func startIfEnabled() {
         guard enabled else { return }
         DocsServerManager.shared.startIfEnabled()
+        DocsAnswerServerManager.shared.startIfEnabled()
         Task { [weak self] in
             await self?.service?.setEnabled(true)
             await self?.ensureDefaultPackIfNeeded()
@@ -101,18 +103,23 @@ final class DocsManager {
         for (_, task) in batchTasks { task.cancel() }
         batchTasks.removeAll()
         DocsServerManager.shared.shutdownForQuit()
+        DocsAnswerServerManager.shared.shutdownForQuit()
     }
 
-    /// Synchronizes the active loopback embedder and reranker clients from `DocsServerManager` into `ResearchService` (Phase 2, D-9, DOC-10).
+    /// Synchronizes the active loopback embedder, reranker, and answer generator clients into `ResearchService` (Phase 2/3, D-9, DOC-10, DOC-11).
     func syncInferenceClients() {
         guard let svc = service else { return }
         let embedder = DocsServerManager.shared.embedderClient
         let reranker = DocsServerManager.shared.rerankerClient
         let endpoint = DocsServerManager.shared.endpointURL
+        let generator = DocsAnswerServerManager.shared.answerGeneratorClient
+        let includeCtx = DocsAnswerServerManager.shared.config.includeEditorContext
         Task { [weak self] in
             try? await svc.setLocalEndpoint(endpoint)
             await svc.setEmbedder(embedder)
             await svc.setReranker(reranker)
+            await svc.setAnswerGenerator(generator)
+            await svc.setIncludeEditorContextInGeneration(includeCtx)
             self?.notifyPacksChanged()
         }
     }

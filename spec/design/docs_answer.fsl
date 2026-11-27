@@ -1,0 +1,205 @@
+// og — Docs Phase 3 design: Grounded answer generation & temporary-module go build verification
+//
+// Refines: spec/req/docs_answer.fsl (mapping: spec/design/docs_answer_refines_req.fsl)
+//
+// DES-A1: Answer generation client validates loopback endpoint (127.0.0.1, ::1, localhost)
+//         and disables HTTP redirects.
+// DES-A2: Generation runs strictly after grounded Phase 2 retrieval (`DRGroundedCards`).
+// DES-A3: Local snippet verification writes a temporary `go.mod` pinned to `project_ver`
+//         and runs `go build` with `GOPROXY=off` (zero network access).
+//         Missing `go` toolchain or unresolved external dependency yields `VUnverified`.
+//         Compile/type errors yield `VFailed`. Newer-API usage yields `gen_snippet_usable = false`.
+//
+// ASSUME-1 (representation only): two Go versions (0 = older, 1 = newer).
+spec DocsAnswerDesign {
+  number GoVer
+
+  enum Host { Loopback, Elsewhere }
+  enum DRetrievalStatus { DRNone, DRGroundedCards, DRNotFound, DRMissingPack }
+  enum SnippetVerification { VNone, VVerified, VUnverified, VFailed }
+
+  state {
+    endpoint:           Host,
+    enabled:            Bool,
+    llm_available:      Bool,
+    project_ver:        GoVer,
+    retrieval_status:   DRetrievalStatus,
+    retrieval_ver:      Option<GoVer>,
+    retrieval_since:    Option<GoVer>,
+    gen_has_answer:     Bool,
+    gen_ver:            Option<GoVer>,
+    gen_has_citation:   Bool,
+    gen_uses_newer_api: Bool,
+    gen_verification:   SnippetVerification,
+    gen_snippet_usable: Bool,
+    gen_inserted:       Bool,
+    sent_remote:        Bool
+  }
+
+  init {
+    endpoint = Loopback
+    enabled = false
+    llm_available = false
+    project_ver = 0
+    retrieval_status = DRNone
+    retrieval_ver = none
+    retrieval_since = none
+    gen_has_answer = false
+    gen_ver = none
+    gen_has_citation = false
+    gen_uses_newer_api = false
+    gen_verification = VNone
+    gen_snippet_usable = false
+    gen_inserted = false
+    sent_remote = false
+  }
+
+  action set_endpoint(h: Host) "DES-A1: only loopback endpoints are accepted" {
+    requires h == Loopback
+    endpoint = h
+  }
+
+  action enable() "DES-A2: enable Go docs lookup" {
+    requires not enabled
+    enabled = true
+  }
+
+  action disable() "DES-A2: disable lookup and clear answers" {
+    requires enabled
+    enabled = false
+    retrieval_status = DRNone
+    retrieval_ver = none
+    retrieval_since = none
+    gen_has_answer = false
+    gen_ver = none
+    gen_has_citation = false
+    gen_uses_newer_api = false
+    gen_verification = VNone
+    gen_snippet_usable = false
+  }
+
+  action set_project_version(v: GoVer) "DES-A3: update project Go version and clear stale answers" {
+    requires v != project_ver
+    project_ver = v
+    retrieval_status = DRNone
+    retrieval_ver = none
+    retrieval_since = none
+    gen_has_answer = false
+    gen_ver = none
+    gen_has_citation = false
+    gen_uses_newer_api = false
+    gen_verification = VNone
+    gen_snippet_usable = false
+  }
+
+  action toggle_llm(avail: Bool) "DES-A2: update local LLM readiness" {
+    requires avail != llm_available
+    llm_available = avail
+  }
+
+  action retrieve_cards(card_since: GoVer) "DES-A2: record grounded retrieval cards" {
+    requires enabled
+    requires card_since <= project_ver
+    retrieval_status = DRGroundedCards
+    retrieval_ver = some(project_ver)
+    retrieval_since = some(card_since)
+    gen_has_answer = false
+    gen_ver = none
+    gen_has_citation = false
+    gen_uses_newer_api = false
+    gen_verification = VNone
+    gen_snippet_usable = false
+  }
+
+  action retrieve_not_found() "DES-A2: record Not Found retrieval" {
+    requires enabled
+    retrieval_status = DRNotFound
+    retrieval_ver = some(project_ver)
+    retrieval_since = none
+    gen_has_answer = false
+    gen_ver = none
+    gen_has_citation = false
+    gen_uses_newer_api = false
+    gen_verification = VNone
+    gen_snippet_usable = false
+  }
+
+  action retrieve_missing_pack() "DES-A2: record MissingPack retrieval" {
+    requires enabled
+    retrieval_status = DRMissingPack
+    retrieval_ver = some(project_ver)
+    retrieval_since = none
+    gen_has_answer = false
+    gen_ver = none
+    gen_has_citation = false
+    gen_uses_newer_api = false
+    gen_verification = VNone
+    gen_snippet_usable = false
+  }
+
+  action generate_answer(
+    has_citation: Bool,
+    uses_newer_api: Bool,
+    verif: SnippetVerification
+  ) "DES-A3: synthesize cited answer on loopback and verify snippet in temp go.mod with GOPROXY=off" {
+    requires enabled
+    requires llm_available
+    requires retrieval_status == DRGroundedCards
+    requires retrieval_ver == some(project_ver)
+    requires retrieval_since is some(s) and s <= project_ver
+    requires has_citation
+    requires verif != VNone
+    gen_has_answer = true
+    gen_ver = some(project_ver)
+    gen_has_citation = true
+    gen_uses_newer_api = uses_newer_api
+    gen_verification = verif
+    gen_snippet_usable = (verif == VVerified and not uses_newer_api)
+    sent_remote = sent_remote or endpoint == Elsewhere
+  }
+
+  action insert_generated() "DES-A3: insert verified, version-compatible generated snippet" {
+    requires enabled
+    requires gen_has_answer
+    requires gen_ver == some(project_ver)
+    requires gen_has_citation
+    requires gen_snippet_usable
+    gen_inserted = true
+  }
+
+  invariant EndpointIsLoopback "DES-A1: validated endpoint is always loopback" {
+    endpoint == Loopback
+  }
+
+  invariant NeverLeavesMachine "DES-A1: no data ever leaves the machine" {
+    not sent_remote
+  }
+
+  invariant DisabledHasNoAnswer "DES-A2: disabling lookup leaves no answer" {
+    not enabled => (retrieval_status == DRNone and not gen_has_answer)
+  }
+
+  invariant GeneratedRequiresGroundedCards "DES-A2: generated answers require grounded cards" {
+    gen_has_answer => (
+      enabled and retrieval_status == DRGroundedCards and
+      retrieval_ver == some(project_ver) and
+      gen_ver == some(project_ver) and gen_has_citation and
+      gen_verification != VNone
+    )
+  }
+
+  invariant FailedOrNewerSnippetNeverUsable "DES-A3: failed, unverified, or newer-API snippets are never usable" {
+    gen_snippet_usable => (
+      gen_has_answer and gen_verification == VVerified and not gen_uses_newer_api
+    )
+  }
+
+  invariant RetrievalMatchesProjectVersion "DES-A3: retrieval and generated answers match project_ver" {
+    (retrieval_status != DRNone => retrieval_ver == some(project_ver)) and
+    (gen_has_answer => gen_ver == some(project_ver))
+  }
+}
+
+verify {
+  values GoVer = 0..1
+}

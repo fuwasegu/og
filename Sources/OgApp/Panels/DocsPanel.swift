@@ -161,6 +161,11 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
                 self?.updateModeLabelForProgress()
             }
         })
+        observers.append(NotificationCenter.default.addObserver(forName: .ogDocsAnswerServerChanged, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.updateModeLabelForProgress()
+            }
+        })
         refreshVersionPopup()
         renderIdleOrStatus()
     }
@@ -245,6 +250,21 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
         context.setStatus("Copied snippet from \(answer.cards[index].citation)")
     }
 
+    @objc private func copyGeneratedClicked() {
+        guard let gen = lastAnswer?.generatedAnswer, let code = gen.snippet else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(code, forType: .string)
+        context.setStatus("Copied generated snippet (\(gen.citations.first ?? "Docs"))")
+    }
+
+    @objc private func insertGeneratedClicked() {
+        guard let gen = lastAnswer?.generatedAnswer, gen.canInsert else { return }
+        insertTask?.cancel()
+        insertTask = Task { [weak self] in
+            _ = await self?.insertGeneratedAsync(gen)
+        }
+    }
+
     @objc private func showLicense() {
         let alert = NSAlert()
         alert.messageText = "Go Documentation License (BSD-3-Clause)"
@@ -292,6 +312,33 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
     /// M-3 & L-10: checks `.isGo`, runs `gofmt` off the main thread, then inserts safely via UTF-16 ranges.
     @discardableResult
     private func insertCardAsync(_ card: DocsAnswerCard, targetVersion: GoVersion?) async -> Bool {
+        guard let ver = targetVersion ?? GoVersion(parsing: card.goVersion) else {
+            context.setStatus("Snippet cannot be inserted for unknown Go version.")
+            return false
+        }
+        return await insertWithPreparation(citation: card.citation, goVersion: card.goVersion) {
+            await DocsCodeInserter.prepareSnippetAsync(from: card, targetVersion: ver)
+        }
+    }
+
+    @discardableResult
+    private func insertGeneratedAsync(_ generated: DocsGeneratedAnswer) async -> Bool {
+        guard generated.canInsert else {
+            context.setStatus("Unverified or failed generated snippets cannot be inserted.")
+            return false
+        }
+        let cite = generated.citations.first ?? "Docs Synthesis"
+        let ver = generated.targetVersion
+        return await insertWithPreparation(citation: cite, goVersion: ver.minorKey) {
+            await DocsCodeInserter.prepareSnippetAsync(from: generated, targetVersion: ver)
+        }
+    }
+
+    private func insertWithPreparation(
+        citation: String,
+        goVersion: String,
+        prepare: () async -> DocsPreparedSnippet?
+    ) async -> Bool {
         guard let editor = context.currentEditor else {
             context.setStatus("Open a Go file to insert the snippet.")
             return false
@@ -300,13 +347,9 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
             context.setStatus("Switch to a Go (.go) file before inserting a Go Docs snippet.")
             return false
         }
-        guard let ver = targetVersion ?? GoVersion(parsing: card.goVersion) else {
-            context.setStatus("Snippet cannot be inserted for unknown Go version.")
-            return false
-        }
         let docVersionBefore = editor.document.version
-        guard let prepared = await DocsCodeInserter.prepareSnippetAsync(from: card, targetVersion: ver) else {
-            context.setStatus("Snippet cannot be inserted for \(ver.description).")
+        guard let prepared = await prepare() else {
+            context.setStatus("Snippet cannot be inserted for go\(goVersion).")
             return false
         }
         guard !Task.isCancelled else { return false }
@@ -314,7 +357,6 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
             context.setStatus("Editor changed while formatting snippet; please try inserting again.")
             return false
         }
-        // UTF-16 safe insertion via existing editor path (AGENTS.md §4-2), matching surrounding indentation.
         let range = editor.textView.selectedRange()
         let indent = indentationForInsertion(in: editor.document.storage.string, atUTF16Offset: range.location)
         let indented = prepared.code
@@ -329,7 +371,7 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
         editor.document.undoManager.setActionName("Insert Go Docs Snippet")
         editor.focus()
         let fmtNote = prepared.formattedByGofmt ? "" : " (unformatted: gofmt not found)"
-        context.setStatus("Inserted snippet (\(card.citation), go\(card.goVersion))\(fmtNote)")
+        context.setStatus("Inserted snippet (\(citation), go\(goVersion))\(fmtNote)")
         return true
     }
 
@@ -447,6 +489,11 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
             }
 
         case .found:
+            if let gen = answer.generatedAnswer {
+                let genView = makeGeneratedAnswerView(gen)
+                contentStack.addArrangedSubview(genView)
+                genView.widthAnchor.constraint(equalTo: contentStack.widthAnchor, constant: -24).isActive = true
+            }
             for (idx, card) in answer.cards.enumerated() {
                 let cardView = makeCardView(card: card, index: idx)
                 contentStack.addArrangedSubview(cardView)
@@ -563,6 +610,91 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
         return box
     }
 
+    private func makeGeneratedAnswerView(_ gen: DocsGeneratedAnswer) -> NSView {
+        let box = NSView()
+        box.wantsLayer = true
+        Theme.paint(box, background: Theme.panelBackground, border: Theme.border)
+        box.layer?.cornerRadius = 6
+        box.layer?.borderWidth = 1.5
+
+        let inner = NSStackView()
+        inner.orientation = .vertical
+        inner.alignment = .leading
+        inner.spacing = 6
+        inner.edgeInsets = NSEdgeInsets(top: 10, left: 10, bottom: 10, right: 10)
+        inner.translatesAutoresizingMaskIntoConstraints = false
+        box.addSubview(inner)
+        NSLayoutConstraint.activate([
+            inner.topAnchor.constraint(equalTo: box.topAnchor),
+            inner.leadingAnchor.constraint(equalTo: box.leadingAnchor),
+            inner.trailingAnchor.constraint(equalTo: box.trailingAnchor),
+            inner.bottomAnchor.constraint(equalTo: box.bottomAnchor)
+        ])
+
+        let badgeColor: NSColor
+        switch gen.verification {
+        case .verified: badgeColor = .systemGreen
+        case .unverified, .newerVersionRequired: badgeColor = Theme.warning
+        case .failed: badgeColor = .systemRed
+        }
+        let titleLabel = label("合成回答（ローカル LLM）", color: Theme.text, size: 12, bold: true)
+        let badgeLabel = label(gen.verification.badgeLabel, color: badgeColor, size: 11, bold: true)
+        let headerRow = NSStackView(views: [titleLabel, NSView(), badgeLabel])
+        headerRow.orientation = .horizontal
+        headerRow.spacing = 8
+        inner.addArrangedSubview(headerRow)
+        headerRow.widthAnchor.constraint(equalTo: inner.widthAnchor, constant: -20).isActive = true
+
+        inner.addArrangedSubview(label(gen.explanation, color: Theme.text, size: 12))
+
+        if let snippet = gen.snippet, !snippet.isEmpty {
+            let codeContainer = NSView()
+            codeContainer.wantsLayer = true
+            Theme.paint(codeContainer, background: Theme.background, border: Theme.border)
+            codeContainer.layer?.cornerRadius = 4
+            codeContainer.layer?.borderWidth = 0.5
+            let codeField = NSTextField(wrappingLabelWithString: snippet)
+            codeField.font = Theme.editorFont.withSize(11)
+            codeField.textColor = Theme.text
+            codeField.isSelectable = true
+            codeField.translatesAutoresizingMaskIntoConstraints = false
+            codeContainer.addSubview(codeField)
+            NSLayoutConstraint.activate([
+                codeField.topAnchor.constraint(equalTo: codeContainer.topAnchor, constant: 6),
+                codeField.leadingAnchor.constraint(equalTo: codeContainer.leadingAnchor, constant: 8),
+                codeField.trailingAnchor.constraint(equalTo: codeContainer.trailingAnchor, constant: -8),
+                codeField.bottomAnchor.constraint(equalTo: codeContainer.bottomAnchor, constant: -6)
+            ])
+            inner.addArrangedSubview(codeContainer)
+        }
+
+        let citeText = "出典: \(gen.citations.joined(separator: ", ")) • go\(gen.targetVersion.minorKey) • \(gen.modelID)"
+        let citeField = label(citeText, color: Theme.secondaryText, size: 11)
+        citeField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        var footerViews: [NSView] = [citeField, NSView()]
+        if gen.snippet != nil {
+            let copyBtn = NSButton(title: "Copy", target: self, action: #selector(copyGeneratedClicked))
+            copyBtn.bezelStyle = .rounded
+            copyBtn.controlSize = .small
+            footerViews.append(copyBtn)
+        }
+        if gen.canInsert {
+            let insertBtn = NSButton(title: "Insert", target: self, action: #selector(insertGeneratedClicked))
+            insertBtn.bezelStyle = .rounded
+            insertBtn.controlSize = .small
+            footerViews.append(insertBtn)
+        }
+        let footer = NSStackView(views: footerViews)
+        footer.orientation = .horizontal
+        footer.spacing = 6
+        inner.addArrangedSubview(footer)
+        footer.widthAnchor.constraint(equalTo: inner.widthAnchor, constant: -20).isActive = true
+
+        box.translatesAutoresizingMaskIntoConstraints = false
+        return box
+    }
+
     private func label(_ text: String, color: NSColor, size: CGFloat, bold: Bool = false) -> NSTextField {
         let f = NSTextField(wrappingLabelWithString: text)
         f.font = bold ? .systemFont(ofSize: size, weight: .semibold) : .systemFont(ofSize: size)
@@ -614,7 +746,8 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
     func debugSummary() -> String {
         guard let a = lastAnswer else { return "none" }
         let titles = a.cards.map { "\($0.citation)[go\($0.goVersion)]" }.joined(separator: " | ")
-        return "status=\(a.status) mode=\(a.searchMode.rawValue) rerank=\(a.usedReranker) cards=\(a.cards.count) newer=\(a.newerVersionNotes.count) [\(titles)]"
+        let genTag = a.generatedAnswer.map { " gen=\($0.verification.badgeLabel)" } ?? ""
+        return "status=\(a.status) mode=\(a.searchMode.rawValue) rerank=\(a.usedReranker)\(genTag) cards=\(a.cards.count) newer=\(a.newerVersionNotes.count) [\(titles)]"
     }
 }
 
