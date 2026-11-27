@@ -36,6 +36,8 @@ refinement ResearchRefinesReq {
   action batch_abort()                    -> abort_batch()
   action query_found(card_since, has_newer_feature, source, card_count)
     -> query_found(Local, card_since, has_newer_feature, source, card_count, true, true)
+  action query_found_example(card_since, source, card_count)
+    -> query_found_example(Local, card_since, source, card_count, true, true)
   action query_not_found(has_newer_feature)
     -> query_not_found(Local, has_newer_feature)
 }

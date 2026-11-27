@@ -314,7 +314,11 @@ def extract_real_goroot_chunks(goroot: Path) -> list[dict]:
             f for f in filenames
             if f.endswith(".go") and not f.endswith("_test.go") and not f.startswith("_")
         )
-        if not go_files:
+        test_files = sorted(
+            f for f in filenames
+            if f.endswith("_test.go") and not f.startswith("_")
+        )
+        if not go_files and not test_files:
             continue
 
         for fname in go_files:
@@ -389,6 +393,74 @@ def extract_real_goroot_chunks(goroot: Path) -> list[dict]:
                         "text": text,
                         "rerank_text": text[:900],
                     })
+
+        # Also extract official Example*() functions from *_test.go (Issue #25).
+        ex_re = re.compile(r"^func\s+(Example(?:_[A-Za-z0-9_]+|[A-Z][A-Za-z0-9_]*)?)\(\)\s*\{")
+        for fname in test_files:
+            fpath = Path(dirpath) / fname
+            try:
+                raw = fpath.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            lines = raw.splitlines()
+            comment_buf = []
+            idx = 0
+            while idx < len(lines):
+                line = lines[idx]
+                stripped = line.strip()
+                if stripped.startswith("//"):
+                    if stripped.startswith("//go:") or stripped.startswith("// +build"):
+                        idx += 1
+                        continue
+                    comment_buf.append(stripped)
+                    idx += 1
+                    continue
+                if stripped == "":
+                    comment_buf = []
+                    idx += 1
+                    continue
+                em = ex_re.match(line)
+                if em:
+                    ex_name = em.group(1)
+                    doc = _clean_doc_lines(comment_buf)
+                    comment_buf = []
+                    body_lines = []
+                    idx += 1
+                    while idx < len(lines) and not lines[idx].startswith("}"):
+                        body_lines.append(lines[idx])
+                        idx += 1
+                    code = "\n".join(body_lines).strip()
+                    if code:
+                        rest = ex_name[len("Example"):]
+                        if not rest or rest.startswith("_"):
+                            target_sym = ""
+                            suffix = rest.lstrip("_") or None
+                        else:
+                            parts = rest.split("_")
+                            if len(parts) >= 2 and parts[1] and parts[1][0].isupper():
+                                target_sym = f"{parts[0]}.{parts[1]}"
+                                suffix = "_".join(parts[2:]) or None
+                            else:
+                                target_sym = parts[0]
+                                suffix = "_".join(parts[1:]) or None
+                        target_disp = f"{import_path}.{target_sym}" if target_sym else import_path
+                        title = f"Example: {target_disp} ({suffix})" if suffix else f"Example: {target_disp}"
+                        sid = f"stdlib::{import_path}::{import_path}::{target_sym}::example::{import_path}.{ex_name}"
+                        if sid not in seen_ids:
+                            seen_ids.add(sid)
+                            summary = (doc.split("\n\n")[0].replace("\n", " ") if doc else f"Official Go example for {target_disp}.")[:240]
+                            text = f"{title}\nfunc {ex_name}()\n{summary}\n{code[:800]}"
+                            chunks.append({
+                                "stable_id": sid,
+                                "title": title,
+                                "content_hash": hashlib.sha256(text.encode("utf-8")).hexdigest()[:24],
+                                "text": text,
+                                "rerank_text": text[:900],
+                            })
+                    idx += 1
+                    continue
+                comment_buf = []
+                idx += 1
 
     return chunks
 

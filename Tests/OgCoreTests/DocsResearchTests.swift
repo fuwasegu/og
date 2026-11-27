@@ -1903,3 +1903,264 @@ struct DocsPhase3Tests {
     }
 }
 
+// MARK: - Issue #25: GOROOT Example Function Extraction & Retrieval
+
+@Suite("GOROOT Example Function Extraction & Retrieval (Issue #25)")
+struct DocsExampleCorpusTests {
+    @Test("Extracts ExampleXxx, Example_pkg_Xxx, ExampleType_Method, doc comments, and // Output: while excluding Test*/Benchmark*/Fuzz* (Issue #25)")
+    func extractsAllExampleFormsAndExcludesRegularTests() {
+        let dir = TempDir()
+        defer { dir.cleanup() }
+
+        let src = dir.subdir("src")
+        _ = dir.file("src/net/http/server.go", """
+        // Package http provides HTTP client and server implementations.
+        package http
+
+        // FileServer returns a handler that serves HTTP requests with the contents of the file system.
+        func FileServer(root any) any { return nil }
+
+        // ServeMux is an HTTP request multiplexer.
+        type ServeMux struct{}
+
+        // Handle registers the handler for the given pattern.
+        func (mux *ServeMux) Handle(pattern string, handler any) {}
+        """)
+        _ = dir.file("src/net/http/example_test.go", """
+        package http_test
+
+        import "testing"
+
+        // Regular test function must be excluded.
+        func TestFileServer(t *testing.T) {
+        \t_ = t
+        }
+
+        // Benchmark and fuzz functions must be excluded.
+        func BenchmarkFileServer(b *testing.B) {
+        \t_ = b
+        }
+
+        func FuzzFileServer(f *testing.F) {
+        \t_ = f
+        }
+
+        // Parameterized or return-valued helpers starting with Example must be excluded.
+        func ExampleHelper(t *testing.T) {
+        \t_ = t
+        }
+
+        func ExampleWithReturn() int {
+        \treturn 42
+        }
+
+        func Examplelowercase() {
+        \tfmt.Println("not a go/doc example")
+        }
+
+        // Package-level example with doc comment.
+        func Example() {
+        \tfmt.Println("package example")
+        \t// Output:
+        \t// package example
+        }
+
+        // Serve files from a directory with a stripped URL prefix.
+        func ExampleFileServer_stripPrefix() {
+        \thttp.Handle("/tmpfiles/", http.StripPrefix("/tmpfiles/", http.FileServer(http.Dir("/tmp"))))
+        \t// Output:
+        \t// serving /tmpfiles/
+        }
+
+        // Package-level named example in Example_pkg_Xxx form.
+        func Example_http_customHandler() {
+        \tfmt.Println("custom handler")
+        \t// Unordered output:
+        \t// custom handler
+        }
+
+        // Register a handler on a ServeMux.
+        func ExampleServeMux_Handle() {
+        \tmux := http.NewServeMux()
+        \tmux.Handle("/api/", nil)
+        }
+
+        // Method example with descriptive suffix.
+        func ExampleServeMux_Handle_customMux() {
+        \tmux := http.NewServeMux()
+        \tmux.Handle("/v2/", nil)
+        \t// Output: ok
+        }
+
+        /*/
+        Malformed-looking block comment opener found in real GOROOT test files must not crash parser.
+        */
+        """)
+        _ = dir.file("src/net/http/example_windows_test.go", """
+        package http_test
+
+        func ExampleWindowsOnly() {
+        \tfmt.Println("windows")
+        }
+        """)
+        _ = dir.file("src/testdata/example_test.go", """
+        package testdata_test
+
+        func ExampleIgnoredTestdata() {
+        \tfmt.Println("ignored")
+        }
+        """)
+        _ = dir.file("src/_gen/example_test.go", """
+        package gen_test
+
+        func ExampleIgnoredUnderscore() {
+        \tfmt.Println("ignored")
+        }
+        """)
+
+        let chunks = DocsCorpusExtractor.extractStdlib(
+            fromGorootSrc: src,
+            goVersion: "1.23",
+            target: GoBuildTarget(goos: "darwin", goarch: "arm64")
+        )
+
+        let exampleChunks = chunks.filter { $0.kind == .example }
+        #expect(exampleChunks.count == 5)
+
+        // All example chunks carry `.officialExample` provenance and "[公式サンプル]" citation label.
+        for ex in exampleChunks {
+            #expect(ex.provenance == .officialExample)
+            #expect(stringContains(ex.citationLabel, "公式サンプル"))
+        }
+
+        // Non-colliding FR-31 stable IDs across doc chunks and multiple examples for the same symbol.
+        let allIDs = chunks.map(\.stableID)
+        #expect(Set(allIDs).count == allIDs.count)
+
+        // Verify ExampleFileServer_stripPrefix metadata, doc comment, code, and stripped // Output:.
+        let stripEx = exampleChunks.first { $0.anchor == "net/http.ExampleFileServer_stripPrefix" }
+        #expect(stripEx != nil)
+        #expect(stripEx?.symbol == "FileServer")
+        #expect(stripEx?.title == "Example: net/http.FileServer (strip prefix)")
+        #expect(stringContains(stripEx?.summary ?? "", "stripped URL prefix"))
+        #expect(stringContains(stripEx?.example ?? "", "http.StripPrefix"))
+        #expect(!stringContains(stripEx?.example ?? "", "// Output:"))
+        #expect(stringContains(stripEx?.body ?? "", "Output:\nserving /tmpfiles/"))
+        #expect(stringContains(stripEx?.citationLabel ?? "", "net/http.FileServer (ExampleFileServer_stripPrefix)"))
+
+        // Verify Example_http_customHandler (Example_pkg_Xxx form) maps to package level.
+        let pkgNamedEx = exampleChunks.first { $0.anchor == "net/http.Example_http_customHandler" }
+        #expect(pkgNamedEx != nil)
+        #expect(pkgNamedEx?.symbol == "")
+        #expect(pkgNamedEx?.title == "Example: net/http (http custom handler)")
+        #expect(stringContains(pkgNamedEx?.body ?? "", "Output:\ncustom handler"))
+
+        // Verify ExampleServeMux_Handle and ExampleServeMux_Handle_customMux both link to ServeMux.Handle without colliding.
+        let methodEx = exampleChunks.first { $0.anchor == "net/http.ExampleServeMux_Handle" }
+        let methodSuffixEx = exampleChunks.first { $0.anchor == "net/http.ExampleServeMux_Handle_customMux" }
+        #expect(methodEx?.symbol == "ServeMux.Handle")
+        #expect(methodEx?.title == "Example: net/http.ServeMux.Handle")
+        #expect(methodSuffixEx?.symbol == "ServeMux.Handle")
+        #expect(methodSuffixEx?.title == "Example: net/http.ServeMux.Handle (custom mux)")
+        #expect(methodEx?.stableID != methodSuffixEx?.stableID)
+        #expect(stringContains(methodSuffixEx?.body ?? "", "Output:\nok"))
+
+        // Verify regular Test*, Benchmark*, Fuzz*, helpers, windows-only, testdata, and _gen are excluded.
+        #expect(!chunks.contains { stringContains($0.anchor, "TestFileServer") })
+        #expect(!chunks.contains { stringContains($0.anchor, "BenchmarkFileServer") })
+        #expect(!chunks.contains { stringContains($0.anchor, "FuzzFileServer") })
+        #expect(!chunks.contains { stringContains($0.anchor, "ExampleHelper") })
+        #expect(!chunks.contains { stringContains($0.anchor, "ExampleWithReturn") })
+        #expect(!chunks.contains { stringContains($0.anchor, "Examplelowercase") })
+        #expect(!chunks.contains { stringContains($0.anchor, "ExampleWindowsOnly") })
+        #expect(!chunks.contains { stringContains($0.anchor, "ExampleIgnoredTestdata") })
+        #expect(!chunks.contains { stringContains($0.anchor, "ExampleIgnoredUnderscore") })
+    }
+
+    @Test("Official Example chunks persist through DocsIndex, surface in search with citation, respect version gate, and keep primary symbol #1 on exact lookup (Issue #25)")
+    func officialExamplesSearchPersistenceAndVersionGate() async throws {
+        let goroot = TempDir()
+        let packDir = TempDir()
+        let proj = TempDir()
+        defer { goroot.cleanup(); packDir.cleanup(); proj.cleanup() }
+        _ = proj.file("go.mod", "module example.com/ex\n\ngo 1.21\n")
+
+        _ = goroot.file("src/net/http/server.go", """
+        // Package http provides HTTP client and server implementations.
+        package http
+
+        // FileServer returns a handler that serves HTTP requests with the contents of the file system.
+        func FileServer(root any) any { return nil }
+        """)
+        _ = goroot.file("src/net/http/example_test.go", """
+        package http_test
+
+        // Hide dot files when serving a directory with FileServer.
+        func ExampleFileServer_dotFileHiding() {
+        \tfsys := http.Dir("/tmp")
+        \t_ = http.FileServer(fsys)
+        \t// Output:
+        \t// hidden
+        }
+        """)
+
+        var extracted = DocsCorpusExtractor.extractStdlib(
+            fromGorootSrc: goroot.url.appendingPathComponent("src"),
+            goVersion: "1.21"
+        )
+        // Add a Go 1.23-only Example chunk to verify version gating (FB-DOC-11).
+        extracted.append(DocsChunk(
+            goVersion: "1.21",
+            source: .stdlib,
+            provenance: .officialExample,
+            packageName: "iter",
+            documentID: "iter",
+            symbol: "Pull",
+            kind: .example,
+            title: "Example: iter.Pull (custom iterator)",
+            anchor: "iter.ExamplePull",
+            since: "1.23",
+            summary: "Official Go example for iter.Pull.",
+            signature: "func ExamplePull()",
+            example: "next, stop := iter.Pull(seq)\ndefer stop()\n_ = next",
+            body: "Official Go example for iter.Pull.\n\nnext, stop := iter.Pull(seq)\ndefer stop()\n_ = next"
+        ))
+
+        let mgr = try makeDocsPackManager(in: packDir)
+        _ = try await mgr.ingest(goVersion: "1.21", chunks: extracted, embedder: nil)
+
+        // Verify SQLite round-trip preserves `.example` kind and `.officialExample` provenance.
+        let idx = try await mgr.openIndex(for: "1.21")
+        let all = try idx?.allChunks() ?? []
+        idx?.close()
+        let storedEx = all.first { $0.anchor == "net/http.ExampleFileServer_dotFileHiding" }
+        #expect(storedEx?.kind == .example)
+        #expect(storedEx?.provenance == .officialExample)
+
+        let svc = ResearchService(packManager: mgr, enabled: true)
+
+        // 1. Exact symbol lookup keeps primary symbol definition #1 while surfacing official example as follow-up.
+        let exact = try await svc.search(query: "http.FileServer", projectRoot: proj.url)
+        #expect(exact.status == .found)
+        #expect(exact.cards.first?.provenance == .officialExtracted)
+        #expect(exact.cards.contains { $0.provenance == .officialExample && stringContains($0.citation, "公式サンプル") })
+
+        // 2. Pattern query hits the official example chunk directly and produces an insertable clean snippet.
+        let pattern = try await svc.search(query: "dotFileHiding FileServer", projectRoot: proj.url)
+        #expect(pattern.status == .found)
+        let exCard = pattern.cards.first { $0.provenance == .officialExample }
+        #expect(exCard != nil)
+        #expect(exCard?.canInsert == true)
+        #expect(stringContains(exCard?.citation ?? "", "公式サンプル"))
+        let snippet = DocsCodeInserter.prepareSnippet(from: exCard!, targetVersion: GoVersion(major: 1, minor: 21))
+        #expect(snippet != nil && !stringContains(snippet ?? "", "// Output:"))
+
+        // 3. Newer-version Example chunk (`since: 1.23` on Go 1.21 project) is blocked by version gate (FB-DOC-11).
+        let gated = try await svc.search(query: "iter.Pull", projectRoot: proj.url)
+        #expect(gated.status == .notFound)
+        #expect(gated.cards.isEmpty)
+        #expect(gated.newerVersionNotes.contains { $0.since == GoVersion(major: 1, minor: 23) && stringContains($0.citation, "公式サンプル") })
+    }
+}
+
+

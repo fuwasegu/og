@@ -28,13 +28,16 @@ public enum DocsChunkKind: String, Sendable, Hashable, Codable, CaseIterable {
     case method
     case constant = "const"
     case variable = "var"
+    case example
     case guide
     case releaseNote = "release_note"
 }
 
-/// Provenance distinguishing official extracted GoDoc/docs from og's bundled curated summaries (R-9).
+/// Provenance distinguishing official extracted GoDoc, official GOROOT Example tests,
+/// and og's bundled curated summaries (R-9, Issue #25).
 public enum DocsProvenance: String, Sendable, Hashable, Codable {
     case officialExtracted = "official_extracted"
+    case officialExample = "official_example"
     case bundledCurated = "bundled_curated"
 }
 
@@ -208,13 +211,27 @@ public struct DocsChunk: Sendable, Hashable, Codable {
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Human-readable citation label (FR-13 / G-4, R-9: clearly marks bundled curated summaries).
+    /// Human-readable citation label (FR-13 / G-4, R-9, Issue #25: clearly marks official examples and bundled curated summaries).
     public var citationLabel: String {
-        let sourceLabel = provenance == .bundledCurated
-            ? "\(source.displayName) [og bundled summary]"
-            : source.displayName
+        let sourceLabel: String
+        switch provenance {
+        case .bundledCurated:
+            sourceLabel = "\(source.displayName) [og bundled summary]"
+        case .officialExample:
+            sourceLabel = "\(source.displayName) [公式サンプル]"
+        case .officialExtracted:
+            sourceLabel = source.displayName
+        }
         switch source {
         case .stdlib:
+            if provenance == .officialExample {
+                let target = symbol.isEmpty ? packageName : "\(packageName).\(symbol)"
+                let exampleFn = anchor.split(separator: ".").last.map(String.init) ?? ""
+                if !exampleFn.isEmpty && exampleFn != symbol {
+                    return "\(sourceLabel): \(target) (\(exampleFn))"
+                }
+                return "\(sourceLabel): \(target)"
+            }
             let sym = symbol.isEmpty ? packageName : "\(packageName).\(symbol)"
             return "\(sourceLabel): \(sym)"
         case .spec, .guide, .release:

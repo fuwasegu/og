@@ -501,18 +501,19 @@ public final class DocsIndex: @unchecked Sendable {
             let shortFull = cShortPkg.isEmpty ? cSym : "\(cShortPkg).\(cSym)"
 
             var score: Double = 0
+            let isExample = chunk.kind == .example
             if full == lower || shortFull == lower {
-                score = 100.0
+                score = isExample ? 92.0 : 100.0
             } else if let pkgPart, let symPart, (cPkg == pkgPart || cShortPkg == pkgPart) {
                 if cSym == symPart {
-                    score = 98.0
+                    score = isExample ? 90.0 : 98.0
                 } else if cSym.hasPrefix(symPart + ".") {
-                    score = 88.0
+                    score = isExample ? 82.0 : 88.0
                 }
             } else if cPkg == lower || cShortPkg == lower {
-                score = cSym.isEmpty ? 95.0 : 80.0
+                score = cSym.isEmpty ? (isExample ? 84.0 : 95.0) : (isExample ? 74.0 : 80.0)
             } else if !cSym.isEmpty && cSym == lower {
-                score = 85.0
+                score = isExample ? 78.0 : 85.0
             }
 
             if score > 0 {

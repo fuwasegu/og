@@ -102,15 +102,20 @@ public enum DocsCorpusExtractor {
             .filter { $0.pathExtension == "go" }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
 
-        // First collect examples from `*_test.go` files keyed by exact target symbol name.
+        // First collect official Example* functions from `*_test.go` files (Issue #25).
+        // Keep the first snippet per exact target symbol to attach to parent doc chunks,
+        // and emit every Example* function as a dedicated `.example` chunk with `.officialExample` provenance.
         var examplesBySymbol: [String: String] = [:]
+        var detailedExamples: [ParsedGoExample] = []
         for file in goFiles where file.lastPathComponent.hasSuffix("_test.go") {
             guard matchesBuildFilename(file.lastPathComponent, target: target),
                   let text = try? String(contentsOf: file, encoding: .utf8),
                   matchesBuildConstraints(in: text, target: target) else { continue }
-            for (targetSymbol, snippet) in parseExamples(from: text) {
-                if examplesBySymbol[targetSymbol] == nil {
-                    examplesBySymbol[targetSymbol] = snippet
+            let parsedExamples = parseDetailedExamples(from: text, fileName: file.lastPathComponent)
+            detailedExamples.append(contentsOf: parsedExamples)
+            for ex in parsedExamples {
+                if examplesBySymbol[ex.targetSymbol] == nil {
+                    examplesBySymbol[ex.targetSymbol] = ex.code
                 }
             }
         }
@@ -148,6 +153,11 @@ public enum DocsCorpusExtractor {
                 body: doc
             )
             chunks.insert(pkgChunk, at: 0)
+        }
+
+        // Emit dedicated official example chunks after primary symbol chunks so symbol lookups stay stable.
+        for ex in detailedExamples {
+            chunks.append(makeExampleChunk(example: ex, importPath: importPath, goVersion: goVersion))
         }
 
         return deduplicateByStableID(chunks)
@@ -464,13 +474,14 @@ public enum DocsCorpusExtractor {
                 continue
             }
             if trimmed.hasPrefix("/*") {
-                if let end = trimmed.range(of: "*/") {
-                    let inner = String(trimmed[trimmed.index(trimmed.startIndex, offsetBy: 2)..<end.lowerBound])
+                let afterOpen = trimmed.index(trimmed.startIndex, offsetBy: 2)
+                if let end = trimmed[afterOpen...].range(of: "*/") {
+                    let inner = String(trimmed[afterOpen..<end.lowerBound])
                         .trimmingCharacters(in: .whitespaces)
                     if !inner.isEmpty { pendingComments.append(inner) }
                 } else {
                     inBlockComment = true
-                    let inner = String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+                    let inner = String(trimmed[afterOpen...]).trimmingCharacters(in: .whitespaces)
                     if !inner.isEmpty { pendingComments.append(inner) }
                 }
                 i += 1
@@ -934,21 +945,106 @@ public enum DocsCorpusExtractor {
         return (header, startIndex + 1)
     }
 
-    /// Parses `func ExampleFoo()` / `func ExampleType_Method()` blocks and returns `[parentSymbol: code]` (M-12).
-    public static func parseExamples(from testSource: String) -> [String: String] {
+    /// Structured representation of a Go `Example*()` function extracted from `*_test.go` (Issue #25).
+    public struct ParsedGoExample: Sendable, Hashable {
+        /// Raw Go function name (e.g. `"ExampleFileServer_stripPrefix"`, `"Example_openDBCLI"`).
+        public var functionName: String
+        /// Associated exported target symbol (e.g. `"FileServer"`, `"DB.QueryContext"`, or `""` for package-level).
+        public var targetSymbol: String
+        /// Optional lowercase-started descriptive suffix after `_` (e.g. `"stripPrefix"`, `"openDBCLI"`).
+        public var suffix: String?
+        /// Preceding GoDoc comment above `func Example...()`, if any.
+        public var docComment: String
+        /// Dedented runnable body code with any trailing `// Output:` block removed.
+        public var code: String
+        /// Expected output from trailing `// Output:` or `// Unordered output:` comments, if any.
+        public var expectedOutput: String?
+        /// Source `*_test.go` filename.
+        public var fileName: String
+
+        public init(
+            functionName: String,
+            targetSymbol: String,
+            suffix: String?,
+            docComment: String,
+            code: String,
+            expectedOutput: String?,
+            fileName: String = ""
+        ) {
+            self.functionName = functionName
+            self.targetSymbol = targetSymbol
+            self.suffix = suffix
+            self.docComment = docComment
+            self.code = code
+            self.expectedOutput = expectedOutput
+            self.fileName = fileName
+        }
+    }
+
+    /// Parses all top-level `func Example...()` functions from a `*_test.go` file, including doc comment,
+    /// dedented code body, and trailing `// Output:` / `// Unordered output:` expectations (Issue #25).
+    /// Non-example test functions (`Test*`, `Benchmark*`, `Fuzz*`) and parameterized helpers are ignored.
+    public static func parseDetailedExamples(from testSource: String, fileName: String = "") -> [ParsedGoExample] {
         let lines = testSource.components(separatedBy: "\n")
-        var result: [String: String] = [:]
+        var result: [ParsedGoExample] = []
+        var pendingComments: [String] = []
+        var inBlockComment = false
         var i = 0
+
         while i < lines.count {
-            let trimmed = lines[i].trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("func Example"),
-               let openParen = trimmed.firstIndex(of: "("),
-               trimmed.contains("()") {
-                let rawName = String(trimmed[trimmed.index(trimmed.startIndex, offsetBy: 5)..<openParen])
-                let target = exampleTargetSymbol(from: rawName)
+            let line = lines[i]
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+            if inBlockComment {
+                if let end = trimmed.range(of: "*/") {
+                    let piece = String(trimmed[..<end.lowerBound]).trimmingCharacters(in: .whitespaces)
+                    if !piece.isEmpty { pendingComments.append(piece) }
+                    inBlockComment = false
+                } else {
+                    pendingComments.append(trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "* ")))
+                }
+                i += 1
+                continue
+            }
+            if trimmed.hasPrefix("/*") {
+                let afterOpen = trimmed.index(trimmed.startIndex, offsetBy: 2)
+                if let end = trimmed[afterOpen...].range(of: "*/") {
+                    let inner = String(trimmed[afterOpen..<end.lowerBound])
+                        .trimmingCharacters(in: .whitespaces)
+                    if !inner.isEmpty { pendingComments.append(inner) }
+                } else {
+                    inBlockComment = true
+                    let inner = String(trimmed[afterOpen...]).trimmingCharacters(in: .whitespaces)
+                    if !inner.isEmpty { pendingComments.append(inner) }
+                }
+                i += 1
+                continue
+            }
+            if trimmed.hasPrefix("//") {
+                let body = String(trimmed.dropFirst(2))
+                if body.hasPrefix("go:") || body.hasPrefix("+build") {
+                    i += 1
+                    continue
+                }
+                pendingComments.append(body.hasPrefix(" ") ? String(body.dropFirst()) : body)
+                i += 1
+                continue
+            }
+            if trimmed.isEmpty {
+                pendingComments.removeAll()
+                i += 1
+                continue
+            }
+
+            // Top-level `func Example...()` only (no leading whitespace, zero parameters, no return type).
+            if !line.hasPrefix(" ") && !line.hasPrefix("\t"),
+               let funcName = parseExampleFunctionHeader(trimmed) {
+                let doc = pendingComments.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                pendingComments.removeAll()
+
                 var bodyLines: [String] = []
                 var state = BraceScanState()
-                var depth = state.scanLine(lines[i])
+                var depth = state.scanLine(line)
                 i += 1
                 while i < lines.count && depth > 0 {
                     let current = lines[i]
@@ -958,15 +1054,229 @@ public enum DocsCorpusExtractor {
                     }
                     i += 1
                 }
-                let cleaned = dedent(bodyLines).trimmingCharacters(in: .whitespacesAndNewlines)
-                if !cleaned.isEmpty, result[target] == nil {
-                    result[target] = cleaned
+                let dedented = dedent(bodyLines)
+                let (code, expectedOutput) = splitExampleOutput(from: dedented)
+                if !code.isEmpty {
+                    let parsedName = parseExampleName(funcName)
+                    result.append(ParsedGoExample(
+                        functionName: funcName,
+                        targetSymbol: parsedName.targetSymbol,
+                        suffix: parsedName.suffix,
+                        docComment: doc,
+                        code: code,
+                        expectedOutput: expectedOutput,
+                        fileName: fileName
+                    ))
                 }
                 continue
             }
+
+            pendingComments.removeAll()
             i += 1
         }
         return result
+    }
+
+    /// Parses `func ExampleFoo()` / `func ExampleType_Method()` blocks and returns `[parentSymbol: code]` (M-12).
+    public static func parseExamples(from testSource: String) -> [String: String] {
+        var result: [String: String] = [:]
+        for ex in parseDetailedExamples(from: testSource) {
+            if result[ex.targetSymbol] == nil {
+                result[ex.targetSymbol] = ex.code
+            }
+        }
+        return result
+    }
+
+    /// Builds a dedicated `.example` `DocsChunk` with `.officialExample` provenance and a FR-31 non-colliding stable ID (Issue #25).
+    private static func makeExampleChunk(
+        example ex: ParsedGoExample,
+        importPath: String,
+        goVersion: String
+    ) -> DocsChunk {
+        let targetDisplay = ex.targetSymbol.isEmpty ? importPath : "\(importPath).\(ex.targetSymbol)"
+        let humanizedSuffix = ex.suffix.map(humanizeExampleSuffix).flatMap { $0.isEmpty ? nil : $0 }
+
+        let title: String
+        if let desc = humanizedSuffix {
+            title = "Example: \(targetDisplay) (\(desc))"
+        } else {
+            title = "Example: \(targetDisplay)"
+        }
+
+        let summary: String
+        if !ex.docComment.isEmpty {
+            summary = firstSentence(of: ex.docComment)
+        } else if let desc = humanizedSuffix {
+            summary = "Official Go example for \(targetDisplay) — \(desc)."
+        } else {
+            summary = "Official Go example for \(targetDisplay)."
+        }
+
+        var bodyParts: [String] = []
+        if !ex.docComment.isEmpty {
+            bodyParts.append(ex.docComment)
+        }
+        bodyParts.append(ex.code)
+        if let output = ex.expectedOutput, !output.isEmpty {
+            bodyParts.append("Output:\n\(output)")
+        }
+
+        return DocsChunk(
+            goVersion: goVersion,
+            source: .stdlib,
+            provenance: .officialExample,
+            packageName: importPath,
+            documentID: importPath,
+            symbol: ex.targetSymbol,
+            kind: .example,
+            title: title,
+            anchor: "\(importPath).\(ex.functionName)",
+            since: nil,
+            summary: summary,
+            signature: "func \(ex.functionName)()",
+            example: ex.code,
+            body: bodyParts.joined(separator: "\n\n")
+        )
+    }
+
+    /// Validates a top-level Go Example function header (`func Example...() {`).
+    /// Follows `go/doc` rules: name must be `"Example"` or start with `"Example_"` or `"Example"` + uppercase letter,
+    /// take zero parameters, and have no return type.
+    private static func parseExampleFunctionHeader(_ trimmedLine: String) -> String? {
+        guard trimmedLine.hasPrefix("func Example") else { return nil }
+        guard let openParen = trimmedLine.firstIndex(of: "(") else { return nil }
+        let nameStart = trimmedLine.index(trimmedLine.startIndex, offsetBy: 5)
+        let funcName = String(trimmedLine[nameStart..<openParen])
+        guard !funcName.isEmpty,
+              funcName.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" }) else { return nil }
+        // Per go/doc: after "Example", must be end-of-name, '_', or an uppercase letter (not lowercase like Examplefoo).
+        let afterPrefix = funcName.dropFirst("Example".count)
+        if let first = afterPrefix.first, first != "_" && !first.isUppercase {
+            return nil
+        }
+        let afterParen = trimmedLine[openParen...]
+        guard afterParen.hasPrefix("()") else { return nil }
+        let tail = afterParen.dropFirst(2).trimmingCharacters(in: .whitespaces)
+        // Must open `{` directly (no return type)
+        guard tail.hasPrefix("{") else { return nil }
+        return funcName
+    }
+
+    /// Separates trailing `// Output:` or `// Unordered output:` comment block from dedented example code.
+    private static func splitExampleOutput(from dedentedBody: String) -> (code: String, expectedOutput: String?) {
+        let lines = dedentedBody.components(separatedBy: "\n")
+        var outputHeaderIdx: Int?
+        for idx in stride(from: lines.count - 1, through: 0, by: -1) {
+            let trimmed = lines[idx].trimmingCharacters(in: .whitespaces)
+            let lower = trimmed.lowercased()
+            if lower.hasPrefix("// output:") || lower.hasPrefix("// unordered output:") {
+                outputHeaderIdx = idx
+                break
+            }
+            if !trimmed.isEmpty && !trimmed.hasPrefix("//") {
+                break
+            }
+        }
+        guard let headerIdx = outputHeaderIdx else {
+            return (dedentedBody.trimmingCharacters(in: .whitespacesAndNewlines), nil)
+        }
+        let code = lines[..<headerIdx].joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        var outLines: [String] = []
+        // Check if text follows on the same line after `Output:`
+        let headerTrimmed = lines[headerIdx].trimmingCharacters(in: .whitespaces)
+        if let colon = headerTrimmed.firstIndex(of: ":") {
+            let sameLine = String(headerTrimmed[headerTrimmed.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+            if !sameLine.isEmpty {
+                outLines.append(sameLine)
+            }
+        }
+        for idx in (headerIdx + 1)..<lines.count {
+            let t = lines[idx].trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("//") {
+                let body = String(t.dropFirst(2))
+                outLines.append(body.hasPrefix(" ") ? String(body.dropFirst()) : body)
+            } else if t.isEmpty {
+                continue
+            } else {
+                break
+            }
+        }
+        let expected = outLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return (code, expected.isEmpty ? nil : expected)
+    }
+
+    /// Parses Go `go/doc` Example naming conventions into `(targetSymbol, suffix)`:
+    /// - `Example` -> `("", nil)`
+    /// - `Example_openDBCLI` -> `("", "openDBCLI")`
+    /// - `ExampleGet` -> `("Get", nil)`
+    /// - `ExampleFileServer_stripPrefix` -> `("FileServer", "stripPrefix")`
+    /// - `ExampleDB_QueryContext` -> `("DB.QueryContext", nil)`
+    /// - `ExampleDB_Query_multipleResultSets` -> `("DB.Query", "multipleResultSets")`
+    public static func parseExampleName(_ funcName: String) -> (targetSymbol: String, suffix: String?) {
+        guard funcName.hasPrefix("Example") else { return ("", nil) }
+        let rest = String(funcName.dropFirst("Example".count))
+        if rest.isEmpty { return ("", nil) }
+        if rest.hasPrefix("_") {
+            let suffix = String(rest.dropFirst())
+            return ("", suffix.isEmpty ? nil : suffix)
+        }
+        let parts = rest.split(separator: "_", omittingEmptySubsequences: false).map(String.init)
+        if parts.count == 1 {
+            return (parts[0], nil)
+        }
+        if let secondFirst = parts[1].first, secondFirst.isUppercase {
+            let symbol = "\(parts[0]).\(parts[1])"
+            if parts.count >= 3 {
+                let tail = parts.dropFirst(2).joined(separator: "_")
+                return (symbol, tail.isEmpty ? nil : tail)
+            }
+            return (symbol, nil)
+        }
+        let tail = parts.dropFirst(1).joined(separator: "_")
+        return (parts[0], tail.isEmpty ? nil : tail)
+    }
+
+    /// Converts an Example suffix such as `"stripPrefix"`, `"openDBCLI"`, `"dotFileHiding"`, or `"pkg_custom"`
+    /// into a readable phrase (e.g. `"strip prefix"`, `"open DB CLI"`, `"dot file hiding"`, `"pkg custom"`).
+    private static func humanizeExampleSuffix(_ raw: String) -> String {
+        let segments = raw.split(separator: "_").map(String.init)
+        var words: [String] = []
+        for seg in segments where !seg.isEmpty {
+            let chars = Array(seg)
+            var current = ""
+            for idx in chars.indices {
+                let ch = chars[idx]
+                let prev: Character? = idx > 0 ? chars[idx - 1] : nil
+                let next: Character? = idx + 1 < chars.count ? chars[idx + 1] : nil
+                let splitBefore: Bool
+                if let prev {
+                    if prev.isLowercase && ch.isUppercase {
+                        splitBefore = true
+                    } else if prev.isUppercase && ch.isUppercase, let next, next.isLowercase {
+                        splitBefore = true
+                    } else {
+                        splitBefore = false
+                    }
+                } else {
+                    splitBefore = false
+                }
+                if splitBefore && !current.isEmpty {
+                    words.append(current)
+                    current = ""
+                }
+                current.append(ch)
+            }
+            if !current.isEmpty { words.append(current) }
+        }
+        return words.map { word in
+            // Preserve acronyms like CLI, DB, HTTP2, JSON, URL; lowercase ordinary camelCase words.
+            let uppercaseCount = word.filter(\.isUppercase).count
+            if uppercaseCount >= 2 || (word.count >= 2 && word.first?.isLowercase == true && word.dropFirst().allSatisfy({ $0.isUppercase || $0.isNumber })) {
+                return word.uppercased()
+            }
+            return word.lowercased()
+        }.joined(separator: " ")
     }
 
     /// Stateful Go brace scanner aware of `"..."`, `` `...` `` (multiline raw strings), `'...'`,
@@ -1080,14 +1390,7 @@ public enum DocsCorpusExtractor {
     }
 
     private static func exampleTargetSymbol(from funcName: String) -> String {
-        guard funcName.hasPrefix("Example") else { return "" }
-        let suffix = String(funcName.dropFirst("Example".count))
-        if suffix.isEmpty || suffix.hasPrefix("_") { return "" }
-        let parts = suffix.split(separator: "_", omittingEmptySubsequences: false).map(String.init)
-        if parts.count >= 2, let second = parts[1].first, second.isUppercase {
-            return "\(parts[0]).\(parts[1])"
-        }
-        return parts[0]
+        parseExampleName(funcName).targetSymbol
     }
 
     private static func extractReceiverTypeName(_ receiver: String) -> String? {
