@@ -463,6 +463,7 @@ public final class DocsIndex: @unchecked Sendable {
                  FROM chunks
                 WHERE (lower(package_name) = ?1 OR lower(package_name) LIKE ?2)
                   AND (lower(symbol) = ?3 OR lower(symbol) LIKE ?4)
+                ORDER BY CASE WHEN kind = 'example' THEN 1 ELSE 0 END, stable_id ASC
                 LIMIT 64;
                 """
                 guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
@@ -480,6 +481,7 @@ public final class DocsIndex: @unchecked Sendable {
                 WHERE lower(package_name) = ?1
                    OR lower(package_name) LIKE ?2
                    OR lower(symbol) = ?1
+                ORDER BY CASE WHEN kind = 'example' THEN 1 ELSE 0 END, stable_id ASC
                 LIMIT 64;
                 """
                 guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
@@ -501,18 +503,19 @@ public final class DocsIndex: @unchecked Sendable {
             let shortFull = cShortPkg.isEmpty ? cSym : "\(cShortPkg).\(cSym)"
 
             var score: Double = 0
+            let isExample = chunk.kind == .example
             if full == lower || shortFull == lower {
-                score = 100.0
+                score = isExample ? 92.0 : 100.0
             } else if let pkgPart, let symPart, (cPkg == pkgPart || cShortPkg == pkgPart) {
                 if cSym == symPart {
-                    score = 98.0
+                    score = isExample ? 90.0 : 98.0
                 } else if cSym.hasPrefix(symPart + ".") {
-                    score = 88.0
+                    score = isExample ? 82.0 : 88.0
                 }
             } else if cPkg == lower || cShortPkg == lower {
-                score = cSym.isEmpty ? 95.0 : 80.0
+                score = cSym.isEmpty ? (isExample ? 84.0 : 95.0) : (isExample ? 74.0 : 80.0)
             } else if !cSym.isEmpty && cSym == lower {
-                score = 85.0
+                score = isExample ? 78.0 : 85.0
             }
 
             if score > 0 {

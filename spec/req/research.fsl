@@ -16,9 +16,10 @@
 //   DOC-5: Shared vector store keyed by (content hash, model id/version) allows a new
 //          version or update batch to reuse cached vectors instead of recomputing (FR-30, FR-31).
 //   DOC-6: All communication stays on loopback; project code never leaves the machine (FR-16, FR-17).
-//   DOC-7: Grounded cards always carry citation, Go version, and `since <= project_ver`;
-//          Not Found answers carry the searched scope (without fabricating citations or symbols)
-//          (FR-12..14, UX-4).
+//   DOC-7: Grounded cards always carry citation, provenance (distinguishing official docs,
+//          official GOROOT Example functions from *_test.go, and bundled curated summaries),
+//          Go version, and `since <= project_ver`; Not Found answers carry the searched scope
+//          (without fabricating citations or symbols) (FR-12..14, UX-4, Issue #25).
 //   DOC-8: Search works offline without an LLM (FTS5 + deterministic excerpts) (FR-15, FR-28).
 //   DOC-9: Code insertion into the editor is allowed only for grounded, version-gated cards
 //          matching the current project version (UX-2).
@@ -363,6 +364,36 @@ requirements Research {
     sent_remote = sent_remote or to == Remote
   }
 
+  action query_found_example(
+    to: Endpoint,
+    card_since: GoVer,
+    source: RetrievalSource,
+    card_count: CardCount,
+    within_top_n: Bool,
+    passed_threshold: Bool
+  ) "DOC-7: official GOROOT Example chunk from *_test.go returns cited with example provenance under the same pack, since, and threshold gates" {
+    requires enabled
+    requires to == Local
+    requires pack_state[project_ver] != Missing
+    requires card_since <= project_ver
+    requires card_count >= 1 and card_count <= MAX_CARDS
+    requires within_top_n
+    requires passed_threshold
+    requires source == RFTSOnly or (pack_state[project_ver] == Ready and pack_model[project_ver] == selected_model)
+    answer_kind = GroundedCards
+    answer_ver = some(project_ver)
+    answer_card_since = some(card_since)
+    answer_card_count = card_count
+    answer_retrieval_source = source
+    answer_has_newer_notes = false
+    answer_has_citation = true
+    answer_has_scope = true
+    answer_grounded = true
+    answer_used_semantic = source != RFTSOnly
+    answer_used_reranker = reranker_available
+    sent_remote = sent_remote or to == Remote
+  }
+
   action query_not_found(to: Endpoint, has_newer_feature: Bool) "DOC-7: when no chunk passes version-gate and anti-hallucination thresholds for project_ver, answer Not Found with searched scope and no fabricated citation/symbol" {
     requires enabled
     requires to == Local
@@ -526,6 +557,11 @@ requirements Research {
     expect pack_state[0] == Ready and answer_used_reranker and answer_retrieval_source == RHybridUnion and answer_card_count == 1
   }
 
+  acceptance AC-DOC-12 "DOC-7: official GOROOT Example chunk returns with example provenance, passes version gate, and allows insertion" {
+    enable() start_batch(0) complete_batch_compute(0) toggle_reranker(true) query_found_example(Local, 0, RHybridUnion, 1, true, true) insert_card()
+    expect answer_kind == GroundedCards and answer_has_citation and answer_used_reranker and inserted
+  }
+
   forbidden FB-DOC-1 "DOC-6: queries to a remote endpoint are refused" {
     enable() start_batch(0) publish_fts_pack(0) query_found(Remote, 0, false, RFTSOnly, 1, true, true)
     expect rejected
@@ -573,6 +609,11 @@ requirements Research {
 
   forbidden FB-DOC-10 "DOC-10: candidates outside the top-N rerank pool cannot be returned as grounded cards" {
     enable() start_batch(0) complete_batch_compute(0) toggle_reranker(true) query_found(Local, 0, false, RHybridUnion, 1, false, true)
+    expect rejected
+  }
+
+  forbidden FB-DOC-11 "DOC-2: official Example chunk whose since exceeds project_ver cannot be returned" {
+    enable() start_batch(0) complete_batch_compute(0) toggle_reranker(true) query_found_example(Local, 1, RHybridUnion, 1, true, true)
     expect rejected
   }
 }

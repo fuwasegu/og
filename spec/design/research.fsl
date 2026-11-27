@@ -26,6 +26,12 @@
 //        formally specified in `spec/design/docs_server.fsl` (127.0.0.1:<free port>, own
 //        process group, bounded health timeout, windowed crash restarts with backoff, clean
 //        quit), serving both `/v1/embeddings` and `/v1/rerank`.
+// DES-7: GOROOT `*_test.go` `Example*()` functions (excluding regular `Test*`/`Benchmark*`/`Fuzz*`
+//        functions and skipping `_`/`.`/`testdata`/`internal`/`vendor`/`cmd` directories) are
+//        extracted as dedicated `kind = .example` chunks with `provenance = .officialExample`,
+//        non-colliding FR-31 stable IDs, target-symbol linkage, doc comment, body code, and
+//        `// Output:` expectation, participating in FTS5, semantic search, reranking, and the
+//        same pack/`since` version gates (Issue #25).
 //
 // ASSUME-1 (representation only): two Go versions, two embedding models, TOTAL_CHUNKS = 2.
 spec ResearchDesign {
@@ -414,6 +420,30 @@ spec ResearchDesign {
     answer_card_count = card_count
     answer_retrieval_source = source
     answer_has_newer_notes = has_newer_feature
+    answer_has_citation = true
+    answer_has_scope = true
+    answer_grounded = true
+    answer_used_semantic = source != RFTSOnly
+    answer_used_reranker = reranker_available
+    sent_remote = sent_remote or endpoint == Elsewhere
+  }
+
+  action query_found_example(
+    card_since: GoVer,
+    source: RetrievalSource,
+    card_count: CardCount
+  ) "DES-7: official GOROOT Example chunk returns cited with example provenance through the same two-stage pipeline and version gates" {
+    requires enabled
+    requires pack_state[project_ver] != DMissing
+    requires card_since <= project_ver
+    requires card_count >= 1 and card_count <= MAX_CARDS
+    requires source == RFTSOnly or (pack_state[project_ver] == DReady and pack_model[project_ver] == selected_model)
+    answer_kind = DGroundedCards
+    answer_ver = some(project_ver)
+    answer_card_since = some(card_since)
+    answer_card_count = card_count
+    answer_retrieval_source = source
+    answer_has_newer_notes = false
     answer_has_citation = true
     answer_has_scope = true
     answer_grounded = true

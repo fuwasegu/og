@@ -737,10 +737,16 @@ public actor ResearchService {
                     if entry.chunk.source == .spec { intentBonus += 18.0 }
                     else if entry.chunk.source == .guide { intentBonus += 14.0 }
                 case .exactSymbol, .existenceCheck, .needsReverseLookup:
-                    if entry.chunk.source == .stdlib { intentBonus += 10.0 }
+                    if entry.chunk.source == .stdlib {
+                        if entry.chunk.kind == .example && plan.intent != .needsReverseLookup {
+                            intentBonus += 7.0
+                        } else {
+                            intentBonus += 10.0
+                        }
+                    }
                     if plan.intent == .needsReverseLookup && entry.chunk.kind != .package {
                         intentBonus += 3.0
-                        if !entry.chunk.symbol.contains(".") {
+                        if entry.chunk.kind != .example && !entry.chunk.symbol.contains(".") {
                             intentBonus += 2.0
                         }
                     }
