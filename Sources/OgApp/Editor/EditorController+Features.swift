@@ -221,7 +221,10 @@ extension EditorController {
         let suffix = ns.substring(from: caret)
         let version = document.version
         ghostTask?.cancel()
+        let gate = ModelServerManager.shared.priorityGate
         ghostTask = Task { [weak self] in
+            await gate.beginHighPriority()
+            defer { Task { await gate.endHighPriority() } }
             var acc = ""
             do {
                 for try await chunk in client.complete(prefix: String(prefix.suffix(6000)), suffix: String(suffix.prefix(2000))) {

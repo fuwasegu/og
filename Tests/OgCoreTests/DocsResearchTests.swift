@@ -1427,3 +1427,479 @@ struct DocsPhase2Tests {
         #expect(p2Neg.status == .notFound && p2Neg.cards.isEmpty && !p2Neg.usedReranker)
     }
 }
+
+private struct StubDocsAnswerGenerator: DocsAnswerGenerator, @unchecked Sendable {
+    let modelID: String
+    let handler: @Sendable (DocsAnswerGenerationRequest) async throws -> DocsAnswerGenerationOutput?
+
+    init(
+        modelID: String = "stub-qwen2.5-coder-3b-instruct",
+        handler: @escaping @Sendable (DocsAnswerGenerationRequest) async throws -> DocsAnswerGenerationOutput?
+    ) {
+        self.modelID = modelID
+        self.handler = handler
+    }
+
+    func generate(request: DocsAnswerGenerationRequest) async throws -> DocsAnswerGenerationOutput? {
+        try await handler(request)
+    }
+}
+
+private struct StubSnippetVerifier: DocsSnippetVerifying {
+    let status: DocsSnippetVerificationStatus
+
+    func verify(snippet: String, targetVersion: GoVersion) async -> DocsSnippetVerificationStatus {
+        status
+    }
+}
+
+@Suite("Phase 3: Grounded Answer Synthesis & Local Snippet Verification (Issue #24)")
+struct DocsPhase3Tests {
+    @Test("LoopbackChatAnswerGenerator rejects non-loopback endpoints and parses JSON output (DOC-6, DES-A1)")
+    func loopbackAndParsing() {
+        #expect(LoopbackChatAnswerGenerator(endpoint: url("https://api.example.com")!, modelID: "m") == nil)
+        #expect(LoopbackChatAnswerGenerator(endpoint: url("http://127.0.0.1:18080")!, modelID: "m") != nil)
+
+        let raw = """
+        Here is the answer:
+        ```json
+        {
+          "insufficient_evidence": false,
+          "explanation": "Use http.NewRequest, Header.Set, and Client.Do.",
+          "snippet": "req, err := http.NewRequest(http.MethodGet, url, nil)",
+          "citations": ["Go Standard Library: net/http.NewRequest"]
+        }
+        ```
+        """
+        let parsed = LoopbackChatAnswerGenerator.parseOutput(raw)
+        #expect(parsed != nil)
+        #expect(parsed?.insufficientEvidence == false)
+        #expect(parsed?.citedLabels == ["Go Standard Library: net/http.NewRequest"])
+
+        let insufficient = LoopbackChatAnswerGenerator.parseOutput(#"{"insufficient_evidence": true, "explanation": "not enough"}"#)
+        #expect(insufficient?.insufficientEvidence == true)
+
+        let sectioned = LoopbackChatAnswerGenerator.parseOutput("""
+        INSUFFICIENT_EVIDENCE: false
+        REQUIRES_NEWER_GO: none
+        CITATIONS: Go Standard Library: net/http.NewRequest | Go Standard Library: net/http.Header.Set
+        EXPLANATION:
+        Use http.NewRequest and Header.Set.
+        SNIPPET:
+        ```go
+        req, _ := http.NewRequest("GET", "https://example.com", nil)
+        req.Header.Set("Authorization", "Bearer tok")
+        ```
+        """)
+        #expect(sectioned != nil)
+        #expect(sectioned?.citedLabels.count == 2)
+        #expect(sectioned?.snippet?.contains("Authorization") == true)
+    }
+
+    @Test("Golden query: Authorization header request synthesis carries net/http citations and verified snippet (DOC-11, AC-DOC-12)")
+    func goldenAuthorizationRequestSynthesis() async throws {
+        let dir = TempDir()
+        let proj = TempDir()
+        defer { dir.cleanup(); proj.cleanup() }
+        _ = proj.file("go.mod", "module example.com/auth\n\ngo 1.23\n")
+
+        let httpChunks = [
+            DocsChunk(
+                goVersion: "1.23",
+                source: .stdlib,
+                packageName: "net/http",
+                symbol: "NewRequest",
+                kind: .function,
+                title: "net/http.NewRequest",
+                anchor: "NewRequest",
+                since: "1.0",
+                summary: "NewRequest wraps NewRequestWithContext using context.Background.",
+                signature: "func NewRequest(method, url string, body io.Reader) (*Request, error)",
+                example: "req, err := http.NewRequest(http.MethodGet, \"https://example.com\", nil)",
+                body: "NewRequest returns a new Request given a method, URL, and optional body. Set Authorization header before Client.Do.",
+                searchAliases: ["Authorization", "ヘッダ", "リクエスト", "http"]
+            ),
+            DocsChunk(
+                goVersion: "1.23",
+                source: .stdlib,
+                packageName: "net/http",
+                symbol: "Header.Set",
+                kind: .method,
+                title: "net/http.Header.Set",
+                anchor: "Header.Set",
+                since: "1.0",
+                summary: "Set sets the header entries associated with key to the single element value.",
+                signature: "func (h Header) Set(key, value string)",
+                example: "req.Header.Set(\"Authorization\", \"Bearer token\")",
+                body: "Set replaces any existing values associated with key, such as Authorization.",
+                searchAliases: ["Authorization", "ヘッダ"]
+            ),
+            DocsChunk(
+                goVersion: "1.23",
+                source: .stdlib,
+                packageName: "net/http",
+                symbol: "Client.Do",
+                kind: .method,
+                title: "net/http.Client.Do",
+                anchor: "Client.Do",
+                since: "1.0",
+                summary: "Do sends an HTTP request and returns an HTTP response.",
+                signature: "func (c *Client) Do(req *Request) (*Response, error)",
+                example: "resp, err := http.DefaultClient.Do(req)",
+                body: "Do sends an HTTP request and returns an HTTP response, following policy configured on the Client.",
+                searchAliases: ["リクエスト", "送信", "http"]
+            )
+        ]
+
+        let mgr = try makeDocsPackManager(in: dir)
+        _ = try await mgr.ingest(goVersion: "1.23", chunks: httpChunks + BundledGoCorpus.chunks(forGoVersion: "1.23"), embedder: nil)
+
+        let svc = ResearchService(packManager: mgr, enabled: true)
+        await svc.setSnippetVerifier(StubSnippetVerifier(status: .verified))
+        await svc.setAnswerGenerator(StubDocsAnswerGenerator { req in
+            let cites = req.evidence.map(\.citation)
+            return DocsAnswerGenerationOutput(
+                explanation: "http.NewRequest でリクエストを作成し、req.Header.Set で Authorization ヘッダを設定して Client.Do で送信します。",
+                snippet: "req, _ := http.NewRequest(http.MethodGet, \"https://example.com\", nil)\nreq.Header.Set(\"Authorization\", \"Bearer token\")\nresp, _ := http.DefaultClient.Do(req)\n_ = resp",
+                citedLabels: cites
+            )
+        })
+
+        let ans = try await svc.search(query: "Authorization ヘッダをつけてリクエストを送りたい", projectRoot: proj.url)
+        #expect(ans.status == .found)
+        #expect(ans.usedLLM)
+        #expect(ans.generatedAnswer != nil)
+        #expect(ans.generatedAnswer?.verification == .verified)
+        #expect(ans.generatedAnswer?.canInsert == true)
+        #expect(ans.generatedAnswer?.citations.contains(where: { $0.contains("net/http") }) == true)
+    }
+
+    @Test("Never fabricates when NotFound or citations are ungrounded, and never degrades Phase 2 cards (FB-DOC-11, DOC-11)")
+    func noFabricationAndNonDegradation() async throws {
+        let dir = TempDir()
+        let proj = TempDir()
+        defer { dir.cleanup(); proj.cleanup() }
+        _ = proj.file("go.mod", "module example.com/test\n\ngo 1.23\n")
+
+        let mgr = try makeDocsPackManager(in: dir)
+        _ = try await mgr.ingest(goVersion: "1.23", chunks: BundledGoCorpus.chunks(forGoVersion: "1.23"), embedder: nil)
+
+        let svc = ResearchService(packManager: mgr, enabled: true)
+        await svc.setSnippetVerifier(StubSnippetVerifier(status: .verified))
+
+        // 1. Non-existent feature -> NotFound, generator must not produce anything
+        await svc.setAnswerGenerator(StubDocsAnswerGenerator { _ in
+            Issue.record("Generator must not be called on NotFound")
+            return nil
+        })
+        let notFound = try await svc.search(query: "標準ライブラリに量子テレポーテーション制御ある？", projectRoot: proj.url)
+        #expect(notFound.status == .notFound && !notFound.usedLLM && notFound.generatedAnswer == nil)
+
+        // 2. Ungrounded fabricated citations -> discarded cleanly
+        await svc.setAnswerGenerator(StubDocsAnswerGenerator { _ in
+            DocsAnswerGenerationOutput(
+                explanation: "Fake answer",
+                snippet: "fmt.Println(\"hi\")",
+                citedLabels: ["Invented Package: fake.Symbol"]
+            )
+        })
+        let lineByLine = try await svc.search(query: "ファイルを1行ずつ読みたい", projectRoot: proj.url)
+        #expect(lineByLine.status == .found)
+        #expect(lineByLine.cards.first?.symbol == "Scanner")
+        #expect(lineByLine.generatedAnswer == nil && !lineByLine.usedLLM)
+    }
+
+    @Test("Failed, unverified, or newer-API generated snippets are never usable or insertable (AC-DOC-13, FB-DOC-12, FB-DOC-14)")
+    func failedAndUnverifiedSnippetsBlockedFromInsertion() async throws {
+        let dir = TempDir()
+        let proj = TempDir()
+        defer { dir.cleanup(); proj.cleanup() }
+        _ = proj.file("go.mod", "module example.com/fail\n\ngo 1.23\n")
+
+        let mgr = try makeDocsPackManager(in: dir)
+        _ = try await mgr.ingest(goVersion: "1.23", chunks: BundledGoCorpus.chunks(forGoVersion: "1.23"), embedder: nil)
+
+        let svc = ResearchService(packManager: mgr, enabled: true)
+        await svc.setAnswerGenerator(StubDocsAnswerGenerator { req in
+            DocsAnswerGenerationOutput(
+                explanation: "Use bufio.Scanner.",
+                snippet: "sc := bufio.NewScanner(f) {{{",
+                citedLabels: req.evidence.map(\.citation)
+            )
+        })
+
+        // Failed verification
+        await svc.setSnippetVerifier(StubSnippetVerifier(status: .failed(errorSummary: "syntax error")))
+        let failedAns = try await svc.search(query: "ファイルを1行ずつ読みたい", projectRoot: proj.url)
+        #expect(failedAns.generatedAnswer != nil)
+        #expect(failedAns.generatedAnswer?.canInsert == false)
+        if let gen = failedAns.generatedAnswer {
+            let prep = await DocsCodeInserter.prepareSnippetAsync(from: gen, targetVersion: GoVersion(major: 1, minor: 23))
+            #expect(prep == nil)
+        }
+
+        // Unverified (missing go toolchain)
+        await svc.setSnippetVerifier(DocsSnippetVerifier(locator: ToolLocator(searchPath: [])))
+        let unverifiedAns = try await svc.search(query: "ファイルを1行ずつ読みたい", projectRoot: proj.url)
+        #expect(unverifiedAns.generatedAnswer?.canInsert == false)
+        if case .unverified = unverifiedAns.generatedAnswer?.verification {
+            // expected
+        } else {
+            Issue.record("Expected .unverified status when go toolchain is missing")
+        }
+
+        // Newer Go version required
+        await svc.setSnippetVerifier(StubSnippetVerifier(status: .verified))
+        await svc.setAnswerGenerator(StubDocsAnswerGenerator { req in
+            DocsAnswerGenerationOutput(
+                explanation: "bufio.Scanner requires Go 1.24",
+                snippet: "sc := bufio.NewScanner(f)\n_ = sc",
+                citedLabels: req.evidence.map(\.citation),
+                requiredNewerGoVersion: GoVersion(major: 1, minor: 24)
+            )
+        })
+        let newerAns = try await svc.search(query: "ファイルを1行ずつ読みたい", projectRoot: proj.url)
+        #expect(newerAns.generatedAnswer?.canInsert == false)
+        #expect(newerAns.generatedAnswer?.verification == .newerVersionRequired(since: GoVersion(major: 1, minor: 24)))
+    }
+
+    @Test("Editor context opt-out, snippet wrapping, and DocsAnswerServerCommand loopback argv")
+    func editorContextOptOutAndCommand() async throws {
+        let dir = TempDir()
+        let proj = TempDir()
+        defer { dir.cleanup(); proj.cleanup() }
+        _ = proj.file("go.mod", "module example.com/ctx\n\ngo 1.23\n")
+
+        let mgr = try makeDocsPackManager(in: dir)
+        _ = try await mgr.ingest(goVersion: "1.23", chunks: BundledGoCorpus.chunks(forGoVersion: "1.23"), embedder: nil)
+
+        let svc = ResearchService(packManager: mgr, enabled: true)
+        await svc.setIncludeEditorContextInGeneration(false)
+        await svc.setSnippetVerifier(StubSnippetVerifier(status: .verified))
+        await svc.setAnswerGenerator(StubDocsAnswerGenerator { req in
+            #expect(req.editorContext == nil)
+            return DocsAnswerGenerationOutput(
+                explanation: "OK",
+                snippet: "sc := bufio.NewScanner(f)\n_ = sc",
+                citedLabels: req.evidence.map(\.citation)
+            )
+        })
+
+        let ctx = DocsEditorContext.parse(goSource: "package main\nimport \"net/http\"\nfunc main() {}\n")
+        _ = try await svc.search(query: "ファイルを1行ずつ読みたい", projectRoot: proj.url, editorContext: ctx)
+
+        let wrapped = DocsSnippetVerifier.wrapSnippetAsGoFile("req, _ := http.NewRequest(\"GET\", \"https://example.com\", nil)\n_ = req", extraImports: ["net/http"])
+        #expect(wrapped.contains("package ogverify"))
+        #expect(wrapped.contains("\"net/http\""))
+        #expect(wrapped.contains("func _ogVerify()"))
+
+        let cfg = DocsAnswerServerConfig(mode: .dedicated, backend: .custom, model: "m", customCommand: "/bin/echo --port {port}")
+        let argv = try DocsAnswerServerCommand.argv(for: cfg, port: 19234)
+        #expect(argv == ["/bin/echo", "--port", "19234"])
+    }
+
+    @Test("Strict citation grounding, snippet symbol grounding, CGO block, and newer-API detection (Y-1, Y-2, Y-4, Y-7, Y-9, Y-10)")
+    func strictGroundingAndVerifierHardening() async throws {
+        // Y-1: Partial package fragment must NOT pass strict citation matching
+        let evidence = [
+            DocsAnswerEvidence(
+                citation: "Go Standard Library: net/http.NewRequest",
+                title: "net/http.NewRequest",
+                packageName: "net/http",
+                symbol: "NewRequest",
+                signature: nil,
+                summary: "NewRequest",
+                example: nil,
+                body: "",
+                since: "1.0"
+            )
+        ]
+        #expect(ResearchService.matchGroundedCitations(["net/http"], against: evidence).isEmpty)
+        #expect(ResearchService.matchGroundedCitations(["net/http.NewRequest"], against: evidence) == ["Go Standard Library: net/http.NewRequest"])
+
+        // Y-2: Unrelated snippet or explanation must fail grounding
+        #expect(!ResearchService.verifyExplanationGroundedInEvidence(
+            explanation: "文字列を連結する方法です。",
+            evidence: evidence,
+            matchedCitations: ["Go Standard Library: net/http.NewRequest"]
+        ))
+        #expect(ResearchService.verifyExplanationGroundedInEvidence(
+            explanation: "net/http の NewRequest を使います。",
+            evidence: evidence,
+            matchedCitations: ["Go Standard Library: net/http.NewRequest"]
+        ))
+        #expect(!ResearchService.verifySnippetGroundedInEvidence(
+            snippet: "fmt.Println(\"unrelated\")",
+            evidence: evidence,
+            matchedCitations: ["Go Standard Library: net/http.NewRequest"]
+        ))
+        #expect(ResearchService.verifySnippetGroundedInEvidence(
+            snippet: "req, _ := http.NewRequest(\"GET\", \"https://example.com\", nil)\n_ = req",
+            evidence: evidence,
+            matchedCitations: ["Go Standard Library: net/http.NewRequest"]
+        ))
+
+        // Y-4: Newer stdlib package detected with word boundaries (no false positive on `admin(`)
+        let newerHit = ResearchService.detectNewerAPIMention(
+            in: "import \"iter\"\nvar _ iter.Seq[int]",
+            newerNotes: [],
+            targetVersion: GoVersion(major: 1, minor: 22)
+        )
+        #expect(newerHit == GoVersion(major: 1, minor: 23))
+        #expect(ResearchService.detectNewerAPIMention(in: "admin(x)", newerNotes: [], targetVersion: GoVersion(major: 1, minor: 20)) == nil)
+        #expect(ResearchService.detectNewerAPIMention(in: "x := min(a, b)", newerNotes: [], targetVersion: GoVersion(major: 1, minor: 20)) == GoVersion(major: 1, minor: 21))
+
+        // Y-2 word boundary: `io` must not match inside `"position"`
+        let ioEvidence = [
+            DocsAnswerEvidence(
+                citation: "Go Standard Library: io.Reader",
+                title: "io.Reader",
+                packageName: "io",
+                symbol: "Reader",
+                signature: nil,
+                summary: "Reader",
+                example: nil,
+                body: "",
+                since: "1.0"
+            )
+        ]
+        #expect(!ResearchService.verifyExplanationGroundedInEvidence(
+            explanation: "Check the position value.",
+            evidence: ioEvidence,
+            matchedCitations: ["Go Standard Library: io.Reader"]
+        ))
+
+        // Y-7 & Y-8 & Y-9(c) & Y-10 & (d)(e)
+        #expect(DocsSnippetVerifier.containsCgoImport("import \"C\"\nfunc f() {}"))
+        let cgoStatus = await DocsSnippetVerifier().verify(snippet: "import \"C\"\nfunc f() {}", targetVersion: GoVersion(major: 1, minor: 23))
+        if case .unverified = cgoStatus { } else { Issue.record("Expected .unverified for CGO import") }
+
+        let wrapped = DocsSnippetVerifier.wrapSnippetAsGoFile("// import \"fmt\" comment\nvar x = 1\n_ = x")
+        #expect(wrapped.contains("package ogverify"))
+        #expect(wrapped.contains("func _ogVerify()"))
+        #expect(!wrapped.contains("\t\"fmt\""))
+
+        let explicitWithExtra = DocsSnippetVerifier.wrapSnippetAsGoFile(
+            "import \"bufio\"\nfunc f() { fmt.Println(bufio.ErrTooLong) }",
+            extraImports: ["fmt"]
+        )
+        #expect(explicitWithExtra.contains("\"bufio\"") && explicitWithExtra.contains("\"fmt\""))
+
+        let ctxDepFailure = DocsSnippetVerifier.classifyFailure(stderr: "./main.go:4:2: undefined: req")
+        if case .failed(let summary) = ctxDepFailure {
+            #expect(summary.contains("文脈依存"))
+        } else {
+            Issue.record("Expected .failed with context-dependent hint")
+        }
+
+        let oldToolchainStatus = DocsSnippetVerifier.classifyFailure(
+            stderr: "go: go.mod requires go >= 1.24 (running go 1.23.6; GOTOOLCHAIN=local)",
+            targetVersion: GoVersion(major: 1, minor: 24)
+        )
+        if case .unverified = oldToolchainStatus { } else { Issue.record("Expected .unverified for older host toolchain") }
+    }
+
+    @Test("Natural Japanese explanation without Latin symbols passes when snippet is grounded (Y-2) and PriorityGate preempts low-priority synthesis (Y-5)")
+    func japaneseExplanationAndPriorityGate() async throws {
+        let dir = TempDir()
+        let proj = TempDir()
+        defer { dir.cleanup(); proj.cleanup() }
+        _ = proj.file("go.mod", "module example.com/jp\n\ngo 1.23\n")
+
+        let mgr = try makeDocsPackManager(in: dir)
+        _ = try await mgr.ingest(goVersion: "1.23", chunks: BundledGoCorpus.chunks(forGoVersion: "1.23"), embedder: nil)
+
+        let svc = ResearchService(packManager: mgr, enabled: true)
+        await svc.setSnippetVerifier(StubSnippetVerifier(status: .verified))
+        await svc.setAnswerGenerator(StubDocsAnswerGenerator { req in
+            DocsAnswerGenerationOutput(
+                explanation: "ファイルを先頭から一行ずつ順に読み込みます。",
+                snippet: "sc := bufio.NewScanner(f)\n_ = sc",
+                citedLabels: req.evidence.map(\.citation)
+            )
+        })
+
+        let ans = try await svc.search(query: "ファイルを1行ずつ読みたい", projectRoot: proj.url)
+        #expect(ans.generatedAnswer != nil)
+        #expect(ans.generatedAnswer?.canInsert == true)
+
+        // Y-5: High-priority inline completion preempts active low-priority synthesis
+        let gate = LocalModelPriorityGate()
+        let preempted = Locked<Bool>(false)
+        let id = makeUUID()
+        let acquired = await gate.acquireLowPriority(id: id) {
+            preempted.withLock { $0 = true }
+        }
+        #expect(acquired)
+        await gate.beginHighPriority()
+        #expect(preempted.current == true)
+        await gate.releaseLowPriority(id: id)
+        await gate.endHighPriority()
+        #expect(await gate.isHighPriorityActive() == false)
+    }
+
+    @Test("Two-step search(includeSynthesis: false) + synthesizeAnswer(for:) decouples card latency from LLM (Y-3)")
+    func twoStepAsyncSynthesis() async throws {
+        let dir = TempDir()
+        let proj = TempDir()
+        defer { dir.cleanup(); proj.cleanup() }
+        _ = proj.file("go.mod", "module example.com/twostep\n\ngo 1.23\n")
+
+        let mgr = try makeDocsPackManager(in: dir)
+        _ = try await mgr.ingest(goVersion: "1.23", chunks: BundledGoCorpus.chunks(forGoVersion: "1.23"), embedder: nil)
+
+        let svc = ResearchService(packManager: mgr, enabled: true)
+        await svc.setSnippetVerifier(StubSnippetVerifier(status: .verified))
+        await svc.setAnswerGenerator(StubDocsAnswerGenerator { req in
+            DocsAnswerGenerationOutput(
+                explanation: "Use bufio.Scanner.",
+                snippet: "sc := bufio.NewScanner(f)\n_ = sc",
+                citedLabels: req.evidence.map(\.citation)
+            )
+        })
+
+        let fastAnswer = try await svc.search(
+            query: "ファイルを1行ずつ読みたい",
+            projectRoot: proj.url,
+            includeSynthesis: false
+        )
+        #expect(fastAnswer.status == .found && !fastAnswer.cards.isEmpty)
+        #expect(fastAnswer.generatedAnswer == nil && !fastAnswer.usedLLM)
+
+        let synth = await svc.synthesizeAnswer(for: fastAnswer)
+        #expect(synth != nil)
+        #expect(synth?.verification == .verified)
+        #expect(synth?.canInsert == true)
+    }
+
+    @Test("Real go build verification against host Go toolchain (Z-11)", .enabled(if: isGoToolchainActive()))
+    func realGoBuildVerification() async {
+        // Use generous timeout for cold Go build caches on CI runners.
+        let verifier = DocsSnippetVerifier(locator: ToolLocator(), timeoutSeconds: 30)
+        let okSnippet = """
+        import "net/http"
+
+        func _sampleAuth() {
+            req, err := http.NewRequest(http.MethodGet, "https://example.com", nil)
+            if err != nil { return }
+            req.Header.Set("Authorization", "Bearer token")
+            _ = req
+        }
+        """
+        let okStatus = await verifier.verify(snippet: okSnippet, targetVersion: GoVersion(major: 1, minor: 23))
+        #expect(okStatus == .verified)
+
+        let retrySnippet = "fmt.Println(\"ok\")"
+        let retryStatus = await verifier.verify(snippet: retrySnippet, targetVersion: GoVersion(major: 1, minor: 23))
+        #expect(retryStatus == .verified)
+
+        let badSnippet = "var x int = \"not an int\""
+        let badStatus = await verifier.verify(snippet: badSnippet, targetVersion: GoVersion(major: 1, minor: 23))
+        if case .failed = badStatus {
+            // expected
+        } else {
+            Issue.record("Expected .failed for type mismatch, got \(badStatus)")
+        }
+    }
+}
+

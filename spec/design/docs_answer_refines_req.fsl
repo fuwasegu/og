@@ -1,0 +1,16 @@
+// DocsAnswerDesign ⊑ DocsAnswer
+refinement DocsAnswerRefinesReq {
+  impl DocsAnswerDesign
+  abs  DocsAnswer
+  maps auto
+
+  map retrieval_status =
+    if retrieval_status == DRGroundedCards then RGroundedCards
+    else if retrieval_status == DRNotFound then RNotFound
+    else if retrieval_status == DRMissingPack then RMissingPack
+    else RNone
+
+  action set_endpoint(h) -> stutter
+  action generate_answer(has_citation, uses_newer_api, verif)
+    -> generate_answer(Local, has_citation, uses_newer_api, verif)
+}

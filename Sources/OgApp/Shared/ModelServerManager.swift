@@ -17,6 +17,8 @@ extension Notification.Name {
 final class ModelServerManager {
     static let shared = ModelServerManager()
     static let maxFailures = 3
+    /// Priority gate ensuring inline completion always preempts shared Docs synthesis (Y-5).
+    let priorityGate = LocalModelPriorityGate()
 
     enum Phase: Equatable {
         case off
@@ -64,6 +66,16 @@ final class ModelServerManager {
         guard phase == .ready, let port, let cfg = loadedConfig,
               let url = URL(string: "http://127.0.0.1:\(port)") else { return nil }
         return LocalCompletionClient(endpoint: url, api: cfg.api)
+    }
+
+    var endpointURL: URL? {
+        guard phase == .ready, let port else { return nil }
+        return URL(string: "http://127.0.0.1:\(port)")
+    }
+
+    var loadedModelName: String? {
+        guard phase == .ready else { return nil }
+        return loadedConfig?.model
     }
 
     var statusText: String {
