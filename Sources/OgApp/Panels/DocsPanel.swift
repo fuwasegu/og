@@ -10,6 +10,9 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
     let context: ProjectContext
 
     private let queryField = NSSearchField()
+    private let searchSpinner = NSProgressIndicator()
+    private let searchStatusLabel = NSTextField(labelWithString: "")
+    private let searchIndicatorStack = NSStackView()
     private let versionPopup = NSPopUpButton()
     private let modeLabel = NSTextField(labelWithString: "")
     private let licenseButton = NSButton(title: "BSD License", target: nil, action: nil)
@@ -19,6 +22,8 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
     private var explicitVersion: GoVersion?
     private var lastAnswer: DocsAnswer?
     private var searchGeneration = 0
+    private var indicatorState = DocsSearchIndicatorState()
+    private var indicatorTimerTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
     private var synthesisTask: Task<Void, Never>?
     private var insertTask: Task<Void, Never>?
@@ -33,6 +38,10 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
 
     deinit {
         MainActor.assumeIsolated {
+            indicatorTimerTask?.cancel()
+            searchTask?.cancel()
+            synthesisTask?.cancel()
+            insertTask?.cancel()
             for o in observers { NotificationCenter.default.removeObserver(o) }
         }
     }
@@ -64,6 +73,26 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
         queryField.target = self
         queryField.action = #selector(querySubmitted)
 
+        searchSpinner.style = .spinning
+        searchSpinner.controlSize = .small
+        searchSpinner.isIndeterminate = true
+        searchSpinner.isDisplayedWhenStopped = false
+        searchSpinner.sizeToFit()
+        searchSpinner.setContentHuggingPriority(.required, for: .horizontal)
+
+        searchStatusLabel.font = Theme.smallFont
+        searchStatusLabel.textColor = Theme.secondaryText
+        searchStatusLabel.lineBreakMode = .byTruncatingTail
+        searchStatusLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        searchIndicatorStack.orientation = .horizontal
+        searchIndicatorStack.spacing = 4
+        searchIndicatorStack.alignment = .centerY
+        searchIndicatorStack.addArrangedSubview(searchSpinner)
+        searchIndicatorStack.addArrangedSubview(searchStatusLabel)
+        searchIndicatorStack.isHidden = true
+        searchIndicatorStack.setContentHuggingPriority(.required, for: .horizontal)
+
         versionPopup.controlSize = .small
         versionPopup.font = Theme.smallFont
         versionPopup.target = self
@@ -80,7 +109,7 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
         licenseButton.target = self
         licenseButton.action = #selector(showLicense)
 
-        let topBar = NSStackView(views: [queryField, versionPopup, modeLabel, licenseButton])
+        let topBar = NSStackView(views: [queryField, searchIndicatorStack, versionPopup, modeLabel, licenseButton])
         topBar.orientation = .horizontal
         topBar.spacing = 8
         topBar.alignment = .centerY
@@ -174,8 +203,7 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
             guard paths.contains(where: { $0.hasSuffix("/go.mod") || $0.hasSuffix("/go.work") }) else { return }
             MainActor.assumeIsolated {
                 guard let self else { return }
-                self.searchTask?.cancel()
-                self.synthesisTask?.cancel()
+                self.cancelInFlightSearch()
                 self.lastAnswer = nil
                 self.refreshVersionPopup()
                 self.renderIdleOrStatus()
@@ -308,6 +336,64 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
 
     // MARK: - Search & Insertion
 
+    private static func nowMs() -> Int {
+        Int(ProcessInfo.processInfo.systemUptime * 1000)
+    }
+
+    private func applyIndicatorAction(_ action: DocsSearchIndicatorAction) {
+        switch action {
+        case .none:
+            syncSearchIndicatorUI()
+        case .scheduleShow(let gen, let delayMs):
+            indicatorTimerTask?.cancel()
+            syncSearchIndicatorUI()
+            indicatorTimerTask = Task { [weak self] in
+                try? await Task.sleep(for: .milliseconds(delayMs))
+                guard !Task.isCancelled, let self else { return }
+                if self.indicatorState.showDelayElapsed(generation: gen, nowMs: Self.nowMs()) {
+                    self.syncSearchIndicatorUI()
+                }
+            }
+        case .scheduleHide(let gen, let delayMs):
+            indicatorTimerTask?.cancel()
+            syncSearchIndicatorUI()
+            indicatorTimerTask = Task { [weak self] in
+                try? await Task.sleep(for: .milliseconds(delayMs))
+                guard !Task.isCancelled, let self else { return }
+                if self.indicatorState.hideDelayElapsed(generation: gen) {
+                    self.syncSearchIndicatorUI()
+                }
+            }
+        case .hideNow:
+            indicatorTimerTask?.cancel()
+            indicatorTimerTask = nil
+            syncSearchIndicatorUI()
+        }
+    }
+
+    private func syncSearchIndicatorUI() {
+        if indicatorState.isVisible {
+            searchStatusLabel.stringValue = indicatorState.currentLabel ?? "検索中…"
+            if searchIndicatorStack.isHidden {
+                searchIndicatorStack.isHidden = false
+            }
+            searchSpinner.startAnimation(nil)
+        } else {
+            searchSpinner.stopAnimation(nil)
+            searchIndicatorStack.isHidden = true
+            searchStatusLabel.stringValue = ""
+        }
+    }
+
+    private func cancelInFlightSearch() {
+        searchTask?.cancel()
+        searchTask = nil
+        synthesisTask?.cancel()
+        synthesisTask = nil
+        searchGeneration += 1
+        applyIndicatorAction(indicatorState.reset(generation: searchGeneration))
+    }
+
     private func runSearch() {
         let query = queryField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         searchTask?.cancel()
@@ -317,6 +403,7 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
         let genToken = searchGeneration
 
         guard !query.isEmpty else {
+            applyIndicatorAction(indicatorState.reset(generation: genToken))
             lastAnswer = nil
             renderIdleOrStatus()
             return
@@ -324,6 +411,8 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
         let root = context.root
         let overrideVer = explicitVersion
         let editorCtx = currentEditorContext()
+        let isRefresh = lastAnswer != nil
+        applyIndicatorAction(indicatorState.beginSearch(generation: genToken, isRefresh: isRefresh, nowMs: Self.nowMs()))
 
         searchTask = Task { [weak self] in
             // Y-3: Render Phase 2 retrieval cards immediately without blocking on LLM synthesis.
@@ -341,14 +430,17 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
             guard answer.status == .found,
                   ResearchService.shouldSynthesize(intent: answer.intent, cards: answer.cards),
                   await DocsManager.shared.hasAnswerGenerator() else {
+                self.applyIndicatorAction(self.indicatorState.finish(generation: genToken, nowMs: Self.nowMs()))
                 return
             }
+            guard !Task.isCancelled, self.searchGeneration == genToken else { return }
+            self.applyIndicatorAction(self.indicatorState.beginSynthesis(generation: genToken, nowMs: Self.nowMs()))
             self.synthesisTask = Task { [weak self] in
                 guard let self else { return }
                 let gen = await DocsManager.shared.synthesizeAnswer(for: answer, editorContext: editorCtx)
-                guard !Task.isCancelled,
-                      let gen,
-                      self.searchGeneration == genToken,
+                guard !Task.isCancelled, self.searchGeneration == genToken else { return }
+                self.applyIndicatorAction(self.indicatorState.finish(generation: genToken, nowMs: Self.nowMs()))
+                guard let gen,
                       self.lastAnswer?.query == answer.query,
                       self.lastAnswer?.targetVersion == answer.targetVersion else {
                     return
@@ -810,7 +902,7 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
     @discardableResult
     func debugSearch(_ query: String) async -> DocsAnswer {
         _ = view
-        searchTask?.cancel()
+        cancelInFlightSearch()
         queryField.stringValue = query
         // M-6: use in-memory debug override so headless tests never persist opt-in to UserDefaults.
         DocsManager.shared.debugEnabledOverride = true
@@ -820,7 +912,7 @@ final class DocsPanel: NSViewController, NSSearchFieldDelegate {
                 ?? GoVersionResolver.resolve(projectRoot: context.root, toolchainVersionProvider: { cachedToolchain })?.version.minorKey
                 ?? BundledGoCorpus.defaultVersion
         )
-        searchTask?.cancel()
+        cancelInFlightSearch()
         queryField.stringValue = query
         let answer = await DocsManager.shared.search(
             query: query,
